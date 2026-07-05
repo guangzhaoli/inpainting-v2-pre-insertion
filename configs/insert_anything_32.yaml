@@ -1,0 +1,94 @@
+# Insert Anything configuration (fixed_pixels processor + local folder or Parquet dataset)
+# 32-GPU variant for 4 nodes x 8 GPUs.
+# Current dataset path points to the a2edit folder dataset without prompt text files.
+# and want to train the Insert Anything LoRA on Qwen Image Edit 2509.
+
+trainer: QwenImageEditInsertAnything
+
+model:
+  pretrained_model_name_or_path: "/mnt/cpfs/weiqingyan/flow/qwen-image-inpainting/models/qwen-image-edit-2511"
+  quantize: false
+  pre_insertion:
+    enabled: false
+    paste_mode: "bbox_fit_keep_aspect"
+    train_scale_jitter_ratio: 0.10
+    train_offset_jitter_ratio: 0.05
+  query_prompt:
+    enabled: false
+    num_query_tokens: 8
+    hidden_dim: 1024
+    num_heads: 8
+    qformer_layers: 2
+    layer_indices: [-11, -9, -7, -5, -3, -1]
+    max_source_images: 4
+  reference_cfg:
+    enabled: true
+    train_dropout_rate: 0.1
+    force_empty_prompt: true
+  lora:
+    r: 128
+    lora_alpha: 128
+    target_modules: ["to_q", "to_k", "to_v", "to_out.0", "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out", "img_mlp.net.0.proj", "img_mlp.net.2", "txt_mlp.net.0.proj", "txt_mlp.net.2"]
+    init_lora_weights: "gaussian"
+    adapter_name: "insert_anything_lora"
+    pretrained_weight: null
+
+data:
+  class_path: "src.data.insert_anything_dataset.InsertAnythingDataset"
+  init_args:
+    dataset_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/a2edit/data"  # dataset root or directory containing *.parquet files
+    categories: null
+    require_prompt: false
+    processor:
+      class_path: "src.data.preprocess.ImageProcessor"
+      init_args:
+        process_type: "fixed_pixels"
+        target_pixels: 1048576  # 1024*1024
+        controls_pixels: [1048576, 1048576]  # 1024*1024
+        resize_mode: "bilinear"
+
+  batch_size: 1
+  num_workers: 8
+  shuffle: true
+  drop_last: true
+
+logging:
+  output_dir: "/mnt/oss/weiqingyan/flow/logs/inpainting_v2_logs"
+  tracker_project_name: "reference_cfg_32"
+  report_to: "tensorboard"
+
+optimizer:
+  class_path: "torch.optim.AdamW"
+  init_args:
+    lr: 1.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    eps: 1.0e-8
+
+lr_scheduler:
+  scheduler_type: "cosine"
+  warmup_steps: 500
+
+train:
+  # Global batch = 32 processes x per-process batch_size 1 x grad_accum 1.
+  gradient_accumulation_steps: 1
+  max_train_steps: 100000000000
+  num_epochs: 10
+  checkpointing_steps: 1000
+  checkpoints_total_limit: 1000
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+
+loss:
+  mask_loss: true
+  forground_weight: 2.0
+  background_weight: 1.0
+
+predict:
+  devices:
+    vae: "cuda:0"
+    text_encoder: "cuda:0"
+    dit: "cuda:0"
+
+resume: null

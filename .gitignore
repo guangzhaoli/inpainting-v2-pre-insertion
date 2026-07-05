@@ -1,0 +1,13 @@
+logs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local artifacts
+output/
+qwen_inpainting_code_bundle_*.zip
+
+# Local dependency packages that should not be versioned
+flash_attn-2.8.3+cu12torch2.9cxx11abiTRUE-cp312-cp312-linux_x86_64.whl
+TransformerEngine-2.8.zip

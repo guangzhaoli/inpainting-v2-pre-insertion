@@ -1,0 +1,66 @@
+import os
+import tempfile
+import unittest
+
+import torch
+from safetensors.torch import save_file
+
+from src.loss.edit_mask_loss import map_mask_to_latent
+from src.utils.images import build_preinserted_composite, resize_mask_bhw
+from src.utils.lora_utils import classify_lora_weight, filter_lora_state_keys, is_lora_state_key
+
+
+class MaskUtilsTest(unittest.TestCase):
+    def test_map_mask_to_latent_uses_vae_scale_factor(self):
+        mask = torch.zeros(1, 32, 32)
+        mask[:, 16:, 16:] = 1.0
+
+        packed = map_mask_to_latent(mask, vae_scale_factor=8, expected_seq_len=4)
+
+        self.assertEqual(tuple(packed.shape), (1, 4))
+        self.assertEqual(packed.tolist(), [[0.0, 0.0, 0.0, 1.0]])
+
+    def test_map_mask_to_latent_rejects_seq_len_mismatch(self):
+        mask = torch.zeros(1, 32, 32)
+
+        with self.assertRaises(ValueError):
+            map_mask_to_latent(mask, vae_scale_factor=8, expected_seq_len=5)
+
+    def test_resize_mask_bhw_uses_nearest(self):
+        mask = torch.tensor([[[0.0, 1.0], [1.0, 0.0]]])
+
+        resized = resize_mask_bhw(mask, 4, 4)
+
+        self.assertEqual(sorted(set(resized.flatten().tolist())), [0.0, 1.0])
+
+    def test_preinserted_composite_rejects_unknown_paste_mode(self):
+        image = torch.zeros(1, 3, 4, 4)
+        mask = torch.zeros(1, 4, 4)
+
+        with self.assertRaises(ValueError):
+            build_preinserted_composite(image, mask, image, mask, paste_mode="unknown")
+
+
+class LoraUtilsTest(unittest.TestCase):
+    def test_lora_key_filter_handles_prefix_and_nested_keys(self):
+        keys = [
+            "lora_A.default.weight",
+            "transformer.block.attn.to_q.lora_B.default.weight",
+            "transformer.block.weight",
+        ]
+
+        self.assertTrue(is_lora_state_key(keys[0]))
+        self.assertTrue(is_lora_state_key(keys[1]))
+        self.assertFalse(is_lora_state_key(keys[2]))
+        self.assertEqual(filter_lora_state_keys(keys), keys[:2])
+
+    def test_classify_lora_weight_handles_prefix_key(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            weight_path = os.path.join(tmpdir, "model.safetensors")
+            save_file({"lora_A.default.weight": torch.zeros(1, 1)}, weight_path)
+
+            self.assertEqual(classify_lora_weight(weight_path), "PEFT")
+
+
+if __name__ == "__main__":
+    unittest.main()
