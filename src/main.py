@@ -35,7 +35,7 @@ def main():
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
-    seed_everything(1234)
+    seed_everything(42)
 
     # 创建训练器
     Trainer = import_trainer(config)
@@ -53,7 +53,7 @@ def main():
         prefetch_factor=config.data.prefetch_factor,
         shuffle=shuffle,
         drop_last=config.data.drop_last,
-        seed=1234,
+        seed=42,
     )
 
     # 开始训练

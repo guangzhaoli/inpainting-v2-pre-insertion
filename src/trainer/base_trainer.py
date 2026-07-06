@@ -11,6 +11,7 @@ import math
 import re
 import shutil
 import random
+import time
 
 import torch
 import torch.nn as nn
@@ -281,10 +282,18 @@ class BaseTrainer(ABC):
     def clip_gradients(self):
         """Clip gradients"""
         if self.accelerator.sync_gradients:
-            self.accelerator.clip_grad_norm_(
+            grad_norm = self.accelerator.clip_grad_norm_(
                 self._trainable_params,
                 self.config.train.max_grad_norm,
             )
+            if isinstance(grad_norm, torch.Tensor):
+                grad_norm = grad_norm.detach().float()
+                if grad_norm.numel() == 1:
+                    return grad_norm.item()
+                return None
+            if grad_norm is not None:
+                return float(grad_norm)
+        return None
 
     def training_step(self, batch: dict) -> torch.Tensor:
         """Training step, batch from dataloader"""
@@ -317,6 +326,7 @@ class BaseTrainer(ABC):
         self.batch_in_epoch = skip_batches
         accumulated_loss_sum = None
         accumulated_loss_count = None
+        optimizer_step_start_time = None
         if skip_batches > 0:
             logging.info(f"Resuming epoch {epoch}, skipping {skip_batches} already-consumed batches.")
 
@@ -337,6 +347,9 @@ class BaseTrainer(ABC):
                 self.save_checkpoint(epoch, self.global_step, is_last=True)
                 return True
 
+            if optimizer_step_start_time is None:
+                optimizer_step_start_time = time.perf_counter()
+
             with self.accelerator.accumulate(self.dit):
                 loss = self.training_step(batch)
                 loss_for_logging = loss.detach().float()
@@ -352,10 +365,12 @@ class BaseTrainer(ABC):
                     num_tokens=None,
                 )
                 self.accelerator.backward(loss)
-                self.clip_gradients()
+                grad_norm = self.clip_gradients()
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
             if self.accelerator.sync_gradients:
+                optimizer_step_time_sec = time.perf_counter() - optimizer_step_start_time
+                optimizer_step_start_time = None
                 self.lr_scheduler.step()
                 self.batch_in_epoch = batch_idx + 1
                 gathered_loss_sum = self.accelerator.gather(accumulated_loss_sum).sum()
@@ -367,13 +382,12 @@ class BaseTrainer(ABC):
                 accumulated_loss_count = None
                 self.running_loss = 0.9 * self.running_loss + 0.1 * self.train_loss
                 self.update_progressbar(
-                    logs={
-                        "loss": self.train_loss,
-                        "smooth_loss": self.running_loss,
-                        "lr": self.lr_scheduler.get_last_lr()[0],
-                        "epoch": epoch,
-                        "fps": self.fps_logger.total_fps(),
-                    }
+                    logs=self.build_training_logs(
+                        epoch=epoch,
+                        train_dataloader=train_dataloader,
+                        grad_norm=grad_norm,
+                        optimizer_step_time_sec=optimizer_step_time_sec,
+                    )
                 )
                 self.save_checkpoint(epoch, self.global_step)
                 if self.validation_sampler and self.validation_sampler.should_run_validation(self.global_step):
@@ -409,6 +423,65 @@ class BaseTrainer(ABC):
         inner_sampler = getattr(batch_sampler, "sampler", None)
         if hasattr(inner_sampler, "set_epoch"):
             inner_sampler.set_epoch(epoch)
+
+    def build_training_logs(
+        self,
+        epoch: int,
+        train_dataloader,
+        grad_norm: Optional[float],
+        optimizer_step_time_sec: float,
+    ) -> dict:
+        """Build scalar training metrics for progress bar and experiment trackers."""
+        lr_values = self.lr_scheduler.get_last_lr()
+        lr = float(lr_values[0]) if lr_values else 0.0
+        total_batches = max(1, len(train_dataloader))
+        epoch_progress = min(1.0, float(self.batch_in_epoch) / float(total_batches))
+        total_fps = float(self.fps_logger.total_fps())
+        last_fps = float(self.fps_logger.last_fps())
+        logs = {
+            # Backward-compatible names used by the existing progress bar and old TB views.
+            "loss": float(self.train_loss),
+            "smooth_loss": float(self.running_loss),
+            "lr": lr,
+            "epoch": int(epoch),
+            "fps": total_fps,
+            # Grouped TensorBoard names.
+            "train/loss": float(self.train_loss),
+            "train/smooth_loss": float(self.running_loss),
+            "train/epoch": int(epoch),
+            "train/batch_in_epoch": int(self.batch_in_epoch),
+            "train/epoch_progress": epoch_progress,
+            "train/global_step": int(self.global_step),
+            "optim/lr": lr,
+            "perf/fps_total": total_fps,
+            "perf/fps_last": last_fps,
+            "perf/samples_seen": int(self.fps_logger.global_samples),
+            "perf/optimizer_step_time_sec": float(optimizer_step_time_sec),
+        }
+        if grad_norm is not None:
+            logs["optim/grad_norm"] = float(grad_norm)
+        for index, group_lr in enumerate(lr_values):
+            logs[f"optim/lr_group_{index}"] = float(group_lr)
+        logs.update(self.cuda_memory_logs())
+        return logs
+
+    def cuda_memory_logs(self) -> dict:
+        """Return CUDA memory scalars in GiB when running on CUDA."""
+        if self.accelerator is None or self.accelerator.device.type != "cuda" or not torch.cuda.is_available():
+            return {}
+
+        device = self.accelerator.device
+        memory_allocated = torch.cuda.memory_allocated(device)
+        memory_reserved = torch.cuda.memory_reserved(device)
+        max_memory_allocated = torch.cuda.max_memory_allocated(device)
+        max_memory_reserved = torch.cuda.max_memory_reserved(device)
+        gib = 1024**3
+        return {
+            "system/cuda_memory_allocated_gib": float(memory_allocated / gib),
+            "system/cuda_memory_reserved_gib": float(memory_reserved / gib),
+            "system/cuda_max_memory_allocated_gib": float(max_memory_allocated / gib),
+            "system/cuda_max_memory_reserved_gib": float(max_memory_reserved / gib),
+        }
 
     def load_resume_progress(self):
         """Load global_step/epoch metadata for resume."""

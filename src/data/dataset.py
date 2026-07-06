@@ -574,7 +574,7 @@ def loader(
         prefetch_factor: Optional[int] = 4,
         shuffle: bool = True,
         drop_last=True,
-        seed: int = 1234) -> DataLoader:
+        seed: int = 42) -> DataLoader:
     """
     动态加载数据集类并创建 DataLoader。
     Args:

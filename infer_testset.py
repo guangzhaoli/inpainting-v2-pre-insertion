@@ -41,7 +41,7 @@ def parse_args(argv=None):
     parser.add_argument("--testset-root", type=Path, default=DEFAULT_TESTSET_ROOT)
     parser.add_argument("--category", type=str, default="accessory")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--prompt", type=str, default="Insert the reference jewelry into the masked region.")
+    parser.add_argument("--prompt", type=str, default="")
     parser.add_argument("--negative-prompt", type=str, default=None)
     parser.add_argument("--num-inference-steps", type=int, default=40)
     parser.add_argument("--true-cfg-scale", type=float, default=4.0)

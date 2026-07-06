@@ -107,7 +107,7 @@ def validate_configured_inference(config, args, resolved_lora_path: Path | None)
     if reference_cfg_enabled and args.negative_prompt is not None:
         raise ValueError("reference_cfg cannot be combined with --negative-prompt")
 
-    if not args.prompt and not enhanced_mask_prompt_enabled(config) and not reference_cfg_force_empty_prompt:
+    if args.prompt is None and not enhanced_mask_prompt_enabled(config) and not reference_cfg_force_empty_prompt:
         raise ValueError("--prompt is required for native qwen image inpainting")
 
     if resolved_lora_path is None and not args.allow_base_model:
