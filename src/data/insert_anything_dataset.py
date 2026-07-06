@@ -13,12 +13,15 @@ Directory structure:
     │   └── person/
 """
 
+import csv
+import json
 import logging
 import os
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -45,6 +48,7 @@ class InsertAnythingDataset(Dataset):
     def __init__(self, data_config: DatasetInitArgs):
         self.data_config = data_config
         self.dataset_path = data_config.dataset_path
+        self.manifest_path = data_config.manifest_path
         self.categories = data_config.categories
         self.require_prompt = data_config.require_prompt
         self.samples = []
@@ -67,6 +71,20 @@ class InsertAnythingDataset(Dataset):
         return mask_prompt_root if mask_prompt_root.is_dir() else root
 
     def _load_dataset(self):
+        manifest_path = self._resolve_manifest_path()
+        if manifest_path is not None and manifest_path.is_file():
+            logging.info(f"Loading InsertAnything manifest from {manifest_path}")
+            self._load_from_manifest(manifest_path)
+        elif manifest_path is not None:
+            logging.warning(f"manifest_path not found, falling back to dataset scan: {manifest_path}")
+            self._load_dataset_without_manifest()
+        else:
+            self._load_dataset_without_manifest()
+
+        if len(self.samples) == 0:
+            raise ValueError(f"No InsertAnything samples loaded from {self.dataset_path}")
+
+    def _load_dataset_without_manifest(self):
         if self._is_huggingface_repo(self.dataset_path):
             self._load_from_huggingface()
         elif self._is_local_folder_dataset(self.dataset_path):
@@ -80,9 +98,6 @@ class InsertAnythingDataset(Dataset):
             self._load_from_local_parquet()
         else:
             raise FileNotFoundError(f"Unsupported or missing dataset_path: {self.dataset_path}")
-
-        if len(self.samples) == 0:
-            raise ValueError(f"No InsertAnything samples loaded from {self.dataset_path}")
 
     def _is_local_folder_dataset(self, path: str) -> bool:
         if not os.path.isdir(path):
@@ -140,6 +155,88 @@ class InsertAnythingDataset(Dataset):
         logging.info(f"Found categories: {[d.name for d in category_dirs]}")
         for category_dir in category_dirs:
             self._scan_category(category_dir, category_dir.name)
+
+    def _resolve_manifest_path(self) -> Optional[Path]:
+        if not self.manifest_path:
+            return None
+
+        path = Path(self.manifest_path)
+        if path.is_absolute():
+            return path
+        if isinstance(self.dataset_path, str):
+            return Path(self.dataset_path) / path
+        return path
+
+    def _category_filter(self) -> Optional[set[str]]:
+        if not self.categories:
+            return None
+        if isinstance(self.categories, str):
+            return {self.categories}
+        return set(self.categories)
+
+    def _load_from_manifest(self, manifest_path: Path):
+        category_filter = self._category_filter()
+        skipped = 0
+
+        for idx, row in enumerate(self._iter_manifest_rows(manifest_path)):
+            sample = self._sample_from_manifest_row(row, idx)
+            if category_filter is not None and sample.get("category") not in category_filter:
+                skipped += 1
+                continue
+            self.samples.append(sample)
+
+        logging.info(
+            f"Loaded {len(self.samples)} samples from manifest {manifest_path}"
+            + (f", skipped {skipped} by categories" if skipped else "")
+        )
+
+    def _iter_manifest_rows(self, manifest_path: Path):
+        suffix = manifest_path.suffix.lower()
+        if suffix == ".jsonl":
+            with manifest_path.open("r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        yield json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        raise ValueError(f"Invalid JSONL manifest row {line_no}: {manifest_path}") from exc
+            return
+
+        if suffix == ".json":
+            with manifest_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            rows = data.get("samples") if isinstance(data, dict) else data
+            if not isinstance(rows, list):
+                raise ValueError("JSON manifest must be a list or an object with a 'samples' list")
+            yield from rows
+            return
+
+        if suffix in {".csv", ".tsv"}:
+            delimiter = "\t" if suffix == ".tsv" else ","
+            with manifest_path.open("r", encoding="utf-8", newline="") as f:
+                yield from csv.DictReader(f, delimiter=delimiter)
+            return
+
+        raise ValueError(f"Unsupported manifest format: {manifest_path}")
+
+    def _sample_from_manifest_row(self, row: Dict[str, Any], idx: int) -> Dict[str, Any]:
+        required = ["ref_image", "ref_mask", "tar_image", "tar_mask"]
+        missing = [key for key in required if not row.get(key)]
+        if missing:
+            raise ValueError(f"Manifest sample {idx} is missing required fields: {missing}")
+
+        return {
+            "dataset_type": "local_manifest",
+            "ref_image": row["ref_image"],
+            "ref_mask": row["ref_mask"],
+            "tar_image": row["tar_image"],
+            "tar_mask": row["tar_mask"],
+            "category": row.get("category", "unknown"),
+            "stem": row.get("stem", ""),
+            "prompt": row.get("prompt", ""),
+        }
 
     def _scan_category(self, category_dir: Path, category: str):
         ref_image_dir = category_dir / "ref_image"
@@ -284,18 +381,25 @@ class InsertAnythingDataset(Dataset):
             path = image_path_or_pil
             if not os.path.isabs(path):
                 path = os.path.join(self.dataset_path, path)
-            with PIL.Image.open(path) as img:
-                return np.array(img.convert("RGB"))
+            img = cv2.imread(path, cv2.IMREAD_COLOR)
+            if img is None:
+                raise ValueError(f"Failed to read image: {path}")
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         if isinstance(image_path_or_pil, dict):
             image_bytes = image_path_or_pil.get("bytes")
             image_path = image_path_or_pil.get("path")
             if image_bytes is not None:
-                with PIL.Image.open(BytesIO(image_bytes)) as img:
-                    return np.array(img.convert("RGB"))
+                img = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if img is None:
+                    with PIL.Image.open(BytesIO(image_bytes)) as pil_img:
+                        return np.array(pil_img.convert("RGB"))
+                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             if image_path:
                 path = image_path if os.path.isabs(image_path) else os.path.join(self.dataset_path, image_path)
-                with PIL.Image.open(path) as img:
-                    return np.array(img.convert("RGB"))
+                img = cv2.imread(path, cv2.IMREAD_COLOR)
+                if img is None:
+                    raise ValueError(f"Failed to read image: {path}")
+                return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             raise ValueError("Image dict must contain either 'bytes' or 'path'.")
         if isinstance(image_path_or_pil, PIL.Image.Image):
             return np.array(image_path_or_pil.convert("RGB"))
@@ -308,18 +412,25 @@ class InsertAnythingDataset(Dataset):
             path = mask_path_or_pil
             if not os.path.isabs(path):
                 path = os.path.join(self.dataset_path, path)
-            with PIL.Image.open(path) as mask:
-                return np.array(mask.convert("L"))
+            mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise ValueError(f"Failed to read mask: {path}")
+            return mask
         if isinstance(mask_path_or_pil, dict):
             mask_bytes = mask_path_or_pil.get("bytes")
             mask_path = mask_path_or_pil.get("path")
             if mask_bytes is not None:
-                with PIL.Image.open(BytesIO(mask_bytes)) as mask:
-                    return np.array(mask.convert("L"))
+                mask = cv2.imdecode(np.frombuffer(mask_bytes, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+                if mask is None:
+                    with PIL.Image.open(BytesIO(mask_bytes)) as pil_mask:
+                        return np.array(pil_mask.convert("L"))
+                return mask
             if mask_path:
                 path = mask_path if os.path.isabs(mask_path) else os.path.join(self.dataset_path, mask_path)
-                with PIL.Image.open(path) as mask:
-                    return np.array(mask.convert("L"))
+                mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if mask is None:
+                    raise ValueError(f"Failed to read mask: {path}")
+                return mask
             raise ValueError("Mask dict must contain either 'bytes' or 'path'.")
         if isinstance(mask_path_or_pil, PIL.Image.Image):
             return np.array(mask_path_or_pil.convert("L"))

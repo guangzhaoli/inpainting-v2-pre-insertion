@@ -72,7 +72,7 @@ Accelerate entry:
 accelerate launch -m src.main --config configs/insert_anything_fixed_pixels_parquet.yaml
 ```
 
-Training checkpoints now always save accelerator state. Resume requires a checkpoint directory that contains the accelerator state files and LoRA weights.
+Training checkpoints are LoRA-only by default. Resume expects a checkpoint directory with LoRA weights, optimizer and scheduler state, `state.json`, and per-rank `random_states_*.pkl` files; the frozen base model is loaded again from `model.pretrained_model_name_or_path`.
 
 ## Inference
 

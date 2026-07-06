@@ -26,8 +26,13 @@ MASTER_PORT="${MASTER_PORT:-${MAIN_PROCESS_PORT:-19001}}"
 WORLD_SIZE="${WORLD_SIZE:-${NUM_MACHINES:-1}}"
 RANK="${RANK:-${MACHINE_RANK:-${NODE_RANK:-0}}}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-$(count_gpus)}"
-TOTAL_PROCESSES="${TOTAL_PROCESSES:-$((WORLD_SIZE * NPROC_PER_NODE))}"
+TOTAL_PROCESSES="${TOTAL_PROCESSES:-${NUM_PROCESSES:-$((WORLD_SIZE * NPROC_PER_NODE))}}"
 DEFAULT_CONFIG_FILE="${SCRIPT_DIR}/configs/insert_anything_${TOTAL_PROCESSES}.yaml"
+USER_CONFIG_ARG="${1:-}"
+if [[ -n "${USER_CONFIG_ARG}" && -z "${CONFIG_FILE:-}" ]]; then
+    CONFIG_FILE="${USER_CONFIG_ARG}"
+    shift
+fi
 CONFIG_FILE="${CONFIG_FILE:-${DEFAULT_CONFIG_FILE}}"
 
 if [[ -z "${MASTER_ADDR}" ]]; then
@@ -67,4 +72,4 @@ echo "CONFIG_FILE: ${CONFIG_FILE}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "=================================================="
 
-exec "${SCRIPT_DIR}/run.sh"
+exec "${SCRIPT_DIR}/run.sh" "$@"

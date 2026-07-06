@@ -601,15 +601,39 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
         ).to(device)
 
         drop_idx = self.prompt_template_encode_start_idx
-        outputs = self.text_encoder(
-            input_ids=model_inputs.input_ids,
-            attention_mask=model_inputs.attention_mask,
-            pixel_values=model_inputs.pixel_values,
-            image_grid_thw=model_inputs.image_grid_thw,
-            output_hidden_states=True,
-        )
+        if return_query_features:
+            outputs = self.text_encoder(
+                input_ids=model_inputs.input_ids,
+                attention_mask=model_inputs.attention_mask,
+                pixel_values=model_inputs.pixel_values,
+                image_grid_thw=model_inputs.image_grid_thw,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            final_hidden_states = outputs.hidden_states[-1]
+        else:
+            encoder = getattr(self.text_encoder, "model", None)
+            if encoder is not None:
+                outputs = encoder(
+                    input_ids=model_inputs.input_ids,
+                    attention_mask=model_inputs.attention_mask,
+                    pixel_values=model_inputs.pixel_values,
+                    image_grid_thw=model_inputs.image_grid_thw,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                final_hidden_states = outputs.last_hidden_state
+            else:
+                outputs = self.text_encoder(
+                    input_ids=model_inputs.input_ids,
+                    attention_mask=model_inputs.attention_mask,
+                    pixel_values=model_inputs.pixel_values,
+                    image_grid_thw=model_inputs.image_grid_thw,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                final_hidden_states = outputs.hidden_states[-1]
 
-        final_hidden_states = outputs.hidden_states[-1]
         split_hidden_states = self._extract_masked_hidden(final_hidden_states, model_inputs.attention_mask)
         split_hidden_states = [hidden_state[drop_idx:] for hidden_state in split_hidden_states]
         prompt_embeds, encoder_attention_mask = self._pad_hidden_sequences(split_hidden_states)

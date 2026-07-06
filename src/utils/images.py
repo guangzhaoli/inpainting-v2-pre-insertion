@@ -318,24 +318,58 @@ def extract_foreground_from_image_and_mask(
     if mask_np.max() == 0:
         return image_np, mask_np
 
-    image_t = torch.from_numpy(image_np.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
-    mask_t = torch.from_numpy(mask_np.astype(np.float32) / 255.0).unsqueeze(0)
+    height, width = mask_np.shape[:2]
+    y_coords, x_coords = np.where(mask_np > 127)
+    y1, y2 = int(y_coords.min()), int(y_coords.max()) + 1
+    x1, x2 = int(x_coords.min()), int(x_coords.max()) + 1
 
-    cropped_image, cropped_mask, _ = crop_to_mask_with_padding(
-        image_t,
-        mask_t,
-        padding_ratio=padding_ratio,
-        min_size=min_size,
-        align_to=align_to,
-    )
+    bbox_h = y2 - y1
+    bbox_w = x2 - x1
+    pad_h = int(bbox_h * padding_ratio)
+    pad_w = int(bbox_w * padding_ratio)
 
-    cropped_image_np = (cropped_image.squeeze(0).permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
-    cropped_mask_np = (cropped_mask.squeeze(0).clamp(0, 1).cpu().numpy() > 0.5).astype(np.uint8) * 255
+    y1_padded = max(0, y1 - pad_h)
+    x1_padded = max(0, x1 - pad_w)
+    y2_padded = min(height, y2 + pad_h)
+    x2_padded = min(width, x2 + pad_w)
 
-    mask_f = (cropped_mask_np.astype(np.float32) / 255.0)[:, :, None]
-    masked_image_np = cropped_image_np.astype(np.float32) * mask_f + 255.0 * (1.0 - mask_f)
-    masked_image_np = masked_image_np.round().astype(np.uint8)
-    return masked_image_np, cropped_mask_np
+    crop_h = y2_padded - y1_padded
+    crop_w = x2_padded - x1_padded
+    if crop_h < min_size:
+        deficit = min_size - crop_h
+        y1_padded = max(0, y1_padded - deficit // 2)
+        y2_padded = min(height, y2_padded + (deficit - deficit // 2))
+    if crop_w < min_size:
+        deficit = min_size - crop_w
+        x1_padded = max(0, x1_padded - deficit // 2)
+        x2_padded = min(width, x2_padded + (deficit - deficit // 2))
+
+    crop_h = y2_padded - y1_padded
+    crop_w = x2_padded - x1_padded
+    aligned_h = max(align_to, (crop_h // align_to) * align_to)
+    aligned_w = max(align_to, (crop_w // align_to) * align_to)
+
+    h_adjust = crop_h - aligned_h
+    w_adjust = crop_w - aligned_w
+    y1_aligned = y1_padded + h_adjust // 2
+    x1_aligned = x1_padded + w_adjust // 2
+    y2_aligned = y1_aligned + aligned_h
+    x2_aligned = x1_aligned + aligned_w
+
+    if y2_aligned > height:
+        y1_aligned = height - aligned_h
+        y2_aligned = height
+    if x2_aligned > width:
+        x1_aligned = width - aligned_w
+        x2_aligned = width
+
+    y1_aligned = max(0, y1_aligned)
+    x1_aligned = max(0, x1_aligned)
+
+    cropped_image_np = image_np[y1_aligned:y2_aligned, x1_aligned:x2_aligned]
+    cropped_mask_np = mask_np[y1_aligned:y2_aligned, x1_aligned:x2_aligned]
+    masked_image_np = np.where(cropped_mask_np[:, :, None] > 127, cropped_image_np, 255).astype(np.uint8)
+    return np.ascontiguousarray(masked_image_np), np.ascontiguousarray(cropped_mask_np)
 
 
 def _normalize_mask_bhw(mask: torch.Tensor) -> torch.Tensor:

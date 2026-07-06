@@ -4,12 +4,13 @@ Defines the core interface that all trainers must implement.
 """
 
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration
+from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs, ProjectConfiguration
 from abc import ABC, abstractmethod
 from typing import Dict, Optional, Tuple
 import math
 import re
 import shutil
+import random
 
 import torch
 import torch.nn as nn
@@ -43,6 +44,13 @@ from src.utils.lora_utils import classify_lora_weight, filter_lora_state_keys
 from src.trainer.constants import LORA_FILE_BASE_NAME
 
 logger = logging.getLogger(__name__)
+
+OPTIMIZER_FILE_NAME = "optimizer.bin"
+SCHEDULER_FILE_NAME = "scheduler.bin"
+TRAIN_STATE_FILE_NAME = "state.json"
+RANDOM_STATE_FILE_TEMPLATE = "random_states_{process_index}.pkl"
+CHECKPOINT_TYPE_LORA_ONLY = "lora_only"
+PEFT_LORA_FILE_NAME = "model.safetensors"
 
 
 def collect_lora_linears(root: nn.Module):
@@ -174,27 +182,11 @@ class BaseTrainer(ABC):
         self.config.logging.output_dir = versioned_dir
         logging.info(f"使用训练版本目录: {versioned_dir}")
 
-    @staticmethod
-    def _has_accelerator_state(resume_dir: str | None) -> bool:
-        if resume_dir is None:
-            return False
-        accelerator_state_files = [
-            os.path.join(resume_dir, "random_states_0.pkl"),
-            os.path.join(resume_dir, "random_states.pkl"),
-        ]
-        return any(os.path.exists(path) for path in accelerator_state_files)
-
     def accelerator_prepare(self, train_dataloader):
         """Prepare accelerator"""
         # 根据配置决定是否启用梯度检查点
         if self.config.train.gradient_checkpointing:
             self.dit.enable_gradient_checkpointing()
-        resume_has_accelerator_state = self._has_accelerator_state(self.config.resume)
-        if self.config.resume is not None and not resume_has_accelerator_state:
-            raise FileNotFoundError(
-                f"resume requires accelerator state files under {self.config.resume}; "
-                "expected random_states_0.pkl or random_states.pkl"
-            )
 
         # sdp_kernel(enable_flash=False, enable_math=False, enable_mem_efficient=True)
 
@@ -290,7 +282,7 @@ class BaseTrainer(ABC):
         """Clip gradients"""
         if self.accelerator.sync_gradients:
             self.accelerator.clip_grad_norm_(
-                self.dit.parameters(),
+                self._trainable_params,
                 self.config.train.max_grad_norm,
             )
 
@@ -362,7 +354,7 @@ class BaseTrainer(ABC):
                 self.accelerator.backward(loss)
                 self.clip_gradients()
                 self.optimizer.step()
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
             if self.accelerator.sync_gradients:
                 self.lr_scheduler.step()
                 self.batch_in_epoch = batch_idx + 1
@@ -421,8 +413,7 @@ class BaseTrainer(ABC):
     def load_resume_progress(self):
         """Load global_step/epoch metadata for resume."""
         if self.config.resume is not None:
-            with open(os.path.join(self.config.resume, "state.json")) as f:
-                st = json.load(f)
+            st = self._load_train_state(self.config.resume)
             self.global_step = st["global_step"]
             self.start_epoch = st["epoch"]
             self.resume_batch_in_epoch = st.get("batch_in_epoch", 0)
@@ -481,6 +472,7 @@ class BaseTrainer(ABC):
         self.setup_accelerator()
         self.load_model()
         if self.config.resume is not None:
+            self._validate_lora_resume_checkpoint(self.config.resume)
             self.config.model.lora.pretrained_weight = self._resolve_resume_lora_weight(self.config.resume)
             logging.info(f"Loaded checkpoint from {self.config.model.lora.pretrained_weight}")
         if self.config.model.quantize:
@@ -614,6 +606,10 @@ class BaseTrainer(ABC):
             mixed_precision=self.config.train.mixed_precision,
             log_with=self.config.logging.report_to,
             project_config=accelerator_project_config,
+            kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+            dataloader_config=DataLoaderConfiguration(
+                non_blocking=self.config.data.non_blocking,
+            ),
         )
 
         # Initialize tracker with empty project name to avoid subdirectory
@@ -661,30 +657,106 @@ class BaseTrainer(ABC):
             os.makedirs(save_path, exist_ok=True)
         self.accelerator.wait_for_everyone()
 
-        self.accelerator.save_state(save_path)
+        self._save_random_state(save_path)
 
         if self.accelerator.is_main_process:
             self.save_lora(save_path, adapter_name=self.adapter_name)
             self.save_additional_modules(save_path)
-            torch.save(self.optimizer.state_dict(), os.path.join(save_path, "optimizer.bin"))
+            torch.save(self.optimizer.state_dict(), os.path.join(save_path, OPTIMIZER_FILE_NAME))
             if self.lr_scheduler is not None:
-                torch.save(self.lr_scheduler.state_dict(), os.path.join(save_path, "scheduler.bin"))
+                torch.save(self.lr_scheduler.state_dict(), os.path.join(save_path, SCHEDULER_FILE_NAME))
 
             state_info = {
+                "checkpoint_type": CHECKPOINT_TYPE_LORA_ONLY,
                 "global_step": global_step,
                 "epoch": epoch,
                 "batch_in_epoch": self.batch_in_epoch,
                 "is_last": is_last,
-                "used_accelerate_state": True,
+                "used_accelerate_state": False,
+                "num_processes": self.accelerator.num_processes,
+                "random_state_pattern": RANDOM_STATE_FILE_TEMPLATE,
             }
             if is_last:
                 git_info = get_git_info()
                 state_info.update(git_info)
-            with open(os.path.join(save_path, "state.json"), "w") as f:
+            with open(os.path.join(save_path, TRAIN_STATE_FILE_NAME), "w") as f:
                 json.dump(state_info, f)
             self._enforce_checkpoints_total_limit()
         self.accelerator.wait_for_everyone()
         self.fps_logger.resume()
+
+    @staticmethod
+    def _torch_load(path: str, map_location=None):
+        try:
+            return torch.load(path, map_location=map_location, weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location=map_location)
+
+    @staticmethod
+    def _load_train_state(checkpoint_dir: str) -> dict:
+        state_path = os.path.join(checkpoint_dir, TRAIN_STATE_FILE_NAME)
+        if not os.path.exists(state_path):
+            raise FileNotFoundError(f"Missing training state file: {state_path}")
+        with open(state_path) as f:
+            return json.load(f)
+
+    def _random_state_path(self, checkpoint_dir: str, process_index: int | None = None) -> str:
+        if process_index is None:
+            process_index = self.accelerator.process_index if self.accelerator is not None else 0
+        return os.path.join(
+            checkpoint_dir,
+            RANDOM_STATE_FILE_TEMPLATE.format(process_index=process_index),
+        )
+
+    def _save_random_state(self, checkpoint_dir: str):
+        state = {
+            "process_index": self.accelerator.process_index,
+            "random_state": random.getstate(),
+            "numpy_random_seed": np.random.get_state(),
+            "torch_manual_seed": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["torch_cuda_manual_seed"] = torch.cuda.get_rng_state_all()
+        torch.save(state, self._random_state_path(checkpoint_dir))
+
+    def _load_random_state(self, checkpoint_dir: str):
+        random_state_path = self._random_state_path(checkpoint_dir)
+        if not os.path.exists(random_state_path):
+            raise FileNotFoundError(f"Missing random state file for this rank: {random_state_path}")
+
+        state = self._torch_load(random_state_path, map_location="cpu")
+        random.setstate(state["random_state"])
+        np.random.set_state(state["numpy_random_seed"])
+        torch.set_rng_state(state["torch_manual_seed"])
+        if torch.cuda.is_available() and "torch_cuda_manual_seed" in state:
+            torch.cuda.set_rng_state_all(state["torch_cuda_manual_seed"])
+
+    def _validate_lora_resume_checkpoint(self, checkpoint_dir: str):
+        if not os.path.isdir(checkpoint_dir):
+            raise FileNotFoundError(f"Resume checkpoint directory not found: {checkpoint_dir}")
+        train_state = self._load_train_state(checkpoint_dir)
+        self._resolve_resume_lora_weight(checkpoint_dir)
+        saved_num_processes = train_state.get("num_processes")
+        if (
+            saved_num_processes is not None
+            and self.accelerator is not None
+            and int(saved_num_processes) != self.accelerator.num_processes
+        ):
+            logging.warning(
+                "Resuming LoRA-only checkpoint with a different process count: saved=%s current=%s. "
+                "This is allowed, but data order and RNG continuity may differ.",
+                saved_num_processes,
+                self.accelerator.num_processes,
+            )
+
+        required_files = [
+            OPTIMIZER_FILE_NAME,
+            SCHEDULER_FILE_NAME,
+            os.path.basename(self._random_state_path(checkpoint_dir)),
+        ]
+        missing = [name for name in required_files if not os.path.exists(os.path.join(checkpoint_dir, name))]
+        if missing:
+            raise FileNotFoundError(f"Resume checkpoint {checkpoint_dir} is missing required files: {missing}")
 
     def _enforce_checkpoints_total_limit(self):
         """Keep only the newest regular checkpoints according to train.checkpoints_total_limit."""
@@ -729,11 +801,18 @@ class BaseTrainer(ABC):
             unwrapped_transformer = unwrapped_transformer._orig_mod
         adapter_name = self.adapter_name if adapter_name is None else adapter_name
 
-        lora_state_dict = convert_state_dict_to_diffusers(
-            get_peft_model_state_dict(unwrapped_transformer, adapter_name=adapter_name)
+        peft_lora_state_dict = get_peft_model_state_dict(unwrapped_transformer, adapter_name=adapter_name)
+        peft_lora_state_dict = {
+            key: value.detach().cpu() for key, value in peft_lora_state_dict.items()
+        }
+        safetensors.torch.save_file(
+            peft_lora_state_dict,
+            os.path.join(save_folder, PEFT_LORA_FILE_NAME),
         )
-        self.pipeline_class.save_lora_weights(save_folder, lora_state_dict, safe_serialization=True)
-        logging.info(f"Saved LoRA weights to {save_folder}")
+
+        diffusers_lora_state_dict = convert_state_dict_to_diffusers(peft_lora_state_dict)
+        self.pipeline_class.save_lora_weights(save_folder, diffusers_lora_state_dict, safe_serialization=True)
+        logging.info(f"Saved PEFT and Diffusers LoRA weights to {save_folder}")
 
     def save_additional_modules(self, save_folder):
         return
@@ -789,6 +868,9 @@ class BaseTrainer(ABC):
             lora_layers,
             **optimizer_config,
         )
+        # Cache trainable params for gradient clipping: avoids re-traversing the
+        # full (mostly frozen) DiT parameter set every step.
+        self._trainable_params = lora_layers
 
     def configure_lr_scheduler(self):
         """Configure LR scheduler after the exact steps/epoch is known."""
@@ -809,51 +891,47 @@ class BaseTrainer(ABC):
             scheduler_type,
             **scheduler_kwargs,
         )
-        if hasattr(self.accelerator, "register_for_checkpointing"):
-            self.accelerator.register_for_checkpointing(self.lr_scheduler)
-        if self.config.resume is not None and not self._has_accelerator_state(self.config.resume):
-            raise FileNotFoundError(
-                f"resume requires accelerator state files under {self.config.resume}; "
-                "expected random_states_0.pkl or random_states.pkl"
-            )
 
     def restore_training_state(self):
-        """Restore accelerator-managed state."""
+        """Restore LoRA-only optimizer, scheduler, and RNG state."""
         self.used_accelerate_resume = False
         if self.config.resume is None:
             return
 
-        if not self._has_accelerator_state(self.config.resume):
-            raise FileNotFoundError(
-                f"resume requires accelerator state files under {self.config.resume}; "
-                "expected random_states_0.pkl or random_states.pkl"
-            )
+        optimizer_path = os.path.join(self.config.resume, OPTIMIZER_FILE_NAME)
+        scheduler_path = os.path.join(self.config.resume, SCHEDULER_FILE_NAME)
 
         try:
-            self.accelerator.load_state(self.config.resume)
-            self.used_accelerate_resume = True
-            logging.info(f"Loaded accelerator state from {self.config.resume}")
+            optimizer_state = self._torch_load(optimizer_path, map_location="cpu")
+            self.optimizer.load_state_dict(optimizer_state)
+            if self.lr_scheduler is not None:
+                scheduler_state = self._torch_load(scheduler_path, map_location="cpu")
+                self.lr_scheduler.load_state_dict(scheduler_state)
+            self._load_random_state(self.config.resume)
+            logging.info(f"Loaded LoRA-only training state from {self.config.resume}")
         except Exception as e:
-            raise RuntimeError(f"Failed to load accelerator state from {self.config.resume}: {e}") from e
+            raise RuntimeError(f"Failed to load LoRA-only training state from {self.config.resume}: {e}") from e
 
     @staticmethod
     def _resolve_resume_lora_weight(resume_dir: str) -> str:
         """Resolve the LoRA weights file inside a checkpoint directory deterministically.
 
-        For training resume we prefer the PEFT-style checkpoint (`model.safetensors`)
-        when it exists. The diffusers export (`pytorch_lora_weights.safetensors`) is
-        sufficient for inference, but it can restore a smaller set of trainable LoRA
-        modules in this project, which then breaks optimizer state loading.
+        LoRA-only checkpoints save PEFT LoRA weights for exact training resume
+        and a Diffusers LoRA export for inference.
         """
         preferred_files = [
-            os.path.join(resume_dir, "model.safetensors"),
+            os.path.join(resume_dir, PEFT_LORA_FILE_NAME),
             os.path.join(resume_dir, LORA_FILE_BASE_NAME),
         ]
         for path in preferred_files:
             if os.path.exists(path):
                 return path
 
-        model_files = sorted(glob.glob(os.path.join(resume_dir, "*.safetensors")))
+        model_files = [
+            path
+            for path in sorted(glob.glob(os.path.join(resume_dir, "*.safetensors")))
+            if os.path.basename(path) != "query_prompt.safetensors"
+        ]
         if len(model_files) == 1:
             return model_files[0]
         if len(model_files) > 1:

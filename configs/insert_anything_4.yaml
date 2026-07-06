@@ -73,7 +73,7 @@ train:
   max_train_steps: 100000000000
   num_epochs: 10
   checkpointing_steps: 1000
-  checkpoints_total_limit: 1000
+  checkpoints_total_limit: 20
   max_grad_norm: 1.0
   mixed_precision: "bf16"
   gradient_checkpointing: true

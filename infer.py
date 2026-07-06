@@ -72,8 +72,8 @@ def resolve_lora_path(path: Path) -> Path:
         return path
 
     preferred_files = [
-        path / "model.safetensors",
         path / "pytorch_lora_weights.safetensors",
+        path / "model.safetensors",
     ]
     for candidate in preferred_files:
         if candidate.exists():

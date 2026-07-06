@@ -332,6 +332,7 @@ class ModelConfig(BaseModel):
 class DatasetInitArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     dataset_path: Union[str, List, None] = None
+    manifest_path: Optional[str] = None
     split: Optional[str] = None
     categories: Optional[Union[List[str], str]] = None
     require_prompt: bool = True
@@ -353,6 +354,10 @@ class DataConfig(BaseModel):
     init_args: DatasetInitArgs = Field(default_factory=DatasetInitArgs)
     batch_size: int = 1
     num_workers: int = 1
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    prefetch_factor: Optional[int] = 4
+    non_blocking: bool = True
     shuffle: bool = True
     drop_last: bool = True
 
@@ -375,6 +380,13 @@ class DataConfig(BaseModel):
     def _check_non_negative_int(cls, v: int) -> int:
         if v < 0:
             raise ValueError("num_workers must be >= 0")
+        return v
+
+    @field_validator("prefetch_factor")
+    @classmethod
+    def _check_prefetch_factor(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and v <= 0:
+            raise ValueError("prefetch_factor must be positive or None")
         return v
 
 
@@ -543,7 +555,7 @@ class TrainConfig(BaseModel):
     max_train_steps: int = 1000
     num_epochs: int = 3
     checkpointing_steps: int = 500
-    checkpoints_total_limit: Optional[int] = None
+    checkpoints_total_limit: Optional[int] = 20
     max_grad_norm: float = 1.0
     mixed_precision: str = "bf16"  # fp16 | bf16 | no
     gradient_checkpointing: bool = True

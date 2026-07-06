@@ -75,6 +75,15 @@ class QwenImageEditTrainer(BaseTrainer):
     _pack_latents = staticmethod(QwenImageEditPipeline._pack_latents)
     _unpack_latents = staticmethod(QwenImageEditPipeline._unpack_latents)
 
+    @staticmethod
+    def _move_tensor(tensor: torch.Tensor, device=None, dtype=None) -> torch.Tensor:
+        kwargs = {"non_blocking": tensor.device.type == "cpu"}
+        if device is not None:
+            kwargs["device"] = device
+        if dtype is not None:
+            kwargs["dtype"] = dtype
+        return tensor.to(**kwargs)
+
     def _cache_scheduler_training_tensors(self):
         if self.scheduler is None:
             raise ValueError("scheduler must be loaded before caching training timesteps")
@@ -258,7 +267,7 @@ class QwenImageEditTrainer(BaseTrainer):
             )
 
         device = self.vae.device
-        image = image.to(device=device, dtype=dtype)
+        image = self._move_tensor(image, device=device, dtype=dtype)
         if image.shape[1] != self.latent_channels:
             image_latents = self._encode_vae_image(image=image, generator=generator)
         else:
@@ -309,7 +318,7 @@ class QwenImageEditTrainer(BaseTrainer):
             latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
             latents = self._pack_latents(latents, batch_size, num_channels_latents, height, width)
         else:
-            latents = latents.to(device=device, dtype=dtype)
+            latents = self._move_tensor(latents, device=device, dtype=dtype)
         return latents
 
     def setup_model_device_train_mode(self, stage="fit"):
@@ -524,14 +533,14 @@ class QwenImageEditTrainer(BaseTrainer):
 
     def _compute_loss(self, embeddings: dict) -> torch.Tensor:
         device = self.accelerator.device
-        image_latents = embeddings["image_latents"].to(self.weight_dtype).to(device)
-        control_latents = embeddings["control_latents"].to(self.weight_dtype).to(device)
-        prompt_embeds = embeddings["prompt_embeds"].to(self.weight_dtype).to(device)
-        prompt_embeds_mask = embeddings["prompt_embeds_mask"].to(dtype=torch.int64).to(device)
+        image_latents = self._move_tensor(embeddings["image_latents"], device=device, dtype=self.weight_dtype)
+        control_latents = self._move_tensor(embeddings["control_latents"], device=device, dtype=self.weight_dtype)
+        prompt_embeds = self._move_tensor(embeddings["prompt_embeds"], device=device, dtype=self.weight_dtype)
+        prompt_embeds_mask = self._move_tensor(embeddings["prompt_embeds_mask"], device=device, dtype=torch.int64)
         img_shapes = embeddings["img_shapes"]
         batch_size = image_latents.shape[0]
         if "mask" in embeddings:
-            edit_mask = embeddings["mask"]
+            edit_mask = self._move_tensor(embeddings["mask"], device=device, dtype=torch.float32)
         else:
             edit_mask = None
 
@@ -576,7 +585,7 @@ class QwenImageEditTrainer(BaseTrainer):
     def _get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
         """Calculate sigma values for noise scheduler"""
         schedule_timesteps, sigmas = self._get_cached_scheduler_training_tensors(self.accelerator.device, dtype)
-        timesteps = timesteps.to(self.accelerator.device)
+        timesteps = self._move_tensor(timesteps, device=self.accelerator.device)
         if sigmas.numel() < schedule_timesteps.numel():
             raise ValueError(
                 f"scheduler sigmas must cover all timesteps: {sigmas.numel()} vs {schedule_timesteps.numel()}"
@@ -700,16 +709,28 @@ class QwenImageEditTrainer(BaseTrainer):
             return_tensors="pt",
         ).to(device)
 
+        encoder = getattr(self.text_encoder, "model", None)
         with torch.cuda.device(model_inputs.input_ids.device):  # 作用域内的 'cuda' 都指向同一张卡
-            outputs = self.text_encoder(
-                input_ids=model_inputs.input_ids,
-                attention_mask=model_inputs.attention_mask,
-                pixel_values=model_inputs.pixel_values,
-                image_grid_thw=model_inputs.image_grid_thw,
-                output_hidden_states=True,
-            )
-
-        hidden_states = outputs.hidden_states[-1]
+            if encoder is not None:
+                outputs = encoder(
+                    input_ids=model_inputs.input_ids,
+                    attention_mask=model_inputs.attention_mask,
+                    pixel_values=model_inputs.pixel_values,
+                    image_grid_thw=model_inputs.image_grid_thw,
+                    output_hidden_states=False,
+                    return_dict=True,
+                )
+                hidden_states = outputs.last_hidden_state
+            else:
+                outputs = self.text_encoder(
+                    input_ids=model_inputs.input_ids,
+                    attention_mask=model_inputs.attention_mask,
+                    pixel_values=model_inputs.pixel_values,
+                    image_grid_thw=model_inputs.image_grid_thw,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                hidden_states = outputs.hidden_states[-1]
 
         split_hidden_states = self._extract_masked_hidden(hidden_states, model_inputs.attention_mask)
         split_hidden_states = [e[drop_idx:] for e in split_hidden_states]

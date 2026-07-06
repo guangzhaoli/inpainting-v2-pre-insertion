@@ -569,6 +569,9 @@ def loader(
         init_args: dict,
         batch_size: int = 1,
         num_workers: int = 0,
+        pin_memory: bool = True,
+        persistent_workers: bool = True,
+        prefetch_factor: Optional[int] = 4,
         shuffle: bool = True,
         drop_last=True,
         seed: int = 1234) -> DataLoader:
@@ -609,14 +612,21 @@ def loader(
     # 使用init_args实例化类
     dataset = dataset_class(init_args)
     sampler = EpochShuffleSampler(dataset, seed=seed) if shuffle else SequentialSampler(dataset)
+    worker_kwargs = {}
+    if num_workers > 0:
+        worker_kwargs["persistent_workers"] = persistent_workers
+        if prefetch_factor is not None:
+            worker_kwargs["prefetch_factor"] = prefetch_factor
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
         sampler=sampler,
         num_workers=num_workers,
-        pin_memory=False,
+        pin_memory=pin_memory,
         collate_fn=collate_fn,
         drop_last=drop_last,
+        **worker_kwargs,
     )
     return dataloader
