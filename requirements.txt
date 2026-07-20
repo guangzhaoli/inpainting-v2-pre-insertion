@@ -30,5 +30,6 @@ blake3
 pillow
 rich
 imagehash
+faiss-cpu
 # wandb
 # transformer_engine[pytorch]

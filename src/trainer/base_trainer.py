@@ -6,6 +6,7 @@ Defines the core interface that all trainers must implement.
 from accelerate import Accelerator
 from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs, ProjectConfiguration
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from typing import Dict, Optional, Tuple
 import math
 import re
@@ -52,6 +53,13 @@ TRAIN_STATE_FILE_NAME = "state.json"
 RANDOM_STATE_FILE_TEMPLATE = "random_states_{process_index}.pkl"
 CHECKPOINT_TYPE_LORA_ONLY = "lora_only"
 PEFT_LORA_FILE_NAME = "model.safetensors"
+PEFT_LORA_PARAMETER_PREFIXES = (
+    "lora_A",
+    "lora_B",
+    "lora_embedding_A",
+    "lora_embedding_B",
+    "lora_magnitude_vector",
+)
 
 
 def collect_lora_linears(root: nn.Module):
@@ -128,14 +136,47 @@ class BaseTrainer(ABC):
         return msg
 
     def setup_signal_handlers(self):
-        """设置信号处理器来捕获Ctrl+C中断"""
+        """Handle interactive interrupts without swallowing Elastic failures.
+
+        SIGTERM is reserved for the launcher/Elastic agent so a peer failure can
+        tear workers down immediately.  SIGINT only sets a local flag; the flag
+        is synchronized at safe batch boundaries before any rank checkpoints.
+        """
 
         def signal_handler(signum, frame):
-            logging.info("收到中断信号，准备保存最后一个检查点...")
             self.training_interrupted = True
 
         signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+    def _sync_training_interrupted(self) -> bool:
+        """Synchronize a graceful SIGINT request at a DDP-safe boundary."""
+
+        accelerator = getattr(self, "accelerator", None)
+        if accelerator is None or int(getattr(accelerator, "num_processes", 1)) <= 1:
+            return bool(self.training_interrupted)
+
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "Distributed interrupt synchronization requires an initialized process group"
+            )
+
+        interrupt_flag = torch.tensor(
+            [int(bool(self.training_interrupted))],
+            device=accelerator.device,
+            dtype=torch.int32,
+        )
+        # Do not catch collective errors here.  A broken process group must tear
+        # the worker down instead of entering a checkpoint barrier.
+        torch.distributed.all_reduce(
+            interrupt_flag,
+            op=torch.distributed.ReduceOp.MAX,
+        )
+        # Never write False back: SIGINT may arrive after the local flag was
+        # copied into interrupt_flag but before this collective completes.
+        if bool(interrupt_flag.item()):
+            self.training_interrupted = True
+        return bool(self.training_interrupted)
 
     def log_model_info(self):
         """Log model information."""
@@ -340,11 +381,10 @@ class BaseTrainer(ABC):
                 )
                 return True
 
-            # 检查是否收到中断信号
-            if self.training_interrupted:
-                logger.info("检测到训练中断信号，保存最后检查点后退出本epoch...")
-                # 立刻做一次“last”保存（即使不是 checkpointing_steps 整除）
-                self.save_checkpoint(epoch, self.global_step, is_last=True)
+            if self._sync_training_interrupted():
+                logger.info(
+                    "检测到已同步的训练中断信号，将由统一退出路径保存一次最后检查点。"
+                )
                 return True
 
             if optimizer_step_start_time is None:
@@ -405,7 +445,7 @@ class BaseTrainer(ABC):
                     )
                     return True
         self.resume_batch_in_epoch = 0
-        return False
+        return self._sync_training_interrupted()
 
     @staticmethod
     def _set_dataloader_epoch(train_dataloader, epoch: int):
@@ -576,8 +616,6 @@ class BaseTrainer(ABC):
         for epoch in range(self.start_epoch, self.num_epochs):
             current_epoch = epoch
             stop_training = self.train_epoch(epoch, train_dataloader)
-            if self.training_interrupted:
-                break
             if stop_training:
                 break
 
@@ -595,6 +633,7 @@ class BaseTrainer(ABC):
             self.criterion = MaskEditLoss(
                 forground_weight=self.config.loss.forground_weight,
                 background_weight=self.config.loss.background_weight,
+                mode=self.config.loss.mask_loss_mode,
             )
         else:
             self.criterion = nn.MSELoss()
@@ -661,6 +700,56 @@ class BaseTrainer(ABC):
 
             return pil_images
         return image
+
+    def predict_loaded_model(self, **kwargs):
+        """Run prediction with the already-loaded training model.
+
+        This is used by training-time validation. It deliberately does not call
+        setup_predict(), because setup_predict() is for standalone inference and
+        may reload weights or move modules away from the training accelerator.
+        """
+        if self.dit is None or self.vae is None or self.text_encoder is None:
+            raise ValueError("predict_loaded_model requires loaded dit, vae, and text_encoder modules")
+
+        was_training = self.dit.training
+        self.dit.eval()
+        try:
+            with torch.inference_mode():
+                batch = self.prepare_predict_batch_data(**kwargs)
+                embeddings: dict = self.prepare_embeddings(batch, stage="predict")
+                target_height = embeddings["height"]
+                target_width = embeddings["width"]
+                latents = self.sampling_from_embeddings(embeddings)
+
+            # The prepared embedding dict can retain prompt/control/reference
+            # latents on GPU. Release it before moving the offloaded VAE decoder
+            # onto that device so the decoder can reuse the freed allocator blocks.
+            del embeddings
+            del batch
+
+            # Module device migration must happen outside inference_mode(); otherwise
+            # torch can permanently replace Parameter storage with inference tensors.
+            with self._loaded_model_decode_context():
+                with torch.inference_mode():
+                    image = self.decode_vae_latent(latents, target_height, target_width)
+            pil_images = self._tensor_batch_to_pil_images(image)
+        finally:
+            if was_training:
+                self.dit.train()
+        return pil_images
+
+    @contextmanager
+    def _loaded_model_decode_context(self):
+        """Prepare modules needed only while decoding a loaded training model."""
+        yield
+
+    @staticmethod
+    def _tensor_batch_to_pil_images(image: torch.Tensor):
+        image = image.detach().permute(0, 2, 3, 1).float().cpu().numpy()
+        image = (image * 255).round().astype("uint8")
+        if image.shape[-1] == 1:
+            return [PIL.Image.fromarray(item.squeeze(), mode="L") for item in image]
+        return [PIL.Image.fromarray(item) for item in image]
 
     def setup_accelerator(self):
         """Initialize accelerator and logging configuration"""
@@ -739,6 +828,20 @@ class BaseTrainer(ABC):
             if self.lr_scheduler is not None:
                 torch.save(self.lr_scheduler.state_dict(), os.path.join(save_path, SCHEDULER_FILE_NAME))
 
+            checkpoint_train_config = os.path.join(save_path, "train_config.yaml")
+            run_train_config = os.path.join(self.config.logging.output_dir, "train_config.yaml")
+            if os.path.isfile(run_train_config):
+                shutil.copy2(run_train_config, checkpoint_train_config)
+            else:
+                import yaml
+
+                with open(checkpoint_train_config, "w", encoding="utf-8") as file:
+                    yaml.safe_dump(
+                        self.config.model_dump(mode="json", exclude_none=True),
+                        file,
+                        sort_keys=False,
+                    )
+
             state_info = {
                 "checkpoint_type": CHECKPOINT_TYPE_LORA_ONLY,
                 "global_step": global_step,
@@ -748,6 +851,7 @@ class BaseTrainer(ABC):
                 "used_accelerate_state": False,
                 "num_processes": self.accelerator.num_processes,
                 "random_state_pattern": RANDOM_STATE_FILE_TEMPLATE,
+                "train_config": "train_config.yaml",
             }
             if is_last:
                 git_info = get_git_info()
@@ -1038,6 +1142,107 @@ class BaseTrainer(ABC):
         transformer.add_adapter(lora_config, adapter_name=adapter_name)
         transformer.set_adapter(adapter_name)
 
+    @staticmethod
+    def _peft_lora_key_candidates(key: str, adapter_name: str) -> list[str]:
+        candidates = [key]
+        for prefix in PEFT_LORA_PARAMETER_PREFIXES:
+            start_pattern = f"{prefix}."
+            nested_pattern = f".{prefix}."
+            if key.startswith(start_pattern):
+                suffix_start = len(start_pattern)
+            else:
+                index = key.find(nested_pattern)
+                if index < 0:
+                    continue
+                suffix_start = index + len(nested_pattern)
+
+            prefix_with_dot = key[:suffix_start]
+            suffix = key[suffix_start:]
+            if suffix:
+                candidates.append(f"{prefix_with_dot}{adapter_name}.{suffix}")
+                if "." in suffix:
+                    saved_adapter_name, suffix_without_adapter = suffix.split(".", 1)
+                    if saved_adapter_name not in {"weight"}:
+                        candidates.append(f"{prefix_with_dot}{adapter_name}.{suffix_without_adapter}")
+            break
+
+        deduped = []
+        seen = set()
+        for candidate in candidates:
+            if candidate not in seen:
+                deduped.append(candidate)
+                seen.add(candidate)
+        return deduped
+
+    @classmethod
+    def _normalize_peft_lora_state_dict(
+        cls,
+        transformer: torch.nn.Module,
+        state_dict: Dict[str, torch.Tensor],
+        adapter_name: str,
+    ) -> tuple[Dict[str, torch.Tensor], list[str]]:
+        model_keys = set(transformer.state_dict().keys())
+        normalized_state_dict = {}
+        unresolved_lora_keys = []
+
+        for key, value in state_dict.items():
+            target_key = key
+            candidates = cls._peft_lora_key_candidates(key, adapter_name)
+            for candidate in candidates:
+                if candidate in model_keys:
+                    target_key = candidate
+                    break
+
+            if target_key in normalized_state_dict:
+                raise ValueError(f"Duplicate PEFT LoRA key after adapter normalization: {target_key}")
+            normalized_state_dict[target_key] = value
+            if target_key not in model_keys and filter_lora_state_keys([key]):
+                unresolved_lora_keys.append(key)
+
+        return normalized_state_dict, unresolved_lora_keys
+
+    @classmethod
+    def _load_peft_lora_state_dict(
+        cls,
+        transformer: torch.nn.Module,
+        state_dict: Dict[str, torch.Tensor],
+        adapter_name: str,
+        stage: str,
+    ):
+        loaded_lora_keys = filter_lora_state_keys(state_dict.keys())
+        if len(loaded_lora_keys) == 0:
+            raise ValueError("PEFT LoRA weight has no LoRA state keys")
+
+        normalized_state_dict, unresolved_lora_keys = cls._normalize_peft_lora_state_dict(
+            transformer=transformer,
+            state_dict=state_dict,
+            adapter_name=adapter_name,
+        )
+        if len(unresolved_lora_keys) > 0:
+            raise ValueError(
+                f"Could not map PEFT LoRA keys to adapter={adapter_name} for stage={stage}: "
+                f"{len(unresolved_lora_keys)}, first_unresolved={unresolved_lora_keys[0]}"
+            )
+
+        missing, unexpected = transformer.load_state_dict(
+            normalized_state_dict,
+            strict=False,
+        )
+        missing = list(missing)
+        unexpected = list(unexpected)
+        if len(unexpected) > 0:
+            raise ValueError(
+                f"Unexpected LoRA keys while loading PEFT weights for stage={stage}: "
+                f"{len(unexpected)}, first_unexpected={unexpected[0]}"
+            )
+        missing_lora_keys = filter_lora_state_keys(missing)
+        if len(missing_lora_keys) > 0:
+            raise ValueError(
+                f"Missing LoRA keys while loading PEFT weights for stage={stage}: "
+                f"{len(missing_lora_keys)}, first_missing={missing_lora_keys[0]}"
+            )
+        return missing
+
     @classmethod
     def load_pretrain_lora_model(
         cls,
@@ -1071,22 +1276,12 @@ class BaseTrainer(ABC):
                 cls.add_lora_adapter(transformer, config, adapter_name)
 
                 state_dict = safetensors.torch.load_file(pretrained_weight)
-                loaded_lora_keys = filter_lora_state_keys(state_dict.keys())
-                if len(loaded_lora_keys) == 0:
-                    raise ValueError(f"PEFT LoRA weight has no LoRA state keys: {pretrained_weight}")
-
-                missing, unexpected = transformer.load_state_dict(
-                    state_dict,
-                    strict=False,
+                missing = cls._load_peft_lora_state_dict(
+                    transformer=transformer,
+                    state_dict=state_dict,
+                    adapter_name=adapter_name,
+                    stage=stage,
                 )
-                if len(unexpected) > 0:
-                    raise ValueError(f"Unexpected keys: {unexpected}")
-                missing_lora_keys = filter_lora_state_keys(missing)
-                if len(missing_lora_keys) > 0:
-                    raise ValueError(
-                        f"Missing LoRA keys while loading PEFT weights for stage={stage}: "
-                        f"{len(missing_lora_keys)}, first_missing={missing_lora_keys[0]}"
-                    )
                 logging.info(f"set_lora: {lora_type} Loaded lora from {pretrained_weight} for {adapter_name}")
                 if len(missing) > 0:
                     logging.info(

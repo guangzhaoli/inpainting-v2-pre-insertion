@@ -16,17 +16,14 @@ from infer_testset import (
     setup_trainer,
     stack_rows,
 )
+from src.utils.latent_anchoring import (
+    add_latent_anchoring_cli_args,
+    ensure_latent_anchoring_config,
+    latent_anchoring_metadata,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_LORA = (
-    REPO_ROOT
-    / "logs"
-    / "inpainting_v2_teacher_logs"
-    / "teacher_accessory_jewelry_native_qwen_image_inpainting"
-    / "v2"
-    / "checkpoint-last-4-9800-last"
-)
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "output" / "ref_sensitivity_ablation"
 
 
@@ -108,7 +105,12 @@ def parse_args(argv=None):
         description="Run reference sensitivity ablations by swapping references for fixed source samples."
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    parser.add_argument("--lora", type=Path, default=DEFAULT_LORA, help="LoRA file or checkpoint directory.")
+    parser.add_argument("--lora", type=Path, required=True, help="LoRA file or checkpoint directory.")
+    parser.add_argument(
+        "--allow-checkpoint-mismatch",
+        action="store_true",
+        help="Allow a missing or incompatible checkpoint train_config.yaml. Unsafe unless intentional.",
+    )
     parser.add_argument("--testset-root", type=Path, default=DEFAULT_TESTSET_ROOT)
     parser.add_argument("--category", type=str, default="accessory")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -134,6 +136,7 @@ def parse_args(argv=None):
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--panel-size", type=int, default=320)
+    add_latent_anchoring_cli_args(parser)
     return parser.parse_args(argv)
 
 
@@ -141,21 +144,30 @@ def main():
     args = parse_args()
     source_stems = parse_stems(args.source_stems)
     requested_ref_stems = parse_stems(args.ref_stems)
+    if not source_stems:
+        raise ValueError("--source-stems must contain at least one stem")
+    if args.max_ref_variants <= 0:
+        raise ValueError("--max-ref-variants must be positive")
 
     samples = discover_samples(args.testset_root, args.category, limit=None)
     sample_by_stem = build_sample_by_stem(samples)
     require_stems(sample_by_stem, source_stems, "source")
 
     ref_stems = choose_ref_stems(samples, source_stems, requested_ref_stems, args.max_ref_variants)
+    if not ref_stems:
+        raise ValueError("reference stem selection must not be empty")
     require_stems(sample_by_stem, ref_stems, "reference")
+    if args.seed + len(source_stems) - 1 >= 2**32:
+        raise ValueError("per-source seeds must remain in [0, 2**32)")
 
-    trainer, config, resolved_lora_path = setup_trainer(args)
+    trainer, config, resolved_lora_path, checkpoint_compatibility = setup_trainer(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     run_config = {
         "config": str(args.config),
         "checkpoint_arg": str(args.lora),
         "resolved_lora": str(resolved_lora_path),
+        "checkpoint_compatibility": checkpoint_compatibility,
         "testset_root": str(args.testset_root),
         "category": args.category,
         "source_stems": source_stems,
@@ -171,6 +183,7 @@ def main():
         "reference_cfg_enabled": bool(config.model.reference_cfg.enabled),
         "query_prompt_enabled": bool(config.model.query_prompt.enabled),
         "pre_insertion_enabled": bool(config.model.pre_insertion.enabled),
+        "latent_anchoring": latent_anchoring_metadata(ensure_latent_anchoring_config(config)),
     }
     write_json(args.output_dir / "run_config.json", run_config)
 
@@ -201,7 +214,15 @@ def main():
                     f"[src {source_stem}] ref {ref_stem}, seed {source_seed} -> {sample_dir}",
                     flush=True,
                 )
-                metadata, row_path = run_sample(trainer, sample, sample_dir, args, source_seed)
+                metadata, row_path = run_sample(
+                    trainer,
+                    sample,
+                    sample_dir,
+                    args,
+                    source_seed,
+                    resolved_lora_path=resolved_lora_path,
+                    checkpoint_compatibility=checkpoint_compatibility,
+                )
                 metadata["ablation"] = {
                     "source_stem": source_stem,
                     "ref_stem": ref_stem,

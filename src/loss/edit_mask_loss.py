@@ -6,6 +6,9 @@ import torch
 import torch.nn as nn
 
 
+MASK_LOSS_MODES = ("token_weighted", "region_balanced")
+
+
 def map_mask_to_latent(
     image_mask: Tensor,
     vae_scale_factor: int,
@@ -63,40 +66,104 @@ def map_mask_to_latent(
 
 
 class MaskEditLoss(nn.Module):
-    def __init__(self, forground_weight=2.0, background_weight=1.0):
+    """Mask-aware MSE with two reduction modes.
+
+    - ``token_weighted``: global weighted mean over all tokens
+      ``sum(w * e) / sum(w)`` with ``w = fg_w * m + bg_w * (1-m)``.
+      Mask area still controls how much total mass the edit region gets.
+
+    - ``region_balanced``: mean fg/bg losses separately, then mix with fixed ratio
+      ``(fg_w * mean_fg + bg_w * mean_bg) / (fg_w + bg_w)``.
+      Edit vs background contribution is independent of mask area.
+    """
+
+    def __init__(
+        self,
+        forground_weight: float = 2.0,
+        background_weight: float = 1.0,
+        mode: str = "token_weighted",
+        eps: float = 1e-8,
+    ):
         super().__init__()
-        self.forground_weight = forground_weight
-        self.background_weight = background_weight
+        if mode not in MASK_LOSS_MODES:
+            raise ValueError(f"mode must be one of {MASK_LOSS_MODES}, got {mode!r}")
+        if forground_weight <= 0 or background_weight <= 0:
+            raise ValueError("foreground/background weights must be > 0")
+        self.forground_weight = float(forground_weight)
+        self.background_weight = float(background_weight)
+        self.mode = mode
+        self.eps = float(eps)
 
     def forward(self, mask, model_pred, target, weighting=None):
         """
-        计算mask加权的loss
+        计算 mask 加权的 loss
         Args:
-            mask: [B, seq_len] - 二进制掩码，1表示修改区域，0表示背景区域
+            mask: [B, seq_len] - 掩码，1 表示修改区域，0 表示背景区域（可 soft）
             model_pred: [B, seq_len, channels] - 模型预测结果
             target: [B, seq_len, channels] - 目标值
             weighting: [B, seq_len, 1] - 可选的时间步权重
         Returns:
-            torch.Tensor - 加权后的loss值
+            torch.Tensor - scalar loss
         """
-        # 计算基础element-wise loss
         element_loss = (model_pred.float() - target.float()) ** 2
 
-        # 如果有weighting，应用到element_loss
         if weighting is not None:
             element_loss = weighting.float() * element_loss
 
-        # 创建权重掩码：文本区域权重更高
-        # mask: [B, seq_len] -> weight_mask: [B, seq_len, 1]
-        weight_mask = (mask * self.forground_weight + (1 - mask) * self.background_weight)
-        weight_mask = weight_mask.unsqueeze(-1)  # [B, seq_len, 1]
+        if self.mode == "token_weighted":
+            return self._token_weighted(mask, element_loss)
+        return self._region_balanced(mask, element_loss)
 
-        # Apply mask weights while preserving the loss scale for different mask areas.
+    def _token_weighted(self, mask: Tensor, element_loss: Tensor) -> Tensor:
+        # mask: [B, seq_len] -> weight_mask: [B, seq_len, 1]
+        weight_mask = mask.float() * self.forground_weight + (1.0 - mask.float()) * self.background_weight
+        weight_mask = weight_mask.unsqueeze(-1)
+
         weighted_loss = element_loss * weight_mask
-        normalizer = weight_mask.expand_as(element_loss).reshape(target.shape[0], -1).sum(dim=1)
+        normalizer = weight_mask.expand_as(element_loss).reshape(element_loss.shape[0], -1).sum(dim=1)
         if torch.any(normalizer <= 0):
             raise ValueError("MaskEditLoss normalizer must be positive. Check foreground/background weights.")
 
-        per_sample_loss = weighted_loss.reshape(target.shape[0], -1).sum(dim=1) / normalizer
-        loss = per_sample_loss.mean()
-        return loss
+        per_sample_loss = weighted_loss.reshape(element_loss.shape[0], -1).sum(dim=1) / normalizer
+        return per_sample_loss.mean()
+
+    def _region_balanced(self, mask: Tensor, element_loss: Tensor) -> Tensor:
+        """L = (α * mean_fg + β * mean_bg) / (α + β), independent of mask area.
+
+        Soft masks are supported: region means are weighted by mask / (1-mask).
+        If a sample has no fg or no bg mass, fall back to the non-empty region mean.
+        """
+        batch = element_loss.shape[0]
+        mask_f = mask.float().unsqueeze(-1)  # [B, seq_len, 1]
+        fg_map = mask_f.expand_as(element_loss)
+        bg_map = (1.0 - mask_f).expand_as(element_loss)
+
+        flat_loss = element_loss.reshape(batch, -1)
+        flat_fg = fg_map.reshape(batch, -1)
+        flat_bg = bg_map.reshape(batch, -1)
+
+        fg_mass = flat_fg.sum(dim=1)
+        bg_mass = flat_bg.sum(dim=1)
+
+        # Avoid 0/0; invalid regions are overwritten by the branch below.
+        fg_mean = (flat_loss * flat_fg).sum(dim=1) / fg_mass.clamp_min(self.eps)
+        bg_mean = (flat_loss * flat_bg).sum(dim=1) / bg_mass.clamp_min(self.eps)
+
+        has_fg = fg_mass > self.eps
+        has_bg = bg_mass > self.eps
+        has_both = has_fg & has_bg
+
+        alpha = self.forground_weight
+        beta = self.background_weight
+        mixed = (alpha * fg_mean + beta * bg_mean) / (alpha + beta)
+
+        per_sample = torch.where(
+            has_both,
+            mixed,
+            torch.where(has_fg, fg_mean, bg_mean),
+        )
+        if torch.any(~(has_fg | has_bg)):
+            raise ValueError(
+                "MaskEditLoss region_balanced requires positive foreground or background mass per sample."
+            )
+        return per_sample.mean()

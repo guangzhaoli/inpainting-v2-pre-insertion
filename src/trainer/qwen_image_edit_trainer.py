@@ -3,6 +3,7 @@ import torch.nn.functional as F  # NOQA
 import PIL
 import gc
 import numpy as np
+from contextlib import contextmanager
 from typing import Optional, Union, List, Tuple
 import logging
 from tqdm.auto import tqdm
@@ -20,6 +21,7 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import (
 from src.loss.edit_mask_loss import map_mask_to_latent
 from src.trainer.base_trainer import BaseTrainer
 from src.utils.tools import infer_image_tensor
+from src.utils.latent_anchoring import latent_anchoring_enabled, normalize_latent_anchoring_mode
 from src.utils.images import (
     calculate_best_resolution,
     image_adjust_best_resolution,
@@ -83,6 +85,283 @@ class QwenImageEditTrainer(BaseTrainer):
         if dtype is not None:
             kwargs["dtype"] = dtype
         return tensor.to(**kwargs)
+
+    @staticmethod
+    def _module_device(module: torch.nn.Module, module_name: str) -> torch.device:
+        devices = {tensor.device for tensor in module.parameters()}
+        devices.update(tensor.device for tensor in module.buffers())
+        if len(devices) == 0:
+            raise ValueError(f"{module_name} has no parameters or buffers; its device cannot be determined")
+        if len(devices) != 1:
+            formatted_devices = ", ".join(sorted(str(device) for device in devices))
+            raise RuntimeError(f"{module_name} spans multiple devices: {formatted_devices}")
+        return next(iter(devices))
+
+    def _vae_decode_device(self) -> torch.device:
+        if self.vae is None:
+            raise ValueError("VAE must be loaded before determining its decode device")
+        if not hasattr(self.vae, "post_quant_conv"):
+            raise ValueError("Loaded VAE has no post_quant_conv module")
+        return self._module_device(self.vae.post_quant_conv, "vae.post_quant_conv")
+
+    @contextmanager
+    def _loaded_model_decode_context(self):
+        """Temporarily place the offloaded VAE decoder on the VAE execution device."""
+        if self.vae is None:
+            raise ValueError("VAE must be loaded before preparing loaded-model decode")
+        if not hasattr(self.vae, "decoder"):
+            raise ValueError("Loaded VAE has no decoder module")
+
+        target_device = self._vae_decode_device()
+        original_device = self._module_device(self.vae.decoder, "vae.decoder")
+        if original_device == target_device:
+            yield
+            return
+
+        logging.info(
+            "Moving vae.decoder from %s to %s for training-time validation decode",
+            original_device,
+            target_device,
+        )
+        operation_error = None
+        try:
+            self.vae.decoder.to(target_device)
+            yield
+        except BaseException as error:
+            operation_error = error
+        finally:
+            try:
+                self.vae.decoder.to(original_device)
+                logging.info(
+                    "Restored vae.decoder from %s to %s after training-time validation decode",
+                    target_device,
+                    original_device,
+                )
+            except BaseException as restore_error:
+                if operation_error is not None:
+                    raise BaseExceptionGroup(
+                        "Training-time validation decode and vae.decoder restoration both failed",
+                        [operation_error, restore_error],
+                    )
+                raise
+
+        if operation_error is not None:
+            raise operation_error
+
+    @staticmethod
+    def _combine_reference_cfg_predictions(
+        noise_pred: torch.Tensor,
+        reference_cfg_noise_pred: torch.Tensor,
+        reference_cfg_scale: float,
+        reference_cfg_mask: Optional[torch.Tensor] = None,
+        delta_clip_enabled: bool = False,
+        delta_clip_max_ratio: float = 0.5,
+    ) -> torch.Tensor:
+        if noise_pred.shape != reference_cfg_noise_pred.shape:
+            raise ValueError(
+                "reference_cfg noise prediction shape must match positive prediction shape, "
+                f"got {tuple(reference_cfg_noise_pred.shape)} and {tuple(noise_pred.shape)}"
+            )
+        if delta_clip_max_ratio <= 0:
+            raise ValueError("reference_cfg delta_clip_max_ratio must be positive")
+
+        reference_delta = noise_pred - reference_cfg_noise_pred
+        cfg_delta = reference_delta
+        if delta_clip_enabled:
+            delta_norm = torch.norm(reference_delta.float(), dim=-1, keepdim=True)
+            positive_norm = torch.norm(noise_pred.float(), dim=-1, keepdim=True)
+            max_delta_norm = positive_norm * float(delta_clip_max_ratio)
+            delta_scale = max_delta_norm / torch.clamp(delta_norm, min=1e-6)
+            delta_scale = torch.clamp(delta_scale, max=1.0).to(dtype=reference_delta.dtype)
+            cfg_delta = reference_delta * delta_scale
+
+        guided_pred = reference_cfg_noise_pred + reference_cfg_scale * cfg_delta
+        if reference_cfg_mask is None:
+            comb_pred = guided_pred
+        else:
+            if reference_cfg_mask.ndim == 2:
+                reference_cfg_mask = reference_cfg_mask.unsqueeze(-1)
+            if reference_cfg_mask.ndim != 3 or reference_cfg_mask.shape[-1] != 1:
+                raise ValueError(
+                    "reference_cfg_mask must be [B, seq_len] or [B, seq_len, 1], "
+                    f"got {tuple(reference_cfg_mask.shape)}"
+                )
+            if reference_cfg_mask.shape[:2] != noise_pred.shape[:2]:
+                raise ValueError(
+                    "reference_cfg_mask shape must match prediction batch and sequence dimensions, "
+                    f"got {tuple(reference_cfg_mask.shape)} for prediction {tuple(noise_pred.shape)}"
+                )
+            reference_cfg_mask = reference_cfg_mask.to(device=noise_pred.device, dtype=noise_pred.dtype)
+            comb_pred = noise_pred * (1.0 - reference_cfg_mask) + guided_pred * reference_cfg_mask
+
+        if delta_clip_enabled:
+            return comb_pred
+
+        cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+        noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+        noise_norm = torch.clamp(noise_norm, min=1e-6)
+        return comb_pred * (cond_norm / noise_norm)
+
+    def _prepare_reference_cfg_mask(
+        self,
+        reference_cfg_mask: torch.Tensor,
+        batch_size: int,
+        height_image: int,
+        width_image: int,
+        image_seq_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if reference_cfg_mask.ndim == 4:
+            if reference_cfg_mask.shape[1] not in {1, 3}:
+                raise ValueError(
+                    f"reference_cfg_mask expects 1 or 3 channels, got {reference_cfg_mask.shape[1]}"
+                )
+            reference_cfg_mask = reference_cfg_mask[:, 0]
+        if reference_cfg_mask.ndim != 3:
+            raise ValueError(
+                "reference_cfg_mask must be [B, H, W] or [B, C, H, W], "
+                f"got {tuple(reference_cfg_mask.shape)}"
+            )
+        if reference_cfg_mask.shape[0] != batch_size:
+            raise ValueError(
+                "reference_cfg_mask batch size must match prediction batch size, "
+                f"got {reference_cfg_mask.shape[0]} and {batch_size}"
+            )
+
+        reference_cfg_mask = reference_cfg_mask.to(device=device, dtype=torch.float32)
+        reference_cfg_mask = resize_mask_bhw(reference_cfg_mask, int(height_image), int(width_image))
+        reference_cfg_mask = map_mask_to_latent(
+            reference_cfg_mask,
+            vae_scale_factor=self.vae_scale_factor,
+            expected_seq_len=image_seq_len,
+        )
+        return (reference_cfg_mask > 0).to(device=device, dtype=self.weight_dtype).unsqueeze(-1)
+
+    def _prepare_latent_anchoring_weight(
+        self,
+        edit_weight: torch.Tensor,
+        free_mask: torch.Tensor,
+        batch_size: int,
+        num_channels_latents: int,
+        height_image: int,
+        width_image: int,
+        soft_transition: bool,
+    ) -> torch.Tensor:
+        """Map image-space W_edit to the exact packed latent feature layout."""
+
+        for name, value in (("edit_weight", edit_weight), ("free_mask", free_mask)):
+            if value.ndim != 3:
+                raise ValueError(f"latent anchoring {name} must be [B,H,W], got {tuple(value.shape)}")
+            if value.shape[0] != batch_size:
+                raise ValueError(
+                    f"latent anchoring {name} batch size must be {batch_size}, got {value.shape[0]}"
+                )
+            if not torch.isfinite(value).all().item():
+                raise ValueError(f"latent anchoring {name} must contain only finite values")
+
+        latent_height = 2 * (int(height_image) // (self.vae_scale_factor * 2))
+        latent_width = 2 * (int(width_image) // (self.vae_scale_factor * 2))
+        if latent_height <= 0 or latent_width <= 0:
+            raise ValueError(
+                "latent anchoring target geometry is too small for VAE compression and packing: "
+                f"{(height_image, width_image)}"
+            )
+
+        edit = edit_weight.float().unsqueeze(1)
+        free = free_mask.float().unsqueeze(1)
+        if soft_transition:
+            edit = F.interpolate(
+                edit,
+                size=(latent_height, latent_width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            free = F.adaptive_max_pool2d(free, output_size=(latent_height, latent_width))
+            edit = torch.where(free > 0.5, torch.ones_like(edit), edit)
+            edit = edit.clamp(0.0, 1.0)
+        else:
+            edit = F.adaptive_max_pool2d(edit, output_size=(latent_height, latent_width))
+            edit = (edit > 0.5).to(dtype=torch.float32)
+
+        packed = self._pack_latents(
+            edit.repeat(1, num_channels_latents, 1, 1),
+            batch_size,
+            num_channels_latents,
+            latent_height,
+            latent_width,
+        )
+        if torch.any(packed < 0).item() or torch.any(packed > 1).item():
+            raise RuntimeError("packed latent anchoring weights must remain in [0, 1]")
+        editable_per_sample = packed.flatten(1).amax(dim=1) > 0
+        if not bool(editable_per_sample.all().item()):
+            empty_indices = torch.nonzero(~editable_per_sample, as_tuple=False).flatten().tolist()
+            raise ValueError(
+                "packed latent anchoring weight must retain an editable region for every sample; "
+                f"empty={empty_indices}"
+            )
+        return packed
+
+    def _apply_post_step_latent_anchoring(
+        self,
+        generated_next: torch.Tensor,
+        anchor_source_latents: torch.Tensor,
+        anchor_noise: torch.Tensor,
+        edit_weight: torch.Tensor,
+        timesteps: torch.Tensor,
+        step_index: int,
+    ) -> torch.Tensor:
+        """Apply the official Qwen inpaint source trajectory after scheduler.step()."""
+
+        expected_shape = generated_next.shape
+        for name, value in (
+            ("anchor_source_latents", anchor_source_latents),
+            ("anchor_noise", anchor_noise),
+            ("edit_weight", edit_weight),
+        ):
+            if value.shape != expected_shape:
+                raise ValueError(
+                    f"latent anchoring {name} shape must match generated latents, "
+                    f"got {tuple(value.shape)} vs {tuple(expected_shape)}"
+                )
+            if value.device != generated_next.device:
+                raise ValueError(
+                    f"latent anchoring {name} device must match generated latents, "
+                    f"got {value.device} vs {generated_next.device}"
+                )
+            if value.dtype != generated_next.dtype:
+                raise ValueError(
+                    f"latent anchoring {name} dtype must match generated latents, "
+                    f"got {value.dtype} vs {generated_next.dtype}"
+                )
+        if step_index < 0 or step_index >= len(timesteps):
+            raise IndexError(
+                f"latent anchoring step_index must be in [0, {len(timesteps)}), got {step_index}"
+            )
+
+        if step_index < len(timesteps) - 1:
+            source_next = self.scheduler.scale_noise(
+                anchor_source_latents,
+                timesteps[step_index + 1 : step_index + 2],
+                anchor_noise,
+            )
+        else:
+            source_next = anchor_source_latents
+        source_next = source_next.to(device=generated_next.device, dtype=generated_next.dtype)
+        return torch.lerp(source_next, generated_next, edit_weight)
+
+    def _unwrap_dit(self):
+        if self.accelerator is not None:
+            return self.accelerator.unwrap_model(self.dit)
+        return self.dit
+
+    def _dit_device(self) -> torch.device:
+        return next(self.dit.parameters()).device
+
+    def _dit_config(self):
+        return self._unwrap_dit().config
+
+    def _dit_cache_context(self, name: str):
+        return self._unwrap_dit().cache_context(name)
 
     def _cache_scheduler_training_tensors(self):
         if self.scheduler is None:
@@ -177,7 +456,7 @@ class QwenImageEditTrainer(BaseTrainer):
 
         logging.info(f"Components loaded successfully. VAE scale factor: {self.vae_scale_factor}")
 
-    def preprocess_image_for_vae_encoder(self, image):
+    def preprocess_image_for_vae_encoder(self, image, *, input_range="auto"):
         """
         the image process passed to vae
         import numpy as np
@@ -192,7 +471,7 @@ class QwenImageEditTrainer(BaseTrainer):
         image to the vae encoder should be [B,C,1,H,W] in range [-1,1]
         """
         # suppose image input is [0,1] [B,C,H,W] after dataloader -> [B,C,1,H,W]
-        tensor_info = infer_image_tensor(image)
+        tensor_info = infer_image_tensor(image, input_range=input_range)
         if tensor_info["layout"] == "HW":
             image = image.unsqueeze(0).unsqueeze(0).unsqueeze(0)
         elif tensor_info["layout"] == "CHW":
@@ -219,13 +498,19 @@ class QwenImageEditTrainer(BaseTrainer):
 
         return image
 
-    def preprocess_image_for_text_encoder(self, image, best_resolution=None) -> torch.Tensor:
+    def preprocess_image_for_text_encoder(
+        self,
+        image,
+        best_resolution=None,
+        *,
+        input_range="auto",
+    ) -> torch.Tensor:
         """
         the image process passed to text encoder
         image to the text encoder
             [B,C,H,W] tensor in range [0,255], uint8, or PIL.Image RGB mode
         """
-        tensor_info = infer_image_tensor(image)
+        tensor_info = infer_image_tensor(image, input_range=input_range)
         if tensor_info["layout"] == "HW":
             image = image.unsqueeze(0).unsqueeze(0)
         elif tensor_info["layout"] == "CHW":
@@ -379,17 +664,21 @@ class QwenImageEditTrainer(BaseTrainer):
 
         if "image" in batch:
 
-            batch["image"] = self.preprocess_image_for_vae_encoder(batch["image"])  # B,3,1,H,W
+            batch["image"] = self.preprocess_image_for_vae_encoder(
+                batch["image"], input_range="0-1"
+            )  # B,3,1,H,W
             batch["width"] = batch["image"].shape[4]
             batch["height"] = batch["image"].shape[3]
 
         if "control" not in batch:
             raise ValueError("prepare_embeddings requires main control image under key 'control'")
 
-        prompt_control = self.preprocess_image_for_text_encoder(batch["control"])  # [B,C,H,W], uint8, range [0,255]
+        prompt_control = self.preprocess_image_for_text_encoder(
+            batch["control"], input_range="0-1"
+        )  # [B,C,H,W], float, source range [0,1]
         batch["prompt_control"] = prompt_control
         batch["control"] = self.preprocess_image_for_vae_encoder(
-            batch["control"]
+            batch["control"], input_range="0-1"
         )  # [B,C,1,H,W], float, range [-1,1]
         batch["width_control"] = batch["control"].shape[4]
         batch["height_control"] = batch["control"].shape[3]
@@ -403,7 +692,9 @@ class QwenImageEditTrainer(BaseTrainer):
             additional_control_key = f"control_{i+1}"
             if additional_control_key not in batch:
                 raise ValueError(f"n_controls={num_additional_controls} requires missing key '{additional_control_key}'")
-            batch[additional_control_key] = self.preprocess_image_for_vae_encoder(batch[additional_control_key])
+            batch[additional_control_key] = self.preprocess_image_for_vae_encoder(
+                batch[additional_control_key], input_range="0-1"
+            )
             batch[f"width_control_{i+1}"] = batch[additional_control_key].shape[4]
             batch[f"height_control_{i+1}"] = batch[additional_control_key].shape[3]
 
@@ -867,18 +1158,54 @@ class QwenImageEditTrainer(BaseTrainer):
         height_image = embeddings["height"]
         width_image = embeddings["width"]
 
+        anchor_source_latents = embeddings.get("anchor_source_latents")
+        anchor_edit_weight = embeddings.get("anchor_edit_weight")
+        latent_anchoring_mode = normalize_latent_anchoring_mode(
+            embeddings.get("latent_anchoring_mode", "legacy")
+        )
+        do_latent_anchoring = anchor_source_latents is not None or anchor_edit_weight is not None
+        if (anchor_source_latents is None) != (anchor_edit_weight is None):
+            raise ValueError(
+                "latent anchoring requires both anchor_source_latents and anchor_edit_weight"
+            )
+        if do_latent_anchoring != latent_anchoring_enabled(latent_anchoring_mode):
+            raise ValueError(
+                "latent anchoring mode/tensor mismatch: "
+                f"mode={latent_anchoring_mode}, tensors_present={do_latent_anchoring}"
+            )
+
         negative_prompt = embeddings["negative_prompt"] if "negative_prompt" in embeddings else None
 
         has_neg_prompt = negative_prompt is not None
         do_true_cfg = true_cfg_scale > 1 and has_neg_prompt
         reference_cfg_embeddings = embeddings.get("reference_cfg_embeddings")
         reference_cfg_scale = float(embeddings.get("reference_cfg_scale", 1.0))
+        reference_cfg_mask_aware = bool(embeddings.get("reference_cfg_mask_aware", False))
+        reference_cfg_mask = embeddings.get("reference_cfg_mask")
+        reference_cfg_delta_clip_enabled = bool(embeddings.get("reference_cfg_delta_clip_enabled", False))
+        reference_cfg_delta_clip_max_ratio = float(embeddings.get("reference_cfg_delta_clip_max_ratio", 0.5))
         do_reference_cfg = reference_cfg_embeddings is not None and reference_cfg_scale > 1
         if do_true_cfg and do_reference_cfg:
             raise ValueError("text true CFG and reference_cfg cannot be enabled at the same time")
-        logging.info(f"do_true_cfg={do_true_cfg}, has_negative_prompt={has_neg_prompt}, true_cfg_scale={true_cfg_scale}")
+        if do_reference_cfg and reference_cfg_mask_aware and reference_cfg_mask is None:
+            raise ValueError("reference_cfg.mask_aware requires reference_cfg_mask in embeddings")
+        logging.info(
+            f"do_true_cfg={do_true_cfg}, has_negative_prompt={has_neg_prompt}, true_cfg_scale={true_cfg_scale}"
+        )
         logging.info(f"do_reference_cfg={do_reference_cfg}, reference_cfg_scale={reference_cfg_scale}")
-        device = self.dit.device
+        logging.info(f"reference_cfg_mask_aware={reference_cfg_mask_aware}")
+        logging.info(
+            "latent_anchoring_mode=%s, enabled=%s",
+            latent_anchoring_mode,
+            do_latent_anchoring,
+        )
+        logging.info(
+            "reference_cfg_delta_clip_enabled="
+            f"{reference_cfg_delta_clip_enabled}, "
+            f"reference_cfg_delta_clip_max_ratio={reference_cfg_delta_clip_max_ratio}"
+        )
+        device = self._dit_device()
+        dit_config = self._dit_config()
 
         if do_true_cfg:
             # 清理显存以确保有足够空间进行 CFG
@@ -891,7 +1218,9 @@ class QwenImageEditTrainer(BaseTrainer):
             negative_prompt_embeds_mask = negative_prompt_embeds_mask.to(device, dtype=torch.int64)
 
         if do_reference_cfg:
-            reference_cfg_control_latents = reference_cfg_embeddings["control_latents"].to(self.weight_dtype).to(device)
+            reference_cfg_control_latents = reference_cfg_embeddings["control_latents"].to(
+                self.weight_dtype
+            ).to(device)
             reference_cfg_prompt_embeds = reference_cfg_embeddings["prompt_embeds"].to(
                 device, dtype=self.weight_dtype
             )
@@ -907,7 +1236,7 @@ class QwenImageEditTrainer(BaseTrainer):
         logging.info(f"prompt_embeds shape: {prompt_embeds.shape}, dtype: {prompt_embeds.dtype}")
 
         # 5. Prepare latent variables
-        num_channels_latents = self.dit.config.in_channels // 4
+        num_channels_latents = dit_config.in_channels // 4
 
         latents = self.prepare_initial_latents(
             batch_size=batch_size,
@@ -918,6 +1247,30 @@ class QwenImageEditTrainer(BaseTrainer):
             dtype=self.weight_dtype,
         )
         image_seq_len = latents.shape[1]
+
+        anchor_noise = None
+        if do_latent_anchoring:
+            anchor_source_latents = anchor_source_latents.to(
+                device=device,
+                dtype=latents.dtype,
+            )
+            anchor_edit_weight = anchor_edit_weight.to(
+                device=device,
+                dtype=latents.dtype,
+            )
+            if anchor_source_latents.shape != latents.shape:
+                raise ValueError(
+                    "anchor source latent shape must match generated target latent shape, "
+                    f"got {tuple(anchor_source_latents.shape)} vs {tuple(latents.shape)}"
+                )
+            if anchor_edit_weight.shape != latents.shape:
+                raise ValueError(
+                    "packed W_edit shape must match generated target latent shape, "
+                    f"got {tuple(anchor_edit_weight.shape)} vs {tuple(latents.shape)}"
+                )
+            if torch.any(anchor_edit_weight < 0).item() or torch.any(anchor_edit_weight > 1).item():
+                raise ValueError("packed W_edit must remain in [0, 1]")
+            anchor_noise = latents.detach().clone()
 
         logging.info(f"image latent got grad: {control_latents.requires_grad}")
         logging.info(f"latents shape: {latents.shape}")
@@ -930,13 +1283,38 @@ class QwenImageEditTrainer(BaseTrainer):
         logging.info(f"width: {width_image}")
         logging.info(f"image_seq_len: {image_seq_len}")
 
+        reference_cfg_latent_mask = None
+        if do_reference_cfg and reference_cfg_mask_aware:
+            reference_cfg_latent_mask = self._prepare_reference_cfg_mask(
+                reference_cfg_mask=reference_cfg_mask,
+                batch_size=batch_size,
+                height_image=height_image,
+                width_image=width_image,
+                image_seq_len=image_seq_len,
+                device=device,
+            )
+            logging.info(f"reference_cfg latent mask shape: {reference_cfg_latent_mask.shape}")
+
         timesteps, num_inference_steps = self.prepare_predict_timesteps(num_inference_steps, image_seq_len)
+
+        if do_latent_anchoring:
+            initial_sigma = self.scheduler.sigmas[0].detach().float()
+            if not torch.isclose(
+                initial_sigma,
+                torch.ones_like(initial_sigma),
+                rtol=0.0,
+                atol=1e-6,
+            ).item():
+                raise ValueError(
+                    "latent anchoring currently requires full-noise initialization with first scheduler sigma=1; "
+                    f"got sigma={float(initial_sigma.cpu())}"
+                )
 
         self._num_timesteps = len(timesteps)
 
         # 处理guidance
         guidance_scale = embeddings["guidance"]
-        if self.dit.config.guidance_embeds:
+        if dit_config.guidance_embeds:
             guidance = torch.full([1], guidance_scale, device=device, dtype=torch.float32)
             guidance = guidance.expand(latents.shape[0])
         else:
@@ -981,7 +1359,7 @@ class QwenImageEditTrainer(BaseTrainer):
 
                 # Usecache_context (如果transformer支持)
                 with torch.inference_mode():  # 外层关掉梯度 & 减元数据
-                    with self.dit.cache_context("cond"):
+                    with self._dit_cache_context("cond"):
                         noise_pred = self.dit(
                             hidden_states=latent_model_input,
                             timestep=timestep / 1000,
@@ -1005,7 +1383,7 @@ class QwenImageEditTrainer(BaseTrainer):
                         )
 
                     with torch.inference_mode():
-                        with self.dit.cache_context("reference_uncond"):
+                        with self._dit_cache_context("reference_uncond"):
                             reference_cfg_noise_pred = self.dit(
                                 hidden_states=reference_cfg_latent_model_input,
                                 timestep=timestep / 1000,
@@ -1020,16 +1398,16 @@ class QwenImageEditTrainer(BaseTrainer):
                             reference_cfg_noise_pred = reference_cfg_noise_pred[:, : latents.size(1)]
 
                     noise_pred = noise_pred_cpu.to(device)
-                    comb_pred = reference_cfg_noise_pred + reference_cfg_scale * (
-                        noise_pred - reference_cfg_noise_pred
+                    noise_pred = self._combine_reference_cfg_predictions(
+                        noise_pred=noise_pred,
+                        reference_cfg_noise_pred=reference_cfg_noise_pred,
+                        reference_cfg_scale=reference_cfg_scale,
+                        reference_cfg_mask=reference_cfg_latent_mask,
+                        delta_clip_enabled=reference_cfg_delta_clip_enabled,
+                        delta_clip_max_ratio=reference_cfg_delta_clip_max_ratio,
                     )
 
-                    cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-                    noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-                    noise_norm = torch.clamp(noise_norm, min=1e-6)
-                    noise_pred = comb_pred * (cond_norm / noise_norm)
-
-                    del reference_cfg_noise_pred, comb_pred, cond_norm, noise_norm
+                    del reference_cfg_noise_pred
                     torch.cuda.empty_cache()
 
                 if do_true_cfg:
@@ -1037,7 +1415,7 @@ class QwenImageEditTrainer(BaseTrainer):
                     noise_pred_cpu = noise_pred.cpu()
                     torch.cuda.empty_cache()
                     with torch.inference_mode():  # 外层关掉梯度 & 减元数据
-                        with self.dit.cache_context("uncond"):
+                        with self._dit_cache_context("uncond"):
                             neg_noise_pred = self.dit(
                                 hidden_states=latent_model_input,
                                 timestep=timestep / 1000,
@@ -1066,7 +1444,18 @@ class QwenImageEditTrainer(BaseTrainer):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                generated_next = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                if do_latent_anchoring:
+                    latents = self._apply_post_step_latent_anchoring(
+                        generated_next=generated_next,
+                        anchor_source_latents=anchor_source_latents,
+                        anchor_noise=anchor_noise,
+                        edit_weight=anchor_edit_weight,
+                        timesteps=timesteps,
+                        step_index=i,
+                    )
+                else:
+                    latents = generated_next
 
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
@@ -1076,7 +1465,7 @@ class QwenImageEditTrainer(BaseTrainer):
 
     def decode_vae_latent(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
         # 8. decode final latents
-        latents = latents.to(self.vae.device, dtype=self.weight_dtype)
+        latents = latents.to(self._vae_decode_device(), dtype=self.weight_dtype)
         latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)

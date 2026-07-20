@@ -1,6 +1,4 @@
-# Canonical Insert Anything config used by the training and inference entrypoints.
-# This matches the checkpoint cadence already present under
-# logs/insert_anything_fixed_pixels_parquet.
+# Legacy native-style mask-prompt baseline (reference_cfg, LoRA r128). Prefer configs/default.yaml for new runs.
 
 trainer: QwenImageEditInsertAnything
 
@@ -8,6 +6,11 @@ model:
   pretrained_model_name_or_path: "/inspire/ssd/project/project-public/250041225002/models/qwen-image-edit-2511"
   quantize: false
   pre_insertion:
+    enabled: false
+    paste_mode: "bbox_fit_keep_aspect"
+    train_scale_jitter_ratio: 0.10
+    train_offset_jitter_ratio: 0.05
+  layout_condition:
     enabled: false
     paste_mode: "bbox_fit_keep_aspect"
     train_scale_jitter_ratio: 0.10
@@ -24,12 +27,15 @@ model:
     enabled: true
     train_dropout_rate: 0.1
     force_empty_prompt: true
+    mask_aware: false
+    delta_clip_enabled: false
+    delta_clip_max_ratio: 0.5
   lora:
     r: 128
     lora_alpha: 128
     target_modules: ["to_q", "to_k", "to_v", "to_out.0", "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out", "img_mlp.net.0.proj", "img_mlp.net.2", "txt_mlp.net.0.proj", "txt_mlp.net.2"]
     init_lora_weights: "gaussian"
-    adapter_name: "insert_anything_lora"
+    adapter_name: "legacy_native_lora"
     pretrained_weight: null
 
 data:
@@ -52,8 +58,8 @@ data:
   drop_last: true
 
 logging:
-  output_dir: "/inspire/ssd/project/project-public/250041225002/Qwen-Image-Inpainting/logs/insert_anything_fixed_pixels_parquet"
-  tracker_project_name: "reference_cfg_fixed_pixels_parquet"
+  output_dir: "/inspire/ssd/project/project-public/250041225002/Qwen-Image-Inpainting/logs/native_qwen_image_inpainting"
+  tracker_project_name: "legacy_native"
   report_to: "tensorboard"
 
 optimizer:
@@ -82,11 +88,3 @@ loss:
   mask_loss: true
   forground_weight: 2.0
   background_weight: 1.0
-
-predict:
-  devices:
-    vae: "cuda:0"
-    text_encoder: "cuda:0"
-    dit: "cuda:0"
-
-resume: null

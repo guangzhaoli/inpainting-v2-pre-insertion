@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/configs/insert_anything_fixed_pixels_parquet.yaml}"
+CONFIG_FILE="${CONFIG_FILE:-${SCRIPT_DIR}/configs/default.yaml}"
 LORA_PATH="${LORA_PATH:-${LORA:-${SCRIPT_DIR}/logs/insert_anything_fixed_pixels_parquet/v0/checkpoint-2-43500}}"
 SRC_IMAGE="${SRC_IMAGE:-/inspire/dataset/anyinsertion/v1/examples/tar_image.png}"
 SRC_MASK="${SRC_MASK:-/inspire/dataset/anyinsertion/v1/examples/tar_mask.png}"
@@ -13,6 +13,9 @@ PROMPT="${PROMPT:-Insert Ref into the image}"
 NUM_INFERENCE_STEPS="${NUM_INFERENCE_STEPS:-40}"
 TRUE_CFG_SCALE="${TRUE_CFG_SCALE:-4.0}"
 GUIDANCE_SCALE="${GUIDANCE_SCALE:-1.0}"
+LATENT_ANCHORING_MODE="${LATENT_ANCHORING_MODE:-}"
+INTERACTION_DILATION_PX="${INTERACTION_DILATION_PX:-}"
+TRANSITION_WIDTH_PX="${TRANSITION_WIDTH_PX:-}"
 OUTPUT="${OUTPUT:-${SCRIPT_DIR}/output/generated.png}"
 COMPOSITE_OUTPUT="${COMPOSITE_OUTPUT:-${SCRIPT_DIR}/output/composite.png}"
 
@@ -31,6 +34,16 @@ CMD=(
     --output "${OUTPUT}"
     --composite-output "${COMPOSITE_OUTPUT}"
 )
+
+if [[ -n "${LATENT_ANCHORING_MODE}" ]]; then
+    CMD+=(--latent-anchoring-mode "${LATENT_ANCHORING_MODE}")
+fi
+if [[ -n "${INTERACTION_DILATION_PX}" ]]; then
+    CMD+=(--interaction-dilation-px "${INTERACTION_DILATION_PX}")
+fi
+if [[ -n "${TRANSITION_WIDTH_PX}" ]]; then
+    CMD+=(--transition-width-px "${TRANSITION_WIDTH_PX}")
+fi
 
 printf 'Resolved command:'
 printf ' %q' "${CMD[@]}"

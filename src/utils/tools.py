@@ -10,6 +10,8 @@ import importlib
 import subprocess
 
 Layout = Literal["HW", "CHW", "HWC", "BCHW", "BHWC"]
+ImageRange = Literal["0-1", "-1-1", "0-255"]
+ImageInputRange = Literal["auto", "0-1", "-1-1", "0-255"]
 Range = Literal["0-1", "-1-1", "0-255", "unknown"]
 
 
@@ -176,36 +178,76 @@ def _infer_layout(t: torch.Tensor) -> Optional[Layout]:
     return None
 
 
+def _image_range_stats(t: torch.Tensor) -> tuple[bool, float, float]:
+    if t.numel() == 0:
+        raise ValueError("Image tensor must not be empty")
+    if t.is_complex():
+        raise TypeError(f"Complex image tensors are not supported: dtype={t.dtype}")
+    with torch.no_grad():
+        values = t.detach().float()
+        vmin_tensor, vmax_tensor = torch.aminmax(values)
+        finite = bool(
+            torch.isfinite(torch.stack((vmin_tensor, vmax_tensor))).all().item()
+        )
+        if not finite:
+            return False, float("nan"), float("nan")
+        return True, float(vmin_tensor.item()), float(vmax_tensor.item())
+
+
+def _validate_explicit_image_range(t: torch.Tensor, input_range: ImageRange) -> ImageRange:
+    finite, vmin, vmax = _image_range_stats(t)
+    if not finite:
+        raise ValueError(
+            "Image tensor contains NaN or Inf: "
+            f"shape={tuple(t.shape)}, dtype={t.dtype}, expected_range={input_range}"
+        )
+
+    bounds = {
+        "0-1": (-1e-6, 1.0 + 1e-6),
+        "-1-1": (-1.0 - 1e-6, 1.0 + 1e-6),
+        "0-255": (-1e-6, 255.0 + 1e-6),
+    }
+    lower, upper = bounds[input_range]
+    if vmin < lower or vmax > upper:
+        raise ValueError(
+            "Image tensor is outside its declared range: "
+            f"shape={tuple(t.shape)}, dtype={t.dtype}, expected_range={input_range}, "
+            f"min={vmin}, max={vmax}, allowed=[{lower}, {upper}]"
+        )
+    return input_range
+
+
 def _infer_range(t: torch.Tensor) -> Range:
-    # quick rules based on dtype and min/max
-    if t.dtype in (torch.uint8,):
+    """Best-effort compatibility fallback for callers without a range contract."""
+
+    if t.numel() == 0:
+        raise ValueError("Image tensor must not be empty")
+    if t.dtype == torch.uint8:
         return "0-255"
 
-    # sample to avoid huge reductions
-    with torch.no_grad():
-        v = t
-        if v.numel() > 2_000_000:
-            idx = torch.randperm(v.numel(), device=v.device)[:2_000_000]
-            v = v.reshape(-1)[idx]
-        vmin = torch.min(v.float()).item()
-        vmax = torch.max(v.float()).item()
+    finite, vmin, vmax = _image_range_stats(t)
+    if not finite:
+        raise ValueError(
+            "Image tensor contains NaN or Inf: "
+            f"shape={tuple(t.shape)}, dtype={t.dtype}"
+        )
 
-    def within(x, low, high):  # inclusive slack
-        return low <= x <= high
-
-    # tolerate small numeric noise
-    if within(vmin, -1.05, -0.4) and within(vmax, 0.4, 1.05):
+    # Bounds, rather than image contrast, define a numeric range.  This accepts
+    # valid constant/low-dynamic-range tensors such as an all-black [0, 1] image.
+    if vmin >= -1e-6 and vmax <= 1.0 + 1e-6:
+        return "0-1"
+    if vmin >= -1.05 and vmax <= 1.05:
         return "-1-1"
-    if within(vmin, -1e-6, 0.1) and within(vmax, 0.9, 1.05):
-        return "0-1"
-    if within(vmin, -1e-6, 1.0) and within(vmax, 0.1, 1+1e-6):
-        return "0-1"
-    if within(vmin, -1e-6, 5.0) and within(vmax, 1.5, 260.0):
+    if vmin >= -1e-6 and vmax <= 260.0:
         return "0-255"
     return "unknown"
 
 
-def infer_image_tensor(t: torch.Tensor) -> Dict[str, object]:
+def infer_image_tensor(
+    t: torch.Tensor,
+    *,
+    input_range: ImageInputRange = "auto",
+) -> Dict[str, object]:
     """
     Infer image tensor layout and numeric range.
 
@@ -238,7 +280,10 @@ def infer_image_tensor(t: torch.Tensor) -> Dict[str, object]:
     elif layout == "BHWC":
         b, h, w, c = s
 
-    rng = _infer_range(t)
+    allowed_ranges = {"auto", "0-1", "-1-1", "0-255"}
+    if input_range not in allowed_ranges:
+        raise ValueError(f"input_range must be one of {allowed_ranges}, got {input_range!r}")
+    rng = _infer_range(t) if input_range == "auto" else _validate_explicit_image_range(t, input_range)
 
     return {
         "layout": layout,

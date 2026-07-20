@@ -386,7 +386,9 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
 
     def prepare_embeddings(self, batch, stage="fit"):
         if "image" in batch:
-            batch["image"] = self.preprocess_image_for_vae_encoder(batch["image"])
+            batch["image"] = self.preprocess_image_for_vae_encoder(
+                batch["image"], input_range="0-1"
+            )
             batch["width"] = batch["image"].shape[4]
             batch["height"] = batch["image"].shape[3]
 
@@ -398,10 +400,16 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
 
         if "control" in batch:
             control_image = batch["control"]
-            prompt_control = self.preprocess_image_for_text_encoder(control_image, best_resolution=384 * 384)
+            prompt_control = self.preprocess_image_for_text_encoder(
+                control_image,
+                best_resolution=384 * 384,
+                input_range="0-1",
+            )
             for batch_index in range(batch_size):
                 condition_images_per_sample[batch_index].append(prompt_control[batch_index])
-            batch["control"] = self.preprocess_image_for_vae_encoder(batch["control"])
+            batch["control"] = self.preprocess_image_for_vae_encoder(
+                batch["control"], input_range="0-1"
+            )
             batch["width_control"] = batch["control"].shape[4]
             batch["height_control"] = batch["control"].shape[3]
 
@@ -419,11 +427,15 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
             additional_control_image = batch[additional_control_key]
             if additional_control_key not in vae_only_control_keys:
                 prompt_control = self.preprocess_image_for_text_encoder(
-                    additional_control_image, best_resolution=384 * 384
+                    additional_control_image,
+                    best_resolution=384 * 384,
+                    input_range="0-1",
                 )
                 for batch_index in range(batch_size):
                     condition_images_per_sample[batch_index].append(prompt_control[batch_index])
-            batch[additional_control_key] = self.preprocess_image_for_vae_encoder(batch[additional_control_key])
+            batch[additional_control_key] = self.preprocess_image_for_vae_encoder(
+                batch[additional_control_key], input_range="0-1"
+            )
             batch[f"width_control_{control_index + 1}"] = batch[additional_control_key].shape[4]
             batch[f"height_control_{control_index + 1}"] = batch[additional_control_key].shape[3]
 

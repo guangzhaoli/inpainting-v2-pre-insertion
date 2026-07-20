@@ -4,11 +4,11 @@ set -euo pipefail
 # Submit a DLC PyTorchJob for the inpainting-v2-pre-insertion project.
 #
 # The remote job runs this repo's run_multi_node_dlc.sh, which auto-selects
-# configs/insert_anything_${WORKERS * WORKER_GPU}.yaml plus the matching
+# configs/scale/${WORKERS * WORKER_GPU}.yaml plus the matching
 # accelerate_config_${WORKERS * WORKER_GPU}.yaml unless CONFIG_FILE or
 # ACCELERATE_CONFIG is set.
-# Override the config with: CONFIG_FILE=configs/insert_anything_teacher_human.yaml bash dlc.sh
-# Multi-worker example: WORKERS=4 WORKER_GPU=8 CONFIG_FILE=configs/insert_anything_teacher_human.yaml bash dlc.sh
+# Override the config with: CONFIG_FILE=configs/teacher/human.yaml bash dlc.sh
+# Multi-worker example: WORKERS=4 WORKER_GPU=8 CONFIG_FILE=configs/teacher/human.yaml bash dlc.sh
 # Dry-run (print the resolved `dlc submit ...` command without submitting): bash dlc.sh --dry-run
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -191,7 +191,7 @@ if [[ -z "${MASTER_ADDR}" && "${WORKERS}" -gt 1 && "${REQUIRE_MASTER_ADDR}" == "
   exit 2
 fi
 
-default_config_path="configs/insert_anything_${NUM_PROCESSES}.yaml"
+default_config_path="configs/scale/${NUM_PROCESSES}.yaml"
 remote_config_arg=""
 if (( ${#REMOTE_EXTRA_ARGS[@]} == 1 )); then
   remote_config_arg="${REMOTE_EXTRA_ARGS[0]}"

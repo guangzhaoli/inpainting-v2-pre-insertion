@@ -1,5 +1,4 @@
 ref_image,ref_mask,tar_image,tar_mask,category,stem,prompt
-others/ref_image/0.png,others/ref_mask/0.png,others/tar_image/0.png,others/tar_mask/0.png,others,0,
 others/ref_image/1.png,others/ref_mask/1.png,others/tar_image/1.png,others/tar_mask/1.png,others,1,
 others/ref_image/10.png,others/ref_mask/10.png,others/tar_image/10.png,others/tar_mask/10.png,others,10,
 others/ref_image/100.png,others/ref_mask/100.png,others/tar_image/100.png,others/tar_mask/100.png,others,100,
@@ -23542,7 +23541,6 @@ others/ref_image/928.png,others/ref_mask/928.png,others/tar_image/928.png,others
 others/ref_image/9280.png,others/ref_mask/9280.png,others/tar_image/9280.png,others/tar_mask/9280.png,others,9280,
 others/ref_image/9281.png,others/ref_mask/9281.png,others/tar_image/9281.png,others/tar_mask/9281.png,others,9281,
 others/ref_image/9282.png,others/ref_mask/9282.png,others/tar_image/9282.png,others/tar_mask/9282.png,others,9282,
-others/ref_image/9283.png,others/ref_mask/9283.png,others/tar_image/9283.png,others/tar_mask/9283.png,others,9283,
 others/ref_image/9284.png,others/ref_mask/9284.png,others/tar_image/9284.png,others/tar_mask/9284.png,others,9284,
 others/ref_image/9285.png,others/ref_mask/9285.png,others/tar_image/9285.png,others/tar_mask/9285.png,others,9285,
 others/ref_image/9286.png,others/ref_mask/9286.png,others/tar_image/9286.png,others/tar_mask/9286.png,others,9286,

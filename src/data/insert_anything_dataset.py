@@ -27,6 +27,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.data.config import DatasetInitArgs
+from src.utils.adaptive_crop import build_adaptive_crop_plan, crop_numpy_pair
 from src.utils.images import extract_foreground_from_image_and_mask
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
@@ -444,6 +445,7 @@ class InsertAnythingDataset(Dataset):
         sample_info["tar_image"] = item.get("tar_image")
         sample_info["tar_mask"] = item.get("tar_mask")
         sample_info["category"] = item.get("category", "unknown")
+        sample_info["stem"] = item.get("stem", "")
         sample_info["prompt"] = item.get("prompt", "")
         return sample_info
 
@@ -462,9 +464,61 @@ class InsertAnythingDataset(Dataset):
         if missing:
             raise ValueError(f"Sample {idx} is missing required fields: {missing}")
 
-    def __getitem__(self, idx):
-        sample_info = self._get_sample_info(idx)
+    def _describe_sample_source(self, value: Any) -> str:
+        """Return a stable path string for diagnostics without retaining image payloads."""
 
+        path = None
+        if isinstance(value, str):
+            path = value
+        elif isinstance(value, dict):
+            path = value.get("path")
+        if not path:
+            return ""
+        if (
+            not os.path.isabs(path)
+            and isinstance(self.dataset_path, str)
+            and os.path.isdir(self.dataset_path)
+        ):
+            path = os.path.join(self.dataset_path, path)
+        return os.path.abspath(path) if os.path.isabs(path) or os.path.exists(path) else str(path)
+
+    def _sample_metadata(self, sample_info: Dict[str, Any], idx: int) -> Dict[str, Any]:
+        category = str(sample_info.get("category") or "unknown")
+        stem = str(sample_info.get("stem") or "")
+        if not stem:
+            for key in ("tar_image", "ref_image"):
+                source_path = self._describe_sample_source(sample_info.get(key))
+                if source_path:
+                    stem = Path(source_path).stem
+                    break
+        if not stem:
+            stem = str(idx)
+        return {
+            "dataset_index": int(idx),
+            "sample_id": f"{category}/{stem}",
+            "category": category,
+            "stem": stem,
+            "ref_image_path": self._describe_sample_source(sample_info.get("ref_image")),
+            "ref_mask_path": self._describe_sample_source(sample_info.get("ref_mask")),
+            "tar_image_path": self._describe_sample_source(sample_info.get("tar_image")),
+            "tar_mask_path": self._describe_sample_source(sample_info.get("tar_mask")),
+        }
+
+    def __getitem__(self, idx):
+        sample_metadata = {"dataset_index": int(idx)}
+        try:
+            sample_info = self._get_sample_info(idx)
+            sample_metadata = self._sample_metadata(sample_info, idx)
+            return self._load_and_process_sample(sample_info, sample_metadata)
+        except Exception as exc:
+            if hasattr(exc, "add_note"):
+                exc.add_note(
+                    "InsertAnythingDataset sample context: "
+                    + ", ".join(f"{key}={value}" for key, value in sample_metadata.items() if value != "")
+                )
+            raise
+
+    def _load_and_process_sample(self, sample_info: Dict[str, Any], sample_metadata: Dict[str, Any]):
         data = {
             "ref_image": self._read_image(sample_info["ref_image"]),
             "ref_mask": self._read_mask(sample_info["ref_mask"]),
@@ -472,7 +526,23 @@ class InsertAnythingDataset(Dataset):
             "tar_mask": self._read_mask(sample_info["tar_mask"]),
             "prompt": sample_info.get("prompt", ""),
             "category": sample_info.get("category", ""),
+            "sample_metadata": sample_metadata,
         }
+
+        adaptive_crop_config = self.data_config.adaptive_crop
+        if adaptive_crop_config.train_enabled:
+            tar_height, tar_width = data["tar_image"].shape[:2]
+            crop_plan = build_adaptive_crop_plan(
+                image_size=(tar_width, tar_height),
+                mask=data["tar_mask"],
+                config=adaptive_crop_config,
+            )
+            data["tar_image"], data["tar_mask"] = crop_numpy_pair(
+                data["tar_image"],
+                data["tar_mask"],
+                crop_plan,
+            )
+
         data["ref_image"], data["ref_mask"] = extract_foreground_from_image_and_mask(
             data["ref_image"],
             data["ref_mask"],

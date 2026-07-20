@@ -17,7 +17,7 @@ from typing import Optional
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
-# 与 configs/insert_anything_teacher_*.yaml 中 categories 对应
+# Corresponds to categories used by configs/teacher/*.yaml
 CATEGORY_GROUPS = {
     "animal": ["cat", "dog"],
     "fashion_tryon": ["clothes", "dress", "TopRef_BodyMask", "BottomRef_BodyMask", "TopRef_body_man", "pure_color"],

@@ -1,15 +1,22 @@
-# Teacher-specific Insert Anything config: general objects.
+# Default Insert Anything config (fixed_pixels, all categories, reference_cfg, LoRA r128).
 
 trainer: QwenImageEditInsertAnything
 
 model:
-  pretrained_model_name_or_path: "/mnt/cpfs/weiqingyan/flow/qwen-image-inpainting/models/qwen-image-edit-2511"
+  pretrained_model_name_or_path: "/inspire/ssd/project/project-public/250041225002/models/qwen-image-edit-2511"
   quantize: false
   pre_insertion:
     enabled: false
     paste_mode: "bbox_fit_keep_aspect"
     train_scale_jitter_ratio: 0.10
     train_offset_jitter_ratio: 0.05
+  layout_condition:
+    enabled: false
+    paste_mode: "bbox_fit_keep_aspect"
+    train_scale_jitter_ratio: 0.10
+    train_offset_jitter_ratio: 0.05
+  mask_control:
+    enabled: false
   query_prompt:
     enabled: false
     num_query_tokens: 8
@@ -19,24 +26,25 @@ model:
     layer_indices: [-11, -9, -7, -5, -3, -1]
     max_source_images: 4
   reference_cfg:
-    enabled: false
-    train_dropout_rate: 0.0
-    force_empty_prompt: false
+    enabled: true
+    train_dropout_rate: 0.1
+    force_empty_prompt: true
+    mask_aware: false
+    delta_clip_enabled: false
+    delta_clip_max_ratio: 0.5
   lora:
     r: 128
     lora_alpha: 128
     target_modules: ["to_q", "to_k", "to_v", "to_out.0", "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out", "img_mlp.net.0.proj", "img_mlp.net.2", "txt_mlp.net.0.proj", "txt_mlp.net.2"]
     init_lora_weights: "gaussian"
-    adapter_name: "teacher_general_object_lora"
+    adapter_name: "default_lora"
     pretrained_weight: null
 
 data:
   class_path: "src.data.insert_anything_dataset.InsertAnythingDataset"
   init_args:
-    dataset_path: "/mnt/cpfs/weiqingyan/flow/qwen-image-inpainting/datasets/anyinsertion_v2"
-    manifest_path: "/mnt/cpfs/weiqingyan/inpainting/inpainting-v2-pre-insertion/manifests/insert_anything_teacher_general_object.csv"
-    categories:
-      - "others"
+    dataset_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/a2edit/data"
+    categories: null
     require_prompt: false
     processor:
       class_path: "src.data.preprocess.ImageProcessor"
@@ -52,9 +60,21 @@ data:
   drop_last: true
 
 logging:
-  output_dir: "/mnt/oss/weiqingyan/flow/logs/inpainting_v2_teacher_logs"
-  tracker_project_name: "teacher_general_object_native_qwen_image_inpainting"
+  output_dir: "/inspire/ssd/project/project-public/250041225002/Qwen-Image-Inpainting/logs/insert_anything_fixed_pixels_parquet"
+  tracker_project_name: "default"
   report_to: "tensorboard"
+  sampling:
+    enable: false
+    validation_steps: 1000
+    num_samples: 4
+    seed: 42
+    num_inference_steps: 20
+    true_cfg_scale: 4.0
+    guidance_scale: 1.0
+    output_dir: "validation"
+    panel_size: 320
+    save_composite: true
+    validation_data: null
 
 optimizer:
   class_path: "torch.optim.AdamW"
@@ -71,8 +91,8 @@ lr_scheduler:
 train:
   gradient_accumulation_steps: 1
   max_train_steps: 100000000000
-  num_epochs: 5
-  checkpointing_steps: 1000
+  num_epochs: 10
+  checkpointing_steps: 500
   checkpoints_total_limit: 20
   max_grad_norm: 1.0
   mixed_precision: "bf16"

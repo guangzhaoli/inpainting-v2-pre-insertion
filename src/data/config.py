@@ -3,8 +3,9 @@ Configuration module for Qwen Image Fine-tuning (Pydantic BaseModel version)
 按 model、data、logging、optimizer、train 分块组织配置，支持 YAML 文件加载和验证
 """
 
+import math
 import os
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List, Literal, Union
 import re
 import torch
 from omegaconf import OmegaConf
@@ -178,9 +179,66 @@ class ImageProcessorConfig(BaseModel):
 # ----------------------------
 
 
+class LatentAnchoringMode(str, Enum):
+    legacy = "legacy"
+    core = "core"
+    expanded = "expanded"
+    expanded_soft = "expanded_soft"
+
+
+class LatentAnchoringConfig(BaseModel):
+    """Inference-only A/B/C/D modes for post-step source-latent anchoring."""
+
+    model_config = ConfigDict(extra="forbid")
+    mode: LatentAnchoringMode = LatentAnchoringMode.legacy
+    mask_threshold: float = 0.5
+    interaction_dilation_px: int = 32
+    transition_width_px: int = 32
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _normalize_mode(cls, value):
+        aliases = {
+            "a": "legacy",
+            "b": "core",
+            "c": "expanded",
+            "d": "expanded_soft",
+        }
+        normalized = str(getattr(value, "value", value)).strip().lower()
+        return aliases.get(normalized, normalized)
+
+    @field_validator("mask_threshold")
+    @classmethod
+    def _check_mask_threshold(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0 or value >= 1:
+            raise ValueError("predict.latent_anchoring.mask_threshold must be finite and in [0, 1)")
+        return value
+
+    @field_validator("interaction_dilation_px", "transition_width_px")
+    @classmethod
+    def _check_non_negative_width(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("predict.latent_anchoring pixel widths must be >= 0")
+        return value
+
+    @model_validator(mode="after")
+    def _check_mode_geometry(self):
+        if self.mode in {LatentAnchoringMode.expanded, LatentAnchoringMode.expanded_soft}:
+            if self.interaction_dilation_px <= 0:
+                raise ValueError(
+                    f"predict.latent_anchoring.mode={self.mode.value} requires interaction_dilation_px > 0"
+                )
+        if self.mode == LatentAnchoringMode.expanded_soft and self.transition_width_px < 2:
+            raise ValueError(
+                "predict.latent_anchoring.mode=expanded_soft requires transition_width_px >= 2"
+            )
+        return self
+
+
 class PredictConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     devices: DeviceConfig = Field(default_factory=DeviceConfig)
+    latent_anchoring: LatentAnchoringConfig = Field(default_factory=LatentAnchoringConfig)
 
 
 # ----------------------------
@@ -299,17 +357,61 @@ class PreInsertionConfig(BaseModel):
         return v
 
 
+class LayoutConditionConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    paste_mode: str = "bbox_fit_keep_aspect"
+    train_scale_jitter_ratio: float = 0.10
+    train_offset_jitter_ratio: float = 0.05
+
+    @field_validator("paste_mode")
+    @classmethod
+    def _check_paste_mode(cls, v: str) -> str:
+        allowed = {"bbox_fit_keep_aspect"}
+        if v not in allowed:
+            raise ValueError(f"layout_condition.paste_mode must be one of {allowed}")
+        return v
+
+    @field_validator("train_scale_jitter_ratio", "train_offset_jitter_ratio")
+    @classmethod
+    def _check_jitter_ratio(cls, v: float) -> float:
+        if v < 0 or v >= 1:
+            raise ValueError("layout_condition jitter ratios must be in [0, 1)")
+        return v
+
+
+class MaskControlConfig(BaseModel):
+    """Explicit placement-mask control as an additional VAE-only RGB image.
+
+    Default disabled preserves the historical contract where mask_control is only
+    attached on the query_prompt / pre_insertion (enhanced-mask) paths.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+
+
 class ReferenceCFGConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
     train_dropout_rate: float = 0.0
     force_empty_prompt: bool = False
+    mask_aware: bool = False
+    delta_clip_enabled: bool = False
+    delta_clip_max_ratio: float = 0.5
 
     @field_validator("train_dropout_rate")
     @classmethod
     def _check_train_dropout_rate(cls, v: float) -> float:
         if v < 0 or v >= 1:
             raise ValueError("reference_cfg.train_dropout_rate must be in [0, 1)")
+        return v
+
+    @field_validator("delta_clip_max_ratio")
+    @classmethod
+    def _check_delta_clip_max_ratio(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0:
+            raise ValueError("reference_cfg.delta_clip_max_ratio must be a positive finite value")
         return v
 
 
@@ -320,6 +422,8 @@ class ModelConfig(BaseModel):
     lora: LoraConfig = Field(default_factory=LoraConfig)
     query_prompt: QueryPromptConfig = Field(default_factory=QueryPromptConfig)
     pre_insertion: PreInsertionConfig = Field(default_factory=PreInsertionConfig)
+    layout_condition: LayoutConditionConfig = Field(default_factory=LayoutConditionConfig)
+    mask_control: MaskControlConfig = Field(default_factory=MaskControlConfig)
     reference_cfg: ReferenceCFGConfig = Field(default_factory=ReferenceCFGConfig)
     quantize: bool = False
 
@@ -327,6 +431,187 @@ class ModelConfig(BaseModel):
 # ----------------------------
 # Data
 # ----------------------------
+
+
+class AdaptiveCropConfig(BaseModel):
+    """Shared target-space crop geometry for training and prediction."""
+
+    model_config = ConfigDict(extra="forbid")
+    train_enabled: bool = False
+    predict_enabled: bool = False
+    policy: str = "bbox_area_linear"
+    trigger_bbox_area_ratio: float = 0.10
+    min_crop_area_ratio: float = 0.25
+    context_margin_ratio: float = 0.20
+    mask_threshold: float = 0.5
+    min_crop_side: int = 16
+    aspect_mode: str = "target"
+    blend_mode: str = "strict_mask"
+
+    @field_validator("policy")
+    @classmethod
+    def _check_policy(cls, v: str) -> str:
+        allowed = {"bbox_area_linear"}
+        if v not in allowed:
+            raise ValueError(f"adaptive_crop.policy must be one of {allowed}")
+        return v
+
+    @field_validator("aspect_mode")
+    @classmethod
+    def _check_aspect_mode(cls, v: str) -> str:
+        allowed = {"target"}
+        if v not in allowed:
+            raise ValueError(f"adaptive_crop.aspect_mode must be one of {allowed}")
+        return v
+
+    @field_validator("blend_mode")
+    @classmethod
+    def _check_blend_mode(cls, v: str) -> str:
+        allowed = {"strict_mask"}
+        if v not in allowed:
+            raise ValueError(f"adaptive_crop.blend_mode must be one of {allowed}")
+        return v
+
+    @field_validator("trigger_bbox_area_ratio", "min_crop_area_ratio")
+    @classmethod
+    def _check_open_closed_unit_interval(cls, v: float) -> float:
+        if not math.isfinite(v) or v <= 0 or v > 1:
+            raise ValueError("adaptive crop ratio fields must be in (0, 1]")
+        return v
+
+    @field_validator("mask_threshold")
+    @classmethod
+    def _check_mask_threshold(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 0 or v >= 1:
+            raise ValueError("adaptive_crop.mask_threshold must be finite and in [0, 1)")
+        return v
+
+    @field_validator("context_margin_ratio")
+    @classmethod
+    def _check_context_margin_ratio(cls, v: float) -> float:
+        if not math.isfinite(v) or v < 0:
+            raise ValueError("adaptive_crop.context_margin_ratio must be finite and >= 0")
+        return v
+
+    @field_validator("min_crop_side")
+    @classmethod
+    def _check_positive_size(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("adaptive_crop.min_crop_side must be a positive integer")
+        return v
+
+
+class HybridMaskingContextGuardConfig(BaseModel):
+    """Optional local-data guard against conditioning masks that erase scene context."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    max_condition_area_ratio: float = 0.80
+    overflow_policy: str = "fallback_to_gt"
+
+    @field_validator("max_condition_area_ratio")
+    @classmethod
+    def _check_max_condition_area_ratio(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0 or value >= 1:
+            raise ValueError(
+                "hybrid_masking.context_guard.max_condition_area_ratio must be finite and in (0, 1)"
+            )
+        return value
+
+    @field_validator("overflow_policy")
+    @classmethod
+    def _check_overflow_policy(cls, value: str) -> str:
+        allowed = {"fallback_to_gt"}
+        if value not in allowed:
+            raise ValueError(
+                "hybrid_masking.context_guard.overflow_policy must be one of "
+                f"{allowed}"
+            )
+        return value
+
+
+class HybridMaskingConfig(BaseModel):
+    """Training-only Hybrid Masking from the official Insert Anything pipeline."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    strategy: str = "insert_anything"
+    person_categories: List[str] = Field(default_factory=lambda: ["person"])
+    mask_threshold: float = 0.5
+    bbox_expand_ratio: float = 1.1
+    curve_jitter_px: int = 40
+    dilation_kernel_size: int = 7
+    dilation_iterations: int = 2
+    reference_resolution: int = 768
+    scale_pixel_parameters: bool = True
+    ensure_gt_coverage: bool = True
+    context_guard: HybridMaskingContextGuardConfig = Field(
+        default_factory=HybridMaskingContextGuardConfig
+    )
+
+    @field_validator("strategy")
+    @classmethod
+    def _check_strategy(cls, value: str) -> str:
+        allowed = {"insert_anything"}
+        if value not in allowed:
+            raise ValueError(f"hybrid_masking.strategy must be one of {allowed}")
+        return value
+
+    @field_validator("person_categories")
+    @classmethod
+    def _normalize_person_categories(cls, value: List[str]) -> List[str]:
+        normalized = []
+        for category in value:
+            category = str(category).strip()
+            if not category:
+                raise ValueError("hybrid_masking.person_categories cannot contain empty values")
+            if category not in normalized:
+                normalized.append(category)
+        return normalized
+
+    @field_validator("mask_threshold")
+    @classmethod
+    def _check_mask_threshold(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0 or value >= 1:
+            raise ValueError("hybrid_masking.mask_threshold must be finite and in [0, 1)")
+        return value
+
+    @field_validator("bbox_expand_ratio")
+    @classmethod
+    def _check_bbox_expand_ratio(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 1:
+            raise ValueError("hybrid_masking.bbox_expand_ratio must be finite and >= 1")
+        return value
+
+    @field_validator("curve_jitter_px")
+    @classmethod
+    def _check_curve_jitter(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("hybrid_masking.curve_jitter_px must be >= 0")
+        return value
+
+    @field_validator("dilation_kernel_size")
+    @classmethod
+    def _check_dilation_kernel_size(cls, value: int) -> int:
+        if value <= 0 or value % 2 == 0:
+            raise ValueError("hybrid_masking.dilation_kernel_size must be a positive odd integer")
+        return value
+
+    @field_validator("dilation_iterations", "reference_resolution")
+    @classmethod
+    def _check_positive_int(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("hybrid_masking dilation/reference integer fields must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def _check_context_guard_gt_coverage(self):
+        if self.context_guard.enabled and not self.ensure_gt_coverage:
+            raise ValueError(
+                "hybrid_masking.context_guard requires ensure_gt_coverage=true "
+                "to prevent completed-target pixel leakage"
+            )
+        return self
 
 
 class DatasetInitArgs(BaseModel):
@@ -339,6 +624,8 @@ class DatasetInitArgs(BaseModel):
     use_edit_mask: bool = False
     selected_control_indexes: Optional[List[int]] = None
     processor: ImageProcessorConfig = Field(default_factory=ImageProcessorConfig)
+    adaptive_crop: AdaptiveCropConfig = Field(default_factory=AdaptiveCropConfig)
+    hybrid_masking: HybridMaskingConfig = Field(default_factory=HybridMaskingConfig)
 
     @field_validator("selected_control_indexes")
     @classmethod
@@ -346,6 +633,19 @@ class DatasetInitArgs(BaseModel):
         if v is not None and any(index <= 0 for index in v):
             raise ValueError("selected_control_indexes must use 1-based positive indexes")
         return v
+
+    @model_validator(mode="after")
+    def _check_adaptive_crop_processor_compatibility(self):
+        process_type = self.processor.init_args.process_type
+        adaptive_crop_enabled = (
+            self.adaptive_crop.train_enabled or self.adaptive_crop.predict_enabled
+        )
+        if adaptive_crop_enabled and process_type not in {"fixed_pixels", "resize"}:
+            raise ValueError(
+                "adaptive crop requires processor.process_type to be 'fixed_pixels' or 'resize': "
+                "crop/padding processors cannot be inverted by the original-coordinate restore step"
+            )
+        return self
 
 
 class DataConfig(BaseModel):
@@ -389,6 +689,24 @@ class DataConfig(BaseModel):
             raise ValueError("prefetch_factor must be positive or None")
         return v
 
+    @model_validator(mode="after")
+    def _check_adaptive_fixed_pixels_batching(self):
+        if (
+            self.init_args.adaptive_crop.train_enabled
+            and self.init_args.processor.init_args.process_type == "fixed_pixels"
+            and self.batch_size > 1
+        ):
+            raise ValueError(
+                "adaptive crop with fixed_pixels currently requires data.batch_size=1: "
+                "dynamic H/W padding has no valid-region loss mask"
+            )
+        if self.init_args.hybrid_masking.context_guard.enabled and self.batch_size > 1:
+            raise ValueError(
+                "hybrid masking context guard currently requires data.batch_size=1: "
+                "padded variable-resolution masks do not carry a valid-pixel denominator"
+            )
+        return self
+
 
 # ----------------------------
 # Logging / Sampling
@@ -401,7 +719,21 @@ class SamplingConfig(BaseModel):
     validation_steps: int = 100
     num_samples: int = 4
     seed: int = 42
+    num_inference_steps: int = 20
+    true_cfg_scale: float = 4.0
+    guidance_scale: float = 1.0
+    negative_prompt: Optional[str] = None
+    output_dir: str = "validation"
+    panel_size: int = 320
+    save_composite: bool = True
     validation_data: Optional[Union[str, List[Dict[str, str]]]] = None
+
+    @field_validator("seed")
+    @classmethod
+    def _check_seed(cls, value: int) -> int:
+        if value < 0 or value >= 2**32:
+            raise ValueError("sampling.seed must be in [0, 2**32)")
+        return value
 
     @model_validator(mode="after")
     def _check_when_enabled(self):
@@ -414,6 +746,22 @@ class SamplingConfig(BaseModel):
                 raise ValueError(
                     "num_samples must be positive when sampling is enabled"
                 )
+            if self.num_inference_steps <= 0:
+                raise ValueError(
+                    "num_inference_steps must be positive when sampling is enabled"
+                )
+            if self.true_cfg_scale <= 0:
+                raise ValueError(
+                    "true_cfg_scale must be positive when sampling is enabled"
+                )
+            if self.guidance_scale <= 0:
+                raise ValueError(
+                    "guidance_scale must be positive when sampling is enabled"
+                )
+            if self.panel_size <= 0:
+                raise ValueError(
+                    "panel_size must be positive when sampling is enabled"
+                )
         return self
 
     @field_validator("validation_data")
@@ -422,14 +770,14 @@ class SamplingConfig(BaseModel):
         if v is None:
             return v
         if isinstance(v, list):
-            for item in v:
-                if (
-                    not isinstance(item, dict)
-                    or "control" not in item
-                    or "prompt" not in item
-                ):
+            required = {"ref_image", "ref_mask", "tar_image", "tar_mask"}
+            for index, item in enumerate(v):
+                if not isinstance(item, dict):
+                    raise ValueError("Each validation_data item must be a dict")
+                missing = sorted(required.difference(item))
+                if missing:
                     raise ValueError(
-                        "Each validation_data item must be a dict with 'control' and 'prompt' keys"
+                        f"validation_data item {index} is missing required keys: {missing}"
                     )
         return v
 
@@ -604,12 +952,22 @@ class LossConfig(BaseModel):
     mask_loss: bool = False
     forground_weight: float = 2.0
     background_weight: float = 1.0
+    # token_weighted: global sum(w*e)/sum(w); region_balanced: fixed-ratio mean_fg/mean_bg mix
+    mask_loss_mode: Literal["token_weighted", "region_balanced"] = "token_weighted"
 
     @field_validator("forground_weight", "background_weight")
     @classmethod
     def _positive(cls, v: float) -> float:
         if v <= 0:
             raise ValueError("weight must be > 0")
+        return v
+
+    @field_validator("mask_loss_mode")
+    @classmethod
+    def _mask_loss_mode(cls, v: str) -> str:
+        allowed = {"token_weighted", "region_balanced"}
+        if v not in allowed:
+            raise ValueError(f"mask_loss_mode must be one of {allowed}")
         return v
 
 

@@ -1,13 +1,16 @@
-# Insert Anything configuration (fixed_pixels processor + local folder or Parquet dataset)
-# Current local path points to the a2edit folder dataset without prompt text files.
-# and want to train the Insert Anything LoRA on Qwen Image Edit 2509.
+# Scale launch default for TOTAL_PROCESSES=32 (run.sh). Same idea switches as default.
 
 trainer: QwenImageEditInsertAnything
 
 model:
-  pretrained_model_name_or_path: "/inspire/ssd/project/project-public/250041225002/models/qwen-image-edit-2511"
+  pretrained_model_name_or_path: "/inspire/hdd/global_user/250041225002/project/model/qwen-image-edit-2511"
   quantize: false
   pre_insertion:
+    enabled: false
+    paste_mode: "bbox_fit_keep_aspect"
+    train_scale_jitter_ratio: 0.10
+    train_offset_jitter_ratio: 0.05
+  layout_condition:
     enabled: false
     paste_mode: "bbox_fit_keep_aspect"
     train_scale_jitter_ratio: 0.10
@@ -24,12 +27,15 @@ model:
     enabled: true
     train_dropout_rate: 0.1
     force_empty_prompt: true
+    mask_aware: false
+    delta_clip_enabled: false
+    delta_clip_max_ratio: 0.5
   lora:
     r: 128
     lora_alpha: 128
     target_modules: ["to_q", "to_k", "to_v", "to_out.0", "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out", "img_mlp.net.0.proj", "img_mlp.net.2", "txt_mlp.net.0.proj", "txt_mlp.net.2"]
     init_lora_weights: "gaussian"
-    adapter_name: "insert_anything_lora"
+    adapter_name: "scale_32_lora"
     pretrained_weight: null
 
 data:
@@ -47,13 +53,13 @@ data:
         resize_mode: "bilinear"
 
   batch_size: 1
-  num_workers: 4
+  num_workers: 8
   shuffle: true
   drop_last: true
 
 logging:
-  output_dir: "/inspire/ssd/project/project-public/250041225002/Qwen-Image-Inpainting/logs/query_tarmask"
-  tracker_project_name: "reference_cfg_4_query_tar_mask"
+  output_dir: "logs/inpainting_v2_logs"
+  tracker_project_name: "scale_32"
   report_to: "tensorboard"
 
 optimizer:
@@ -69,6 +75,7 @@ lr_scheduler:
   warmup_steps: 500
 
 train:
+  # Global batch = 32 processes x per-process batch_size 1 x grad_accum 1.
   gradient_accumulation_steps: 1
   max_train_steps: 100000000000
   num_epochs: 10

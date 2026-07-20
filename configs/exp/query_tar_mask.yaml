@@ -1,6 +1,4 @@
-# Insert Anything configuration (fixed_pixels processor + local folder or Parquet dataset)
-# Current local path points to the a2edit folder dataset without prompt text files.
-# and want to train the Insert Anything LoRA on Qwen Image Edit 2509.
+# Experiment: query_prompt path with tar mask (legacy 4-GPU style naming cleaned).
 
 trainer: QwenImageEditInsertAnything
 
@@ -8,6 +6,11 @@ model:
   pretrained_model_name_or_path: "/inspire/ssd/project/project-public/250041225002/models/qwen-image-edit-2511"
   quantize: false
   pre_insertion:
+    enabled: false
+    paste_mode: "bbox_fit_keep_aspect"
+    train_scale_jitter_ratio: 0.10
+    train_offset_jitter_ratio: 0.05
+  layout_condition:
     enabled: false
     paste_mode: "bbox_fit_keep_aspect"
     train_scale_jitter_ratio: 0.10
@@ -24,12 +27,15 @@ model:
     enabled: true
     train_dropout_rate: 0.1
     force_empty_prompt: true
+    mask_aware: false
+    delta_clip_enabled: false
+    delta_clip_max_ratio: 0.5
   lora:
     r: 128
     lora_alpha: 128
     target_modules: ["to_q", "to_k", "to_v", "to_out.0", "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out", "img_mlp.net.0.proj", "img_mlp.net.2", "txt_mlp.net.0.proj", "txt_mlp.net.2"]
     init_lora_weights: "gaussian"
-    adapter_name: "insert_anything_lora"
+    adapter_name: "exp_query_tar_mask_lora"
     pretrained_weight: null
 
 data:
@@ -52,8 +58,8 @@ data:
   drop_last: true
 
 logging:
-  output_dir: "/inspire/ssd/project/project-public/250041225002/Qwen-Image-Inpainting/logs/insert_anything_fixed_pixels_parquet"
-  tracker_project_name: "reference_cfg_4"
+  output_dir: "/inspire/ssd/project/project-public/250041225002/Qwen-Image-Inpainting/logs/query_tarmask"
+  tracker_project_name: "exp_query_tar_mask"
   report_to: "tensorboard"
 
 optimizer:

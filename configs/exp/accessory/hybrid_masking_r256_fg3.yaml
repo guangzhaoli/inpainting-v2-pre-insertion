@@ -1,0 +1,148 @@
+# Experiment: accessory/jewelry + Hybrid Masking, reference_cfg, LoRA r256, fg:bg=3:1. Adaptive Crop off.
+
+trainer: QwenImageEditInsertAnything
+
+model:
+    pretrained_model_name_or_path: "/inspire/hdd/global_user/250041225002/project/model/qwen-image-edit-2511"
+    quantize: false
+    pre_insertion:
+        enabled: false
+        paste_mode: "bbox_fit_keep_aspect"
+        train_scale_jitter_ratio: 0.10
+        train_offset_jitter_ratio: 0.05
+    layout_condition:
+        enabled: false
+        paste_mode: "bbox_fit_keep_aspect"
+        train_scale_jitter_ratio: 0.10
+        train_offset_jitter_ratio: 0.05
+    query_prompt:
+        enabled: false
+        num_query_tokens: 8
+        hidden_dim: 1024
+        num_heads: 8
+        qformer_layers: 2
+        layer_indices: [-11, -9, -7, -5, -3, -1]
+        max_source_images: 4
+    reference_cfg:
+        enabled: true
+        train_dropout_rate: 0.1
+        force_empty_prompt: true
+        mask_aware: false
+        delta_clip_enabled: false
+        delta_clip_max_ratio: 0.5
+    lora:
+        r: 256
+        lora_alpha: 256
+        target_modules:
+            [
+                "to_q",
+                "to_k",
+                "to_v",
+                "to_out.0",
+                "add_q_proj",
+                "add_k_proj",
+                "add_v_proj",
+                "to_add_out",
+                "img_mlp.net.0.proj",
+                "img_mlp.net.2",
+                "txt_mlp.net.0.proj",
+                "txt_mlp.net.2",
+            ]
+        init_lora_weights: "gaussian"
+        adapter_name: "exp_accessory_hybrid_masking_r256_fg3_lora"
+        pretrained_weight: null
+
+data:
+    class_path: "src.data.insert_anything_dataset.InsertAnythingDataset"
+    init_args:
+        dataset_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/a2edit/data"
+        manifest_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2-pre-insertion/manifests/insert_anything_teacher_accessory_jewelry.csv"
+        categories:
+            - "accessory"
+            - "jewel_filter"
+        require_prompt: false
+        adaptive_crop:
+            train_enabled: false
+            predict_enabled: false
+        hybrid_masking:
+            enabled: true
+            strategy: "insert_anything"
+            person_categories:
+                - "person"
+            mask_threshold: 0.5
+            bbox_expand_ratio: 1.1
+            curve_jitter_px: 40
+            dilation_kernel_size: 7
+            dilation_iterations: 2
+            reference_resolution: 768
+            scale_pixel_parameters: true
+            ensure_gt_coverage: true
+            # B: preserve at least 20% scene context; GT is the leakage-safe fallback.
+            context_guard:
+                enabled: true
+                max_condition_area_ratio: 0.80
+                overflow_policy: "fallback_to_gt"
+        processor:
+            class_path: "src.data.preprocess.ImageProcessor"
+            init_args:
+                process_type: "fixed_pixels"
+                target_pixels: 1048576
+                controls_pixels: [1048576, 1048576]
+                resize_mode: "bilinear"
+
+    batch_size: 1
+    num_workers: 8
+    shuffle: true
+    drop_last: true
+
+logging:
+    output_dir: "logs/inpainting_v2_teacher_logs"
+    tracker_project_name: "exp_accessory_hybrid_masking_r256_fg3"
+    report_to: "tensorboard"
+    sampling:
+        enable: false
+        validation_steps: 1000
+        num_samples: 10
+        seed: 42
+        num_inference_steps: 40
+        true_cfg_scale: 4.0
+        guidance_scale: 1.0
+        output_dir: "validation"
+        panel_size: 320
+        save_composite: true
+        validation_data: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/a2edit/eval/testset_20260120/accessory"
+
+optimizer:
+    class_path: "torch.optim.AdamW"
+    init_args:
+        lr: 1.0e-4
+        betas: [0.9, 0.999]
+        weight_decay: 0.01
+        eps: 1.0e-8
+
+lr_scheduler:
+    scheduler_type: "cosine"
+    warmup_steps: 500
+
+train:
+    gradient_accumulation_steps: 1
+    max_train_steps: 100000000000
+    num_epochs: 5
+    checkpointing_steps: 1000
+    checkpoints_total_limit: 20
+    max_grad_norm: 1.0
+    mixed_precision: "bf16"
+    gradient_checkpointing: true
+
+loss:
+    mask_loss: true
+    forground_weight: 3.0
+    background_weight: 1.0
+
+predict:
+    devices:
+        vae: "cuda:0"
+        text_encoder: "cuda:0"
+        dit: "cuda:0"
+
+resume: null

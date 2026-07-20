@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Distributed worker aborts can otherwise write one multi-GiB core per rank.
+ulimit -c 0
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 USER_CONFIG_ARG="${1:-}"
@@ -14,7 +17,7 @@ TOTAL_PROCESSES="${TOTAL_PROCESSES:-$((NUM_MACHINES * NPROC_PER_NODE))}"
 RESUME="${RESUME:-}"
 DRY_RUN="${DRY_RUN:-0}"
 
-DEFAULT_CONFIG_FILE="${SCRIPT_DIR}/configs/insert_anything_${TOTAL_PROCESSES}.yaml"
+DEFAULT_CONFIG_FILE="${SCRIPT_DIR}/configs/scale/${TOTAL_PROCESSES}.yaml"
 CONFIG_FILE="${CONFIG_FILE:-${USER_CONFIG_ARG:-${DEFAULT_CONFIG_FILE}}}"
 
 DEFAULT_ACCELERATE_CONFIG="${SCRIPT_DIR}/accelerate_config_${TOTAL_PROCESSES}.yaml"
@@ -48,12 +51,14 @@ echo "TOTAL_PROCESSES: ${TOTAL_PROCESSES}"
 echo "MAIN_PROCESS_IP: ${MAIN_PROCESS_IP}"
 echo "MAIN_PROCESS_PORT: ${MAIN_PROCESS_PORT}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "CORE_DUMP_LIMIT: $(ulimit -c)"
 echo "=================================================="
 
 LAUNCH_ARGS=(
     --config_file "${ACCELERATE_CONFIG}"
     --num_processes "${TOTAL_PROCESSES}"
     --mixed_precision "${MIXED_PRECISION}"
+    --main_process_port "${MAIN_PROCESS_PORT}"
 )
 
 if [[ "${NUM_MACHINES}" -gt 1 ]]; then
@@ -61,7 +66,6 @@ if [[ "${NUM_MACHINES}" -gt 1 ]]; then
         --num_machines "${NUM_MACHINES}"
         --machine_rank "${MACHINE_RANK}"
         --main_process_ip "${MAIN_PROCESS_IP}"
-        --main_process_port "${MAIN_PROCESS_PORT}"
     )
 fi
 

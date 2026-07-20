@@ -1,11 +1,16 @@
-# Teacher-specific Insert Anything config: humans.
+# Teacher baseline: animal category, LoRA r128. reference_cfg off.
 
 trainer: QwenImageEditInsertAnything
 
 model:
-  pretrained_model_name_or_path: "/mnt/cpfs/weiqingyan/flow/qwen-image-inpainting/models/qwen-image-edit-2511"
+  pretrained_model_name_or_path: "/inspire/hdd/global_user/250041225002/project/model/qwen-image-edit-2511"
   quantize: false
   pre_insertion:
+    enabled: false
+    paste_mode: "bbox_fit_keep_aspect"
+    train_scale_jitter_ratio: 0.10
+    train_offset_jitter_ratio: 0.05
+  layout_condition:
     enabled: false
     paste_mode: "bbox_fit_keep_aspect"
     train_scale_jitter_ratio: 0.10
@@ -22,21 +27,25 @@ model:
     enabled: false
     train_dropout_rate: 0.0
     force_empty_prompt: false
+    mask_aware: false
+    delta_clip_enabled: false
+    delta_clip_max_ratio: 0.5
   lora:
     r: 128
     lora_alpha: 128
     target_modules: ["to_q", "to_k", "to_v", "to_out.0", "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out", "img_mlp.net.0.proj", "img_mlp.net.2", "txt_mlp.net.0.proj", "txt_mlp.net.2"]
     init_lora_weights: "gaussian"
-    adapter_name: "teacher_human_lora"
+    adapter_name: "teacher_animal_lora"
     pretrained_weight: null
 
 data:
   class_path: "src.data.insert_anything_dataset.InsertAnythingDataset"
   init_args:
-    dataset_path: "/mnt/cpfs/weiqingyan/flow/qwen-image-inpainting/datasets/anyinsertion_v2"
-    manifest_path: "/mnt/cpfs/weiqingyan/inpainting/inpainting-v2-pre-insertion/manifests/insert_anything_teacher_human.csv"
+    dataset_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/a2edit/data"
+    manifest_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2-pre-insertion/manifests/insert_anything_teacher_animal.csv"
     categories:
-      - "person"
+      - "cat"
+      - "dog"
     require_prompt: false
     processor:
       class_path: "src.data.preprocess.ImageProcessor"
@@ -52,8 +61,8 @@ data:
   drop_last: true
 
 logging:
-  output_dir: "/mnt/cpfs/weiqingyan/inpainting/inpainting-v2-pre-insertion/logs/inpainting_v2_teacher_logs"
-  tracker_project_name: "teacher_human_native_qwen_image_inpainting"
+  output_dir: "logs/inpainting_v2_teacher_logs"
+  tracker_project_name: "teacher_animal"
   report_to: "tensorboard"
 
 optimizer:
