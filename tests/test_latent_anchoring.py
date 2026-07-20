@@ -487,43 +487,5 @@ class InsertAnythingLatentAnchoringRoutingTest(unittest.TestCase):
         legacy_encode_mock.assert_not_called()
         self.assertNotIn("anchor_source_latents", legacy_embeddings)
 
-    def test_enhanced_mask_control_matches_expanded_source_hole(self):
-        trainer = object.__new__(QwenImageEditInsertAnythingTrainer)
-        trainer.config = Config()
-        trainer.config.model.pre_insertion.enabled = True
-
-        core = torch.zeros(1, 8, 8)
-        core[:, 3:5, 3:5] = 1
-        free = torch.zeros(1, 8, 8)
-        free[:, 1:7, 1:7] = 1
-        batch = {
-            "ref_image": torch.ones(1, 3, 8, 8),
-            "ref_mask": torch.ones(1, 8, 8),
-            "tar_image": torch.ones(1, 3, 8, 8),
-            "tar_mask": core,
-            "source_hole_mask": free,
-            "prompt": [""],
-            "category": ["predict"],
-            "height": 8,
-            "width": 8,
-            "num_inference_steps": 2,
-            "guidance": 1.0,
-            "true_cfg_scale": 1.0,
-        }
-
-        with patch.object(
-            QwenImageEditPlusTrainer,
-            "prepare_embeddings",
-            autospec=True,
-            side_effect=lambda _self, parent_batch, stage="fit": parent_batch,
-        ):
-            embeddings = trainer.prepare_embeddings(batch, stage="predict")
-
-        mask_control = embeddings["control_2"]
-        torch.testing.assert_close(mask_control[:, 0], free)
-        torch.testing.assert_close(mask_control[:, 1], free)
-        torch.testing.assert_close(mask_control[:, 2], free)
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -11,9 +11,6 @@ from pydantic import ValidationError
 from src.data.config import (
     DataConfig,
     HybridMaskingConfig,
-    LayoutConditionConfig,
-    PreInsertionConfig,
-    QueryPromptConfig,
     ReferenceCFGConfig,
     load_config_from_yaml,
 )
@@ -28,7 +25,6 @@ from src.utils.hybrid_masking import (
     build_insert_anything_mask_for_mode,
     sample_insert_anything_mask_mode,
 )
-from src.utils.images import build_preinserted_composite
 
 
 class FixedProbabilityRng:
@@ -78,8 +74,6 @@ def make_trainer(
     hybrid_enabled=False,
     context_guard_enabled=False,
     max_condition_area_ratio=0.80,
-    pre_insertion=False,
-    layout_condition=False,
     reference_cfg=False,
     mask_aware=False,
     mask_loss=True,
@@ -101,17 +95,6 @@ def make_trainer(
             )
         ),
         model=SimpleNamespace(
-            query_prompt=QueryPromptConfig(enabled=False),
-            pre_insertion=PreInsertionConfig(
-                enabled=pre_insertion,
-                train_scale_jitter_ratio=0.0,
-                train_offset_jitter_ratio=0.0,
-            ),
-            layout_condition=LayoutConditionConfig(
-                enabled=layout_condition,
-                train_scale_jitter_ratio=0.0,
-                train_offset_jitter_ratio=0.0,
-            ),
             reference_cfg=ReferenceCFGConfig(
                 enabled=reference_cfg,
                 train_dropout_rate=0.0,
@@ -191,7 +174,8 @@ class HybridMaskingConfigTest(unittest.TestCase):
 
     def test_target_b_config_explicitly_enables_context_guard(self):
         config_path = Path(__file__).resolve().parents[1] / "configs/exp/accessory/hybrid_masking_r256_fg3.yaml"
-        config = load_config_from_yaml(str(config_path))
+        with patch("torch.cuda.is_available", return_value=True):
+            config = load_config_from_yaml(str(config_path))
         guard = config.data.init_args.hybrid_masking.context_guard
         self.assertTrue(guard.enabled)
         self.assertEqual(guard.max_condition_area_ratio, 0.80)
@@ -389,62 +373,6 @@ class HybridMaskingTrainerRoutingTest(unittest.TestCase):
         expected_control = batch["tar_image"] * (1 - batch["tar_mask_cond"].unsqueeze(1))
         self.assertTrue(torch.equal(output["control"], expected_control))
         self.assertTrue(torch.equal(output["mask"], batch["tar_mask"]))
-
-    def test_pre_insertion_and_mask_control_use_condition_mask(self):
-        trainer = make_trainer(hybrid_enabled=True, pre_insertion=True, mask_loss=True)
-        batch = make_batch()
-        with patch.object(
-            QwenImageEditPlusTrainer,
-            "prepare_embeddings",
-            autospec=True,
-            side_effect=passthrough_prepare_embeddings,
-        ):
-            output = trainer.prepare_embeddings(batch, stage="fit")
-
-        expected_control = build_preinserted_composite(
-            target_image=batch["tar_image"],
-            target_mask=batch["tar_mask_cond"],
-            ref_image=batch["ref_image"],
-            ref_mask=batch["ref_mask"],
-            training=True,
-            scale_jitter_ratio=0.0,
-            offset_jitter_ratio=0.0,
-            paste_mode="bbox_fit_keep_aspect",
-        )
-        expected_mask_control = batch["tar_mask_cond"].unsqueeze(1).repeat(1, 3, 1, 1)
-        self.assertTrue(torch.equal(output["control"], expected_control))
-        self.assertTrue(torch.equal(output["control_2"], expected_mask_control))
-        self.assertTrue(torch.equal(output["mask"], batch["tar_mask"]))
-
-    def test_layout_and_mask_aware_reference_cfg_use_condition_mask(self):
-        trainer = make_trainer(
-            layout_condition=True,
-            reference_cfg=True,
-            mask_aware=True,
-            mask_loss=False,
-        )
-        batch = make_batch()
-        with patch.object(
-            QwenImageEditPlusTrainer,
-            "prepare_embeddings",
-            autospec=True,
-            side_effect=passthrough_prepare_embeddings,
-        ):
-            output = trainer.prepare_embeddings(batch, stage="predict")
-
-        expected_layout = build_preinserted_composite(
-            target_image=batch["tar_image"],
-            target_mask=batch["tar_mask"],
-            ref_image=batch["ref_image"],
-            ref_mask=batch["ref_mask"],
-            training=False,
-            scale_jitter_ratio=0.0,
-            offset_jitter_ratio=0.0,
-            paste_mode="bbox_fit_keep_aspect",
-        )
-        self.assertTrue(torch.equal(output["control_2"], expected_layout))
-        self.assertTrue(torch.equal(output["reference_cfg_mask"], batch["tar_mask"]))
-        self.assertEqual(output["reference_cfg_embeddings"]["n_controls"], 0)
 
     def test_precomputed_mask_is_fit_only_binary_and_gt_covering(self):
         trainer = make_trainer(hybrid_enabled=True, mask_loss=False)

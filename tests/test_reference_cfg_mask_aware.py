@@ -5,9 +5,6 @@ from unittest.mock import patch
 import torch
 
 from src.data.config import (
-    LayoutConditionConfig,
-    PreInsertionConfig,
-    QueryPromptConfig,
     ReferenceCFGConfig,
 )
 from src.trainer.qwen_image_edit_insert_anything_trainer import QwenImageEditInsertAnythingTrainer
@@ -33,9 +30,6 @@ def make_trainer(mask_aware, delta_clip_enabled=False, delta_clip_max_ratio=0.5)
     trainer = object.__new__(QwenImageEditInsertAnythingTrainer)
     trainer.config = SimpleNamespace(
         model=SimpleNamespace(
-            query_prompt=QueryPromptConfig(enabled=False),
-            pre_insertion=PreInsertionConfig(enabled=False),
-            layout_condition=LayoutConditionConfig(enabled=False),
             reference_cfg=ReferenceCFGConfig(
                 enabled=True,
                 train_dropout_rate=0.0,

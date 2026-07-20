@@ -303,89 +303,8 @@ class LoraConfig(BaseModel):
         return v
 
 
-class QueryPromptConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    enabled: bool = False
-    num_query_tokens: int = 8
-    hidden_dim: int = 1024
-    num_heads: int = 8
-    qformer_layers: int = 2
-    layer_indices: List[int] = Field(default_factory=lambda: [-3, -2, -1])
-    max_source_images: int = 4
-
-    @field_validator("num_query_tokens", "hidden_dim", "num_heads", "qformer_layers", "max_source_images")
-    @classmethod
-    def _check_positive_ints(cls, v: int) -> int:
-        if v <= 0:
-            raise ValueError("query prompt integer fields must be > 0")
-        return v
-
-    @field_validator("layer_indices")
-    @classmethod
-    def _check_layer_indices(cls, v: List[int]) -> List[int]:
-        if len(v) == 0:
-            raise ValueError("layer_indices must be non-empty")
-        return v
-
-    @model_validator(mode="after")
-    def _check_heads(self):
-        if self.hidden_dim % self.num_heads != 0:
-            raise ValueError("query_prompt.hidden_dim must be divisible by query_prompt.num_heads")
-        return self
-
-
-class PreInsertionConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    enabled: bool = False
-    paste_mode: str = "bbox_fit_keep_aspect"
-    train_scale_jitter_ratio: float = 0.10
-    train_offset_jitter_ratio: float = 0.05
-
-    @field_validator("paste_mode")
-    @classmethod
-    def _check_paste_mode(cls, v: str) -> str:
-        allowed = {"bbox_fit_keep_aspect"}
-        if v not in allowed:
-            raise ValueError(f"pre_insertion.paste_mode must be one of {allowed}")
-        return v
-
-    @field_validator("train_scale_jitter_ratio", "train_offset_jitter_ratio")
-    @classmethod
-    def _check_jitter_ratio(cls, v: float) -> float:
-        if v < 0 or v >= 1:
-            raise ValueError("pre_insertion jitter ratios must be in [0, 1)")
-        return v
-
-
-class LayoutConditionConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    enabled: bool = False
-    paste_mode: str = "bbox_fit_keep_aspect"
-    train_scale_jitter_ratio: float = 0.10
-    train_offset_jitter_ratio: float = 0.05
-
-    @field_validator("paste_mode")
-    @classmethod
-    def _check_paste_mode(cls, v: str) -> str:
-        allowed = {"bbox_fit_keep_aspect"}
-        if v not in allowed:
-            raise ValueError(f"layout_condition.paste_mode must be one of {allowed}")
-        return v
-
-    @field_validator("train_scale_jitter_ratio", "train_offset_jitter_ratio")
-    @classmethod
-    def _check_jitter_ratio(cls, v: float) -> float:
-        if v < 0 or v >= 1:
-            raise ValueError("layout_condition jitter ratios must be in [0, 1)")
-        return v
-
-
 class MaskControlConfig(BaseModel):
-    """Explicit placement-mask control as an additional VAE-only RGB image.
-
-    Default disabled preserves the historical contract where mask_control is only
-    attached on the query_prompt / pre_insertion (enhanced-mask) paths.
-    """
+    """Explicit placement-mask control as an additional VAE-only RGB image."""
 
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
@@ -420,12 +339,38 @@ class ModelConfig(BaseModel):
     pretrained_model_name_or_path: str = "Qwen/Qwen-Image-Edit"
     pretrained_embeddings: Optional[dict] = None  # if want to load different embeeding model vs main model (dit)
     lora: LoraConfig = Field(default_factory=LoraConfig)
-    query_prompt: QueryPromptConfig = Field(default_factory=QueryPromptConfig)
-    pre_insertion: PreInsertionConfig = Field(default_factory=PreInsertionConfig)
-    layout_condition: LayoutConditionConfig = Field(default_factory=LayoutConditionConfig)
     mask_control: MaskControlConfig = Field(default_factory=MaskControlConfig)
     reference_cfg: ReferenceCFGConfig = Field(default_factory=ReferenceCFGConfig)
     quantize: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_split_conditioning_modes(cls, value):
+        """Accept disabled legacy fields while routing enabled modes to their worktrees."""
+
+        if not isinstance(value, dict):
+            return value
+
+        retired_modes = {
+            "query_prompt": "inpainting-v2-query-prompt",
+            "pre_insertion": "inpainting-v2-layout-condition",
+            "layout_condition": "inpainting-v2-layout-condition",
+        }
+        filtered = dict(value)
+        for field_name, worktree_name in retired_modes.items():
+            if field_name not in filtered:
+                continue
+            retired_config = filtered[field_name]
+            if not isinstance(retired_config, dict):
+                raise ValueError(
+                    f"model.{field_name} was split out; legacy values must be mappings with enabled=false"
+                )
+            if retired_config.get("enabled", False) not in (False, 0, None):
+                raise ValueError(
+                    f"model.{field_name}.enabled=true requires the {worktree_name} worktree"
+                )
+            filtered.pop(field_name)
+        return filtered
 
 
 # ----------------------------

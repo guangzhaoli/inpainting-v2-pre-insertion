@@ -181,8 +181,6 @@ def main():
         "width": args.width,
         "seed": args.seed,
         "reference_cfg_enabled": bool(config.model.reference_cfg.enabled),
-        "query_prompt_enabled": bool(config.model.query_prompt.enabled),
-        "pre_insertion_enabled": bool(config.model.pre_insertion.enabled),
         "latent_anchoring": latent_anchoring_metadata(ensure_latent_anchoring_config(config)),
     }
     write_json(args.output_dir / "run_config.json", run_config)

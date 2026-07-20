@@ -1,13 +1,15 @@
 # Qwen Insert Anything Inpainting
 
-This repository is the active `inpainting-v2-pre-insertion` codebase for Qwen image inpainting experiments. It keeps one maintained training and inference path:
+This directory is the `main` baseline worktree (the legacy folder name is kept so existing linked worktrees remain valid). It keeps one maintained training and inference path:
 
 - `QwenImageEditInsertAnythingTrainer`
 - `InsertAnythingDataset`
 - LoRA training for Qwen Image Edit / Qwen Image Edit Plus style multi-image conditioning
-- explicit experiment switches for `query_prompt`, `pre_insertion`, `layout_condition`, `mask_control`, and `reference_cfg`
+- Adaptive Crop, random mask expansion (Hybrid Masking), and reference CFG
 
-Current configs disable `query_prompt`, `pre_insertion`, `layout_condition`, and `mask_control`, and enable `reference_cfg`. In this mode, `true_cfg_scale` controls reference guidance: the positive branch uses both Qwen-VL reference conditioning and reference VAE control, while the null-reference branch removes both reference paths and keeps only the source/context condition. The default configs also set `reference_cfg.force_empty_prompt: true`, so this path does not use text prompt guidance.
+Pre-insertion/layout conditioning and Query-prompt are isolated in sibling worktrees `inpainting-v2-layout-condition` and `inpainting-v2-query-prompt`. This baseline accepts their disabled fields when validating legacy checkpoint metadata, but rejects checkpoints that require either retired conditioning path.
+
+Current baseline configs enable `reference_cfg`. In this mode, `true_cfg_scale` controls reference guidance: the positive branch uses both Qwen-VL reference conditioning and reference VAE control, while the null-reference branch removes both reference paths and keeps only the source/context condition. The default configs also set `reference_cfg.force_empty_prompt: true`, so this path does not use text prompt guidance.
 
 ## Environment
 
@@ -36,7 +38,6 @@ configs/
   scale/{4,8,16,32}.yaml    # run.sh auto-select by TOTAL_PROCESSES
   teacher/                  # domain baselines (all / accessory_jewelry / ...)
   exp/accessory/            # accessory idea ablations
-  exp/query_tar_mask.yaml
   legacy/native.yaml
 ```
 
@@ -53,12 +54,6 @@ Each config exposes:
 
 ```yaml
 model:
-  query_prompt:
-    enabled: false
-  pre_insertion:
-    enabled: false
-  layout_condition:
-    enabled: false
   mask_control:
     enabled: false
   reference_cfg:
@@ -70,15 +65,13 @@ model:
     delta_clip_max_ratio: 0.5
 ```
 
-Set `model.reference_cfg.enabled` to `false` to use the native text true-CFG path. Keep `query_prompt` and `pre_insertion` disabled when using reference CFG.
+Set `model.reference_cfg.enabled` to `false` to use the native text true-CFG path.
 
 Set `model.reference_cfg.mask_aware` to `true` to apply reference CFG only inside the target mask. Mask tokens use reference CFG, while non-mask tokens keep the positive reference-conditioned prediction without extra CFG amplification.
 
 Set `model.reference_cfg.delta_clip_enabled` to `true` to clip the per-token reference delta before applying reference CFG. The clipping threshold is `delta_clip_max_ratio * norm(eps_BR)` for each latent token, where `eps_BR` is the positive reference-conditioned prediction. When enabled, this replaces the older full-prediction norm rescale used after CFG combination.
 
-Set `model.layout_condition.enabled` to `true` to add a coarse reference layout proposal as an additional VAE-only control input. This does not replace the main masked source/background control and does not send the layout proposal to Qwen-VL. When reference CFG is active, the positive branch receives the layout proposal and the null-reference branch keeps only the source/context condition.
-
-Set `model.mask_control.enabled` to `true` to attach the placement mask as an extra VAE-only RGB control (binary mask repeated to 3 channels). This is independent of `query_prompt` / `pre_insertion` and does **not** force `true_cfg_scale` to 1, so it can be combined with `reference_cfg`. When reference CFG is active, both the positive and null-reference branches receive the placement mask; only the reference image (and layout proposal, if any) is dropped on the null branch. Default `false` preserves previous checkpoints and inference.
+Set `model.mask_control.enabled` to `true` to attach the placement mask as an extra VAE-only RGB control (binary mask repeated to 3 channels). It does **not** force `true_cfg_scale` to 1, so it can be combined with `reference_cfg`. When reference CFG is active, both the positive and null-reference branches receive the placement mask; only the reference image is dropped on the null branch. Default `false` preserves previous checkpoints and inference.
 
 ## Training
 
@@ -180,12 +173,6 @@ feathering; candidates expand or fall back when needed, and empty processed
 `M_core` is rejected with a wrapper-level error. Explicit `--height/--width`
 remains unsupported for B/C/D. Training-time periodic validation still forces
 legacy A until its saver uses the same crop-aware primary-output path.
-
-If `query_prompt.enabled: true`, the checkpoint directory must also contain:
-
-```text
-query_prompt.safetensors
-```
 
 Running without LoRA is blocked by default. Use `--allow-base-model` only when intentionally testing the untrained base model. LoRA inference verifies the nearest checkpoint `train_config.yaml` against the selected config, including Adaptive Crop, processor, base model, LoRA structure, and conditioning modes. Missing or incompatible checkpoint metadata fails by default; use `--allow-checkpoint-mismatch` only for an intentional, recorded override.
 
@@ -291,8 +278,6 @@ for path in sorted(Path("configs").rglob("*.yaml")):
     print(
         path.as_posix(),
         cfg.trainer_type,
-        cfg.model.query_prompt.enabled,
-        cfg.model.pre_insertion.enabled,
         cfg.model.reference_cfg.enabled,
         cfg.model.reference_cfg.force_empty_prompt,
         cfg.data.init_args.require_prompt,

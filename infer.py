@@ -164,14 +164,6 @@ def resolve_lora_path(path: Path) -> Path:
     raise FileNotFoundError(f"No safetensors file found in checkpoint directory: {path}")
 
 
-def checkpoint_dir_for_lora(lora_path: Path) -> Path:
-    return lora_path.parent if lora_path.is_file() else lora_path
-
-
-def enhanced_mask_prompt_enabled(config) -> bool:
-    return bool(config.model.query_prompt.enabled) or bool(config.model.pre_insertion.enabled)
-
-
 def validate_configured_inference(config, args, resolved_lora_path: Path | None) -> None:
     validate_inference_mode_inputs(
         config,
@@ -181,14 +173,6 @@ def validate_configured_inference(config, args, resolved_lora_path: Path | None)
 
     if resolved_lora_path is None and not args.allow_base_model:
         raise ValueError("LoRA weight is required. Pass --lora or set model.lora.pretrained_weight in config.")
-
-    if config.model.query_prompt.enabled:
-        if resolved_lora_path is None:
-            raise ValueError("query_prompt inference requires a LoRA checkpoint directory with query_prompt.safetensors")
-        query_prompt_path = checkpoint_dir_for_lora(resolved_lora_path) / "query_prompt.safetensors"
-        if not query_prompt_path.exists():
-            raise FileNotFoundError(f"query_prompt is enabled but companion weights were not found: {query_prompt_path}")
-
 
 def resolve_ref_mask_for_visualization(ref_img: Image.Image, ref_mask: Image.Image | None) -> Image.Image:
     if ref_mask is not None:

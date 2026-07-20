@@ -9,7 +9,6 @@ import torch
 from PIL import Image
 
 from infer import (
-    enhanced_mask_prompt_enabled,
     load_rgb_image,
     resolve_lora_path,
     save_latent_anchoring_masks,
@@ -508,7 +507,6 @@ def main():
         "height": args.height,
         "width": args.width,
         "seed": args.seed,
-        "enhanced_mask_prompt": enhanced_mask_prompt_enabled(config),
         "latent_anchoring": run_anchoring_metadata,
         "adaptive_crop": config.data.init_args.adaptive_crop.model_dump(mode="json"),
         "output_semantics": {

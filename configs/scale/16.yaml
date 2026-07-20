@@ -5,24 +5,6 @@ trainer: QwenImageEditInsertAnything
 model:
   pretrained_model_name_or_path: "/inspire/ssd/project/project-public/250041225002/models/qwen-image-edit-2511"
   quantize: false
-  pre_insertion:
-    enabled: false
-    paste_mode: "bbox_fit_keep_aspect"
-    train_scale_jitter_ratio: 0.10
-    train_offset_jitter_ratio: 0.05
-  layout_condition:
-    enabled: false
-    paste_mode: "bbox_fit_keep_aspect"
-    train_scale_jitter_ratio: 0.10
-    train_offset_jitter_ratio: 0.05
-  query_prompt:
-    enabled: false
-    num_query_tokens: 8
-    hidden_dim: 1024
-    num_heads: 8
-    qformer_layers: 2
-    layer_indices: [-11, -9, -7, -5, -3, -1]
-    max_source_images: 4
   reference_cfg:
     enabled: true
     train_dropout_rate: 0.1

@@ -50,6 +50,25 @@ def make_adaptive_config(*, train_enabled=True, predict_enabled=True, adapter_na
     )
 
 
+class SplitConditioningConfigTest(unittest.TestCase):
+    def test_disabled_legacy_modes_are_ignored(self):
+        config = ModelConfig.model_validate(
+            {
+                "query_prompt": {"enabled": False},
+                "pre_insertion": {"enabled": False},
+                "layout_condition": {"enabled": False},
+            }
+        )
+
+        self.assertFalse(hasattr(config, "query_prompt"))
+        self.assertFalse(hasattr(config, "pre_insertion"))
+        self.assertFalse(hasattr(config, "layout_condition"))
+
+    def test_enabled_legacy_mode_requires_split_worktree(self):
+        with self.assertRaisesRegex(ValueError, "inpainting-v2-query-prompt"):
+            ModelConfig.model_validate({"query_prompt": {"enabled": True}})
+
+
 class CheckpointCompatibilityTest(unittest.TestCase):
     def _write_checkpoint(self, root: Path, config: Config) -> Path:
         run_dir = root / "run"
@@ -133,6 +152,45 @@ class CheckpointCompatibilityTest(unittest.TestCase):
             self.assertTrue(result["verified"])
             self.assertEqual(result["mismatches"], [])
 
+    def test_disabled_retired_modes_are_ignored_for_legacy_checkpoints(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = make_adaptive_config()
+            lora_path = self._write_checkpoint(Path(tmpdir), config)
+            train_config_path = lora_path.parent.parent / "train_config.yaml"
+            payload = yaml.safe_load(train_config_path.read_text(encoding="utf-8"))
+            payload["model"].update(
+                {
+                    "query_prompt": {"enabled": False},
+                    "pre_insertion": {"enabled": False},
+                    "layout_condition": {"enabled": False},
+                }
+            )
+            train_config_path.write_text(
+                yaml.safe_dump(payload, sort_keys=False),
+                encoding="utf-8",
+            )
+
+            result = validate_checkpoint_compatibility(config, lora_path)
+
+            self.assertTrue(result["verified"])
+
+    def test_enabled_retired_mode_points_to_its_worktree(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = make_adaptive_config()
+            lora_path = self._write_checkpoint(Path(tmpdir), config)
+            train_config_path = lora_path.parent.parent / "train_config.yaml"
+            payload = yaml.safe_load(train_config_path.read_text(encoding="utf-8"))
+            payload["model"]["layout_condition"] = {"enabled": True}
+            train_config_path.write_text(
+                yaml.safe_dump(payload, sort_keys=False),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "inpainting-v2-layout-condition"):
+                validate_checkpoint_compatibility(config, lora_path)
+            with self.assertRaisesRegex(ValueError, "inpainting-v2-layout-condition"):
+                validate_checkpoint_compatibility(config, lora_path, allow_mismatch=True)
+
 
 class EffectiveMetadataTest(unittest.TestCase):
     def test_disabled_guidance_embedding_is_recorded_as_inactive(self):
@@ -158,7 +216,7 @@ class EffectiveMetadataTest(unittest.TestCase):
         self.assertEqual(metadata["requested"]["height"], 768)
         self.assertEqual(metadata["effective"]["width"], 672)
 
-    def test_text_reference_and_enhanced_prompt_cfg_modes_are_distinguished(self):
+    def test_text_and_reference_cfg_modes_are_distinguished(self):
         native_config = make_adaptive_config()
         native = build_effective_inference_metadata(
             native_config,
@@ -187,21 +245,6 @@ class EffectiveMetadataTest(unittest.TestCase):
         self.assertTrue(reference["modes"]["reference_cfg_active"])
         self.assertEqual(reference["effective"]["reference_cfg_scale"], 4.0)
         self.assertEqual(reference["effective"]["text_true_cfg_scale"], 1.0)
-
-        enhanced_config = make_adaptive_config()
-        enhanced_config.model.query_prompt.enabled = True
-        enhanced = build_effective_inference_metadata(
-            enhanced_config,
-            prompt="ignored",
-            negative_prompt=None,
-            num_inference_steps=20,
-            true_cfg_scale=4.0,
-            guidance_scale=1.0,
-        )
-        self.assertTrue(enhanced["modes"]["enhanced_mask_prompt"])
-        self.assertEqual(enhanced["effective"]["prompt"], "")
-        self.assertEqual(enhanced["effective"]["text_true_cfg_scale"], 1.0)
-
 
 if __name__ == "__main__":
     unittest.main()

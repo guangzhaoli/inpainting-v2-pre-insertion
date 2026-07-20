@@ -10,10 +10,7 @@ import PIL.Image
 import torch
 
 from src.trainer.qwen_image_edit_plus_trainer import QwenImageEditPlusTrainer
-from src.utils.images import (
-    build_preinserted_composite,
-    extract_foreground_from_image_and_mask,
-)
+from src.utils.images import extract_foreground_from_image_and_mask
 from src.utils.hybrid_masking import (
     INSERT_ANYTHING_AUGMENTED_BOX,
     INSERT_ANYTHING_DILATED_SEGMENTATION,
@@ -66,18 +63,6 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
             return mask
         return mask.resize(image.size, PIL.Image.Resampling.NEAREST)
 
-    def _pre_insertion_cfg(self):
-        return self.config.model.pre_insertion
-
-    def _use_pre_insertion(self) -> bool:
-        return bool(self._pre_insertion_cfg().enabled)
-
-    def _layout_condition_cfg(self):
-        return self.config.model.layout_condition
-
-    def _use_layout_condition(self) -> bool:
-        return bool(self._layout_condition_cfg().enabled)
-
     def _mask_control_cfg(self):
         return getattr(self.config.model, "mask_control", None)
 
@@ -88,9 +73,9 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
         return bool(getattr(cfg, "enabled", False))
 
     def _should_attach_mask_control(self) -> bool:
-        """Attach mask_control for legacy enhanced-mask paths or explicit switch."""
+        """Attach the placement mask only when explicitly requested."""
 
-        return self._use_enhanced_mask_prompt() or self._use_explicit_mask_control()
+        return self._use_explicit_mask_control()
 
     def _reference_cfg_cfg(self):
         return self.config.model.reference_cfg
@@ -352,9 +337,6 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
         )
         return logs
 
-    def _use_enhanced_mask_prompt(self) -> bool:
-        return bool(self._query_prompt_cfg().enabled) or self._use_pre_insertion()
-
     def setup_validation(self, train_dataloader):
         if not self.config.logging.sampling.enable:
             self.validation_sampler = None
@@ -418,26 +400,6 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
             parent_batch.setdefault("vae_only_control_keys", []).append(control_key)
         return control_key
 
-    def _build_layout_condition(
-        self,
-        tar_image: torch.Tensor,
-        tar_mask: torch.Tensor,
-        ref_image: torch.Tensor,
-        ref_mask: torch.Tensor,
-        stage: str,
-    ) -> torch.Tensor:
-        layout_cfg = self._layout_condition_cfg()
-        return build_preinserted_composite(
-            target_image=tar_image,
-            target_mask=tar_mask,
-            ref_image=ref_image,
-            ref_mask=ref_mask,
-            training=(stage == "fit"),
-            scale_jitter_ratio=layout_cfg.train_scale_jitter_ratio,
-            offset_jitter_ratio=layout_cfg.train_offset_jitter_ratio,
-            paste_mode=layout_cfg.paste_mode,
-        )
-
     def prepare_embeddings(self, batch: Dict, stage="fit") -> Dict:
         """
         Convert Insert Anything mask_prompt data to the parent Qwen-Edit conditioning format.
@@ -473,28 +435,9 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 f"{tuple(source_hole_mask.shape)} vs {tuple(tar_mask.shape)}"
             )
 
-        if self._use_pre_insertion():
-            pre_insertion_cfg = self._pre_insertion_cfg()
-            control = build_preinserted_composite(
-                target_image=tar_image,
-                target_mask=tar_mask_cond,
-                ref_image=ref_image,
-                ref_mask=ref_mask,
-                training=(stage == "fit"),
-                scale_jitter_ratio=pre_insertion_cfg.train_scale_jitter_ratio,
-                offset_jitter_ratio=pre_insertion_cfg.train_offset_jitter_ratio,
-                paste_mode=pre_insertion_cfg.paste_mode,
-            )
-            if "source_hole_mask" in batch:
-                interaction_ring = (source_hole_mask - tar_mask_cond).clamp(0, 1)
-                control = control * (1 - interaction_ring.unsqueeze(1))
-        else:
-            control = tar_image * (1 - source_hole_mask.unsqueeze(1))
+        control = tar_image * (1 - source_hole_mask.unsqueeze(1))
 
-        use_enhanced_mask_prompt = self._use_enhanced_mask_prompt()
         use_reference_cfg = self._use_reference_cfg()
-        if use_reference_cfg and use_enhanced_mask_prompt:
-            raise ValueError("reference_cfg requires query_prompt.enabled=false and pre_insertion.enabled=false")
         if use_reference_cfg and "negative_prompt" in batch:
             raise ValueError("reference_cfg cannot be combined with negative_prompt text CFG")
 
@@ -502,11 +445,9 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
         force_empty_reference_prompt = self._force_empty_reference_prompt()
         prompt = (
             self._empty_prompts(batch["prompt"], batch_size)
-            if use_enhanced_mask_prompt or force_empty_reference_prompt
+            if force_empty_reference_prompt
             else batch["prompt"]
         )
-        # Explicit mask_control is independent of enhanced-mask prompt paths.
-        # Default off keeps historical behavior: mask_control only on query/pre_insertion.
         mask_control = (
             self._mask_to_control_image(source_hole_mask) if self._should_attach_mask_control() else None
         )
@@ -520,16 +461,6 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
         if not drop_reference:
             self._append_additional_control(parent_batch, ref_image, vae_only=False)
 
-        if self._use_layout_condition() and not drop_reference:
-            layout_control = self._build_layout_condition(
-                tar_image=tar_image,
-                tar_mask=tar_mask_cond,
-                ref_image=ref_image,
-                ref_mask=ref_mask,
-                stage=stage,
-            )
-            self._append_additional_control(parent_batch, layout_control, vae_only=True)
-
         if mask_control is not None:
             self._append_additional_control(parent_batch, mask_control, vae_only=True)
 
@@ -542,24 +473,16 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
             if key in batch:
                 parent_batch[key] = batch[key]
 
-        # enhanced-mask paths still force true_cfg_scale=1 (text CFG off).
-        # Explicit mask_control alone does NOT force scale to 1, so it can
-        # coexist with reference_cfg which reuses true_cfg_scale as its scale.
-        if "true_cfg_scale" in batch:
-            parent_batch["true_cfg_scale"] = 1.0 if use_enhanced_mask_prompt else batch["true_cfg_scale"]
-        elif use_enhanced_mask_prompt:
-            parent_batch["true_cfg_scale"] = 1.0
-        else:
-            parent_batch["true_cfg_scale"] = 1.0
+        parent_batch["true_cfg_scale"] = batch.get("true_cfg_scale", 1.0)
 
-        if "negative_prompt" in batch and not use_enhanced_mask_prompt:
+        if "negative_prompt" in batch:
             parent_batch["negative_prompt"] = batch["negative_prompt"]
 
         reference_cfg_parent_batch = None
         reference_cfg_scale = float(batch.get("true_cfg_scale", 1.0))
         if stage == "predict" and use_reference_cfg and reference_cfg_scale > 1.0:
-            # Null-reference branch keeps source/context (+ optional placement mask),
-            # but drops reference image and layout proposal.
+            # Null-reference branch keeps source/context (+ optional placement mask)
+            # while dropping the reference image.
             reference_cfg_parent_batch = {
                 "control": control,
                 "prompt": prompt,
@@ -597,8 +520,8 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
         for key in ("height", "width", "num_inference_steps", "guidance"):
             if key in batch:
                 parent_batch[key] = batch[key]
-        parent_batch["true_cfg_scale"] = (
-            1.0 if use_enhanced_mask_prompt else batch.get("true_cfg_scale", parent_batch["true_cfg_scale"])
+        parent_batch["true_cfg_scale"] = batch.get(
+            "true_cfg_scale", parent_batch["true_cfg_scale"]
         )
 
         if anchor_fields_present:
@@ -705,17 +628,14 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 "ref_mask is required for mask_prompt prediction. Provide it as an image input, ref_mask, or RGBA alpha."
             )
 
-        use_enhanced_mask_prompt = self._use_enhanced_mask_prompt()
         use_reference_cfg = self._use_reference_cfg()
-        if use_reference_cfg and use_enhanced_mask_prompt:
-            raise ValueError("reference_cfg requires query_prompt.enabled=false and pre_insertion.enabled=false")
         if use_reference_cfg and negative_prompt is not None:
             raise ValueError("reference_cfg cannot be combined with negative_prompt text CFG")
 
         force_empty_reference_prompt = self._force_empty_reference_prompt()
         if prompt is None:
-            if not use_enhanced_mask_prompt and not force_empty_reference_prompt:
-                raise ValueError("prompt is required when query_prompt and pre_insertion are both disabled")
+            if not force_empty_reference_prompt:
+                raise ValueError("prompt is required unless reference_cfg.force_empty_prompt is enabled")
             prompt = ""
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -794,10 +714,10 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
             "ref_mask": ref_mask_tensor,
             "tar_image": src_tensor,
             "tar_mask": src_mask_tensor,
-            "prompt": [""] if use_enhanced_mask_prompt or force_empty_reference_prompt else prompt,
+            "prompt": [""] if force_empty_reference_prompt else prompt,
             "category": ["predict"],
             "num_inference_steps": num_inference_steps,
-            "true_cfg_scale": 1.0 if use_enhanced_mask_prompt else true_cfg_scale,
+            "true_cfg_scale": true_cfg_scale,
             "guidance": guidance_scale,
         }
 
@@ -813,7 +733,7 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 }
             )
 
-        if negative_prompt is not None and not use_enhanced_mask_prompt:
+        if negative_prompt is not None:
             data["negative_prompt"] = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
 
         if height is None or width is None:

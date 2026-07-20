@@ -102,22 +102,21 @@ class ValidationSamplingTest(unittest.TestCase):
                     SamplingConfig(seed=seed)
 
     def test_sampler_rejects_negative_prompt_for_prompt_free_modes_at_setup(self):
-        for mode in ("reference_cfg", "query_prompt"):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmpdir:
-                sampling = SamplingConfig(
-                    enable=True,
-                    validation_steps=1,
-                    num_samples=1,
-                    negative_prompt="must fail early",
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sampling = SamplingConfig(
+                enable=True,
+                validation_steps=1,
+                num_samples=1,
+                negative_prompt="must fail early",
+            )
+            config = make_config(tmpdir, sampling)
+            config.model.reference_cfg.enabled = True
+            with self.assertRaisesRegex(ValueError, "negative_prompt"):
+                InsertAnythingValidationSampler(
+                    config,
+                    SimpleNamespace(dataset=FakeDataset()),
+                    FakeAccelerator(),
                 )
-                config = make_config(tmpdir, sampling)
-                getattr(config.model, mode).enabled = True
-                with self.assertRaisesRegex(ValueError, "negative_prompt"):
-                    InsertAnythingValidationSampler(
-                        config,
-                        SimpleNamespace(dataset=FakeDataset()),
-                        FakeAccelerator(),
-                    )
 
     def test_manifest_source_reads_image_and_mask_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:

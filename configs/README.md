@@ -16,7 +16,6 @@ configs/
     general_object.yaml
     human.yaml
   exp/
-    query_tar_mask.yaml
     accessory/
       r256.yaml
       fg5.yaml
@@ -24,8 +23,6 @@ configs/
       adaptive_crop_r256_fg3.yaml
       hybrid_masking.yaml
       hybrid_masking_r256_fg3.yaml
-      layout.yaml
-      pre_insertion.yaml
   legacy/
     native.yaml
   README.md
@@ -51,7 +48,7 @@ configs/
 Shared baseline for both:
 
 - `reference_cfg: true`
-- other ideas off: `pre_insertion` / `layout_condition` / `mask_control` / `query_prompt`
+- other optional controls off: `mask_control`
 - data: accessory + jewel_filter
 - `batch_size: 1`
 
@@ -74,9 +71,7 @@ Shared baseline for both:
 | `exp/accessory/fg5.yaml` | fg:bg = 5:1 |
 | `exp/accessory/adaptive_crop.yaml` | Adaptive Crop, r128, 2:1 |
 | `exp/accessory/hybrid_masking.yaml` | Hybrid Masking, r128, 2:1 |
-| `exp/accessory/layout.yaml` | layout_condition on |
 | `exp/accessory/mask_control.yaml` | independent mask_control on (+ reference_cfg), r256, fg:bg=3:1 |
-| `exp/accessory/pre_insertion.yaml` | pre_insertion on, reference_cfg off |
 
 ## Scale / default / legacy
 
@@ -85,7 +80,6 @@ Shared baseline for both:
 | `default.yaml` | Default train/infer entry |
 | `scale/4.yaml` ... `scale/32.yaml` | Auto-selected by `run.sh` when no config arg is given |
 | `legacy/native.yaml` | Older native-style baseline |
-| `exp/query_tar_mask.yaml` | query_prompt / tar-mask experiment |
 
 ## Rename map (old → new)
 
@@ -97,7 +91,6 @@ Shared baseline for both:
 | `insert_anything_8.yaml` | `scale/8.yaml` |
 | `insert_anything_16.yaml` | `scale/16.yaml` |
 | `insert_anything_32.yaml` | `scale/32.yaml` |
-| `insert_anything_4_query_tar_mask.yaml` | `exp/query_tar_mask.yaml` |
 | `insert_anything_teacher_all_data.yaml` | `teacher/all.yaml` |
 | `insert_anything_teacher_accessory_jewelry.yaml` | `teacher/accessory_jewelry.yaml` |
 | `insert_anything_teacher_animal.yaml` | `teacher/animal.yaml` |
@@ -110,8 +103,6 @@ Shared baseline for both:
 | `insert_anything_teacher_accessory_jewelry_adaptive_crop_r256_fg3.yaml` | `exp/accessory/adaptive_crop_r256_fg3.yaml` |
 | `insert_anything_teacher_accessory_jewelry_hybrid_masking.yaml` | `exp/accessory/hybrid_masking.yaml` |
 | `insert_anything_teacher_accessory_jewelry_hybrid_masking_r256_fg3.yaml` | `exp/accessory/hybrid_masking_r256_fg3.yaml` |
-| `insert_anything_teacher_accessory_jewel_layout_condition.yaml` | `exp/accessory/layout.yaml` |
-| `insert_anything_teacher_accessory_jewelry_copy_paste_pre_insertion.yaml` | `exp/accessory/pre_insertion.yaml` |
 
 ## Launch examples
 

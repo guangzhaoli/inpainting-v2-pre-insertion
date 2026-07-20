@@ -8,6 +8,10 @@ import yaml
 from src.utils.latent_anchoring import ensure_latent_anchoring_config
 
 
+class UnsupportedSplitConditioningCheckpointError(ValueError):
+    """Raised when a checkpoint needs conditioning code absent from this worktree."""
+
+
 def _dump_model(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         return value.model_dump(mode="json")
@@ -42,23 +46,14 @@ def validate_inference_mode_inputs(
     prompt: Optional[str],
     negative_prompt: Optional[str],
 ) -> None:
-    query_prompt_enabled = bool(config.model.query_prompt.enabled)
-    pre_insertion_enabled = bool(config.model.pre_insertion.enabled)
-    enhanced_mask_prompt = query_prompt_enabled or pre_insertion_enabled
     reference_cfg_enabled = bool(config.model.reference_cfg.enabled)
     reference_cfg_force_empty_prompt = (
         reference_cfg_enabled and bool(config.model.reference_cfg.force_empty_prompt)
     )
 
-    if reference_cfg_enabled and enhanced_mask_prompt:
-        raise ValueError(
-            "reference_cfg requires query_prompt.enabled=false and pre_insertion.enabled=false"
-        )
     if reference_cfg_enabled and negative_prompt is not None:
         raise ValueError("reference_cfg cannot be combined with negative_prompt")
-    if enhanced_mask_prompt and negative_prompt is not None:
-        raise ValueError("query_prompt/pre_insertion inference cannot use negative_prompt")
-    if prompt is None and not enhanced_mask_prompt and not reference_cfg_force_empty_prompt:
+    if prompt is None and not reference_cfg_force_empty_prompt:
         raise ValueError("prompt is required when no prompt-free conditioning mode is enabled")
     # mask_control is independent and may be combined with reference_cfg; no extra input rules.
 
@@ -103,24 +98,17 @@ def build_effective_inference_metadata(
     effective_height: Optional[int] = None,
     effective_width: Optional[int] = None,
 ) -> dict:
-    query_prompt_enabled = bool(config.model.query_prompt.enabled)
-    pre_insertion_enabled = bool(config.model.pre_insertion.enabled)
     mask_control_enabled = bool(getattr(config.model, "mask_control", None) and config.model.mask_control.enabled)
-    enhanced_mask_prompt = query_prompt_enabled or pre_insertion_enabled
-    # Explicit mask_control is attached independently; enhanced paths still attach it too.
-    mask_control_active = enhanced_mask_prompt or mask_control_enabled
+    mask_control_active = mask_control_enabled
     reference_cfg_enabled = bool(config.model.reference_cfg.enabled)
     reference_cfg_force_empty_prompt = (
         reference_cfg_enabled and bool(config.model.reference_cfg.force_empty_prompt)
     )
 
-    effective_prompt = "" if enhanced_mask_prompt or reference_cfg_force_empty_prompt else prompt
-    effective_negative_prompt = (
-        None if enhanced_mask_prompt or reference_cfg_enabled else negative_prompt
-    )
+    effective_prompt = "" if reference_cfg_force_empty_prompt else prompt
+    effective_negative_prompt = None if reference_cfg_enabled else negative_prompt
     text_true_cfg_active = (
-        not enhanced_mask_prompt
-        and not reference_cfg_enabled
+        not reference_cfg_enabled
         and effective_negative_prompt is not None
         and float(true_cfg_scale) > 1.0
     )
@@ -158,11 +146,8 @@ def build_effective_inference_metadata(
             "width": effective_width,
         },
         "modes": {
-            "query_prompt_enabled": query_prompt_enabled,
-            "pre_insertion_enabled": pre_insertion_enabled,
             "mask_control_enabled": mask_control_enabled,
             "mask_control_active": mask_control_active,
-            "enhanced_mask_prompt": enhanced_mask_prompt,
             "reference_cfg_enabled": reference_cfg_enabled,
             "reference_cfg_force_empty_prompt": reference_cfg_force_empty_prompt,
             "text_true_cfg_active": text_true_cfg_active,
@@ -183,9 +168,6 @@ def build_inference_config_metadata(config, config_path: Optional[Path] = None) 
         "adaptive_crop": _dump_model(config.data.init_args.adaptive_crop),
         "latent_anchoring": _dump_model(ensure_latent_anchoring_config(config)),
         "model_modes": {
-            "query_prompt": _dump_model(config.model.query_prompt),
-            "pre_insertion": _dump_model(config.model.pre_insertion),
-            "layout_condition": _dump_model(config.model.layout_condition),
             "mask_control": _dump_model(getattr(config.model, "mask_control", {"enabled": False})),
             "reference_cfg": _dump_model(config.model.reference_cfg),
         },
@@ -217,9 +199,6 @@ def _checkpoint_contract(config, adaptive_enabled_field: str) -> dict:
                 "target_modules": _normalized_target_modules(config.model.lora.target_modules),
                 "adapter_name": str(config.model.lora.adapter_name),
             },
-            "query_prompt": config.model.query_prompt.model_dump(mode="json"),
-            "pre_insertion": config.model.pre_insertion.model_dump(mode="json"),
-            "layout_condition": config.model.layout_condition.model_dump(mode="json"),
             "mask_control": (
                 config.model.mask_control.model_dump(mode="json")
                 if getattr(config.model, "mask_control", None) is not None
@@ -287,6 +266,20 @@ def _load_checkpoint_train_config(train_config_path: Path):
     }
     model_config = filtered_config.get("model")
     if isinstance(model_config, dict):
+        retired_modes = {
+            "query_prompt": "inpainting-v2-query-prompt",
+            "pre_insertion": "inpainting-v2-layout-condition",
+            "layout_condition": "inpainting-v2-layout-condition",
+        }
+        for field_name, worktree_name in retired_modes.items():
+            retired_config = model_config.pop(field_name, None)
+            if (
+                isinstance(retired_config, dict)
+                and retired_config.get("enabled", False) not in (False, 0, None)
+            ):
+                raise UnsupportedSplitConditioningCheckpointError(
+                    f"checkpoint requires retired model.{field_name}; use the {worktree_name} worktree"
+                )
         lora_config = model_config.get("lora")
         if isinstance(lora_config, dict):
             lora_config["pretrained_weight"] = None
@@ -332,6 +325,10 @@ def validate_checkpoint_compatibility(
         checkpoint_contract = _checkpoint_contract(checkpoint_config, "train_enabled")
         inference_contract = _checkpoint_contract(config, "predict_enabled")
         mismatches = _flatten_contract_mismatches(checkpoint_contract, inference_contract)
+    except UnsupportedSplitConditioningCheckpointError as error:
+        raise ValueError(
+            f"Failed to validate checkpoint train config {train_config_path}: {error}"
+        ) from error
     except Exception as error:
         if not allow_mismatch:
             raise ValueError(

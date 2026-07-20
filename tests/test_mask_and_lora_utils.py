@@ -10,7 +10,7 @@ from safetensors.torch import save_file
 
 from src.loss.edit_mask_loss import map_mask_to_latent
 from src.trainer.base_trainer import BaseTrainer
-from src.utils.images import build_preinserted_composite, resize_mask_bhw
+from src.utils.images import resize_mask_bhw
 from src.utils.lora_utils import classify_lora_weight, filter_lora_state_keys, is_lora_state_key
 
 
@@ -36,14 +36,6 @@ class MaskUtilsTest(unittest.TestCase):
         resized = resize_mask_bhw(mask, 4, 4)
 
         self.assertEqual(sorted(set(resized.flatten().tolist())), [0.0, 1.0])
-
-    def test_preinserted_composite_rejects_unknown_paste_mode(self):
-        image = torch.zeros(1, 3, 4, 4)
-        mask = torch.zeros(1, 4, 4)
-
-        with self.assertRaises(ValueError):
-            build_preinserted_composite(image, mask, image, mask, paste_mode="unknown")
-
 
 class LoraUtilsTest(unittest.TestCase):
     def test_lora_key_filter_handles_prefix_and_nested_keys(self):

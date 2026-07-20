@@ -1024,7 +1024,7 @@ class BaseTrainer(ABC):
         trainable_named_params = [(name, param) for name, param in self.dit.named_parameters() if param.requires_grad]
         lora_layers = [param for _, param in trainable_named_params]
         if len(lora_layers) == 0:
-            raise ValueError("No trainable parameters found. Check LoRA/query_prompt configuration before training.")
+            raise ValueError("No trainable parameters found. Check the LoRA configuration before training.")
 
         # Log how many parameters are in training and show one example
         if (getattr(self, "accelerator", None) is None) or self.accelerator.is_main_process:
@@ -1104,11 +1104,7 @@ class BaseTrainer(ABC):
             if os.path.exists(path):
                 return path
 
-        model_files = [
-            path
-            for path in sorted(glob.glob(os.path.join(resume_dir, "*.safetensors")))
-            if os.path.basename(path) != "query_prompt.safetensors"
-        ]
+        model_files = sorted(glob.glob(os.path.join(resume_dir, "*.safetensors")))
         if len(model_files) == 1:
             return model_files[0]
         if len(model_files) > 1:
