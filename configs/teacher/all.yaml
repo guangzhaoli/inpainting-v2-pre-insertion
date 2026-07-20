@@ -38,7 +38,7 @@ data:
     class_path: "src.data.insert_anything_dataset.InsertAnythingDataset"
     init_args:
         dataset_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/a2edit/data"
-        manifest_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2-pre-insertion/manifests/insert_anything_teacher_all_data.csv"
+        manifest_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2/manifests/insert_anything_teacher_all_data.csv"
         categories:
             - "BottomRef_BodyMask"
             - "TopRef_BodyMask"

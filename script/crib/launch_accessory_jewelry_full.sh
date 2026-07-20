@@ -2,7 +2,7 @@
 # Launch accessory/jewelry full CRIB on 8 GPUs (for zmx).
 set -euo pipefail
 
-cd /inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2-pre-insertion
+cd /inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2
 
 # shellcheck disable=SC1091
 source "$(conda info --base)/etc/profile.d/conda.sh"

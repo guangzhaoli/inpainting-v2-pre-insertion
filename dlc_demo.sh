@@ -31,7 +31,7 @@ curl --location --request POST 'https://qz.sii.edu.cn/openapi/v1/train_job/creat
     "project_id": "project-44e6816d-6abd-48b2-9e0b-942379839755",
     "auto_fault_tolerance": false,
     "framework": "pytorch",
-    "command": "source /inspire/hdd/global_user/250041225002/miniconda3/bin/activate && conda activate qwen-inpainting-pre-insertion && cd /inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2-pre-insertion && TOTAL_PROCESSES=8 NPROC_PER_NODE=8 NUM_MACHINES=1 MACHINE_RANK=0 RESUME=/inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2-pre-insertion/logs/inpainting_v2_teacher_logs/teacher_all_data_native_qwen_image_inpainting/v0/checkpoint-0-12000 bash run.sh configs/teacher/all.yaml",
+    "command": "source /inspire/hdd/global_user/250041225002/miniconda3/bin/activate && conda activate qwen-inpainting-pre-insertion && cd /inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2 && TOTAL_PROCESSES=8 NPROC_PER_NODE=8 NUM_MACHINES=1 MACHINE_RANK=0 RESUME=/inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2/logs/inpainting_v2_teacher_logs/teacher_all_data_native_qwen_image_inpainting/v0/checkpoint-0-12000 bash run.sh configs/teacher/all.yaml",
     "task_priority": 6,
     "workspace_id": "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6",
     "framework_config": [{

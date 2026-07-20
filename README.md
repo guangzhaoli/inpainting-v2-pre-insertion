@@ -1,6 +1,6 @@
 # Qwen Insert Anything Inpainting
 
-This directory is the `main` baseline worktree (the legacy folder name is kept so existing linked worktrees remain valid). It keeps one maintained training and inference path:
+This directory is the `main` baseline worktree at `inpainting-v2`. It keeps one maintained training and inference path:
 
 - `QwenImageEditInsertAnythingTrainer`
 - `InsertAnythingDataset`

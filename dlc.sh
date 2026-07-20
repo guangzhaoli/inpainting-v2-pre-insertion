@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Submit a DLC PyTorchJob for the inpainting-v2-pre-insertion project.
+# Submit a DLC PyTorchJob for the inpainting-v2 project.
 #
 # The remote job runs this repo's run_multi_node_dlc.sh, which auto-selects
 # configs/scale/${WORKERS * WORKER_GPU}.yaml plus the matching
