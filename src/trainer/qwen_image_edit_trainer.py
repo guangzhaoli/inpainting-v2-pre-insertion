@@ -97,12 +97,36 @@ class QwenImageEditTrainer(BaseTrainer):
             raise RuntimeError(f"{module_name} spans multiple devices: {formatted_devices}")
         return next(iter(devices))
 
+    @staticmethod
+    def _module_floating_dtype(module: torch.nn.Module, module_name: str) -> torch.dtype:
+        dtypes = {
+            tensor.dtype
+            for tensor in (*module.parameters(), *module.buffers())
+            if tensor.is_floating_point() or tensor.is_complex()
+        }
+        if len(dtypes) == 0:
+            raise ValueError(
+                f"{module_name} has no floating-point parameters or buffers; "
+                "its input dtype cannot be determined"
+            )
+        if len(dtypes) != 1:
+            formatted_dtypes = ", ".join(sorted(str(dtype) for dtype in dtypes))
+            raise RuntimeError(f"{module_name} spans multiple floating dtypes: {formatted_dtypes}")
+        return next(iter(dtypes))
+
     def _vae_decode_device(self) -> torch.device:
         if self.vae is None:
             raise ValueError("VAE must be loaded before determining its decode device")
         if not hasattr(self.vae, "post_quant_conv"):
             raise ValueError("Loaded VAE has no post_quant_conv module")
         return self._module_device(self.vae.post_quant_conv, "vae.post_quant_conv")
+
+    def _vae_decode_dtype(self) -> torch.dtype:
+        if self.vae is None:
+            raise ValueError("VAE must be loaded before determining its decode dtype")
+        if not hasattr(self.vae, "post_quant_conv"):
+            raise ValueError("Loaded VAE has no post_quant_conv module")
+        return self._module_floating_dtype(self.vae.post_quant_conv, "vae.post_quant_conv")
 
     @contextmanager
     def _loaded_model_decode_context(self):
@@ -236,6 +260,41 @@ class QwenImageEditTrainer(BaseTrainer):
             expected_seq_len=image_seq_len,
         )
         return (reference_cfg_mask > 0).to(device=device, dtype=self.weight_dtype).unsqueeze(-1)
+
+    @staticmethod
+    def _validate_mask_geometry_image_grid(
+        mask_geometry: torch.Tensor,
+        *,
+        name: str,
+        batch_size: int,
+        height_image: int,
+        width_image: int,
+    ) -> None:
+        """Require geometry to use the generated target's pixel coordinate system."""
+
+        if not isinstance(mask_geometry, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        expected_shape = (batch_size, 3, int(height_image), int(width_image))
+        if tuple(mask_geometry.shape) != expected_shape:
+            raise ValueError(
+                f"{name} must match target image grid {expected_shape}, "
+                f"got {tuple(mask_geometry.shape)}"
+            )
+
+    @staticmethod
+    def _mask_geometries_equal(
+        positive: torch.Tensor,
+        reference_null: torch.Tensor,
+    ) -> bool:
+        """Compare CFG geometry exactly, avoiding a copy on the normal aliased path."""
+
+        if positive is reference_null:
+            return True
+        if positive.shape != reference_null.shape:
+            return False
+        if reference_null.device != positive.device:
+            reference_null = reference_null.to(positive.device)
+        return torch.equal(positive, reference_null)
 
     def _prepare_latent_anchoring_weight(
         self,
@@ -619,17 +678,33 @@ class QwenImageEditTrainer(BaseTrainer):
             self.vae.to(self.accelerator.device)
             self.text_encoder.to(self.accelerator.device)
             # self.dit.to(self.accelerator.device)
-            self.vae.decoder.to("cpu")
+            # Region-perceptual loss decodes pred_x0 through the VAE and backprops
+            # through the decoder into DiT. Keeping decoder on CPU and only moving it
+            # for the forward (then restoring) breaks autograd. When region loss is on,
+            # leave the decoder on the training device for the whole fit stage.
+            if getattr(self.config.loss, "region_perceptual", False):
+                self.vae.decoder.to(self.accelerator.device)
+                logging.info(
+                    "region_perceptual enabled: keeping vae.decoder on %s for training decode+backward",
+                    self.accelerator.device,
+                )
+            else:
+                self.vae.decoder.to("cpu")
 
             self.vae.requires_grad_(False).eval()
             self.text_encoder.requires_grad_(False).eval()
             self.dit.requires_grad_(False)
             self.dit.train()
-            for name, param in self.dit.named_parameters():
-                if "lora" in name:
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
+            # OPD mounts frozen Teacher LoRAs on this same backbone. Activate
+            # and train only the exact Student adapter instead of every
+            # parameter whose name happens to contain "lora".
+            from src.distillation.backends import set_active_adapter
+
+            set_active_adapter(
+                self._unwrap_dit(),
+                self.adapter_name,
+                trainable_adapter=self.adapter_name,
+            )
 
         elif stage == "predict":
             # Predict mode: allocate to different GPUs according to configuration
@@ -755,9 +830,12 @@ class QwenImageEditTrainer(BaseTrainer):
         if self.config.loss.mask_loss and "mask" in batch:
             mask = batch["mask"]
             height_image, width_image = batch["height"], batch["width"]
-            batch["mask"] = resize_mask_bhw(mask, height_image, width_image)
+            pixel_mask = resize_mask_bhw(mask, height_image, width_image)
+            # Keep pixel-space mask for region-perceptual terms before packing to latent.
+            if getattr(self.config.loss, "region_perceptual", False):
+                batch["pixel_mask"] = pixel_mask
             batch["mask"] = map_mask_to_latent(
-                batch["mask"],
+                pixel_mask,
                 vae_scale_factor=self.vae_scale_factor,
                 expected_seq_len=batch["image_latents"].shape[1],
             )
@@ -828,6 +906,9 @@ class QwenImageEditTrainer(BaseTrainer):
         control_latents = self._move_tensor(embeddings["control_latents"], device=device, dtype=self.weight_dtype)
         prompt_embeds = self._move_tensor(embeddings["prompt_embeds"], device=device, dtype=self.weight_dtype)
         prompt_embeds_mask = self._move_tensor(embeddings["prompt_embeds_mask"], device=device, dtype=torch.int64)
+        mask_geometry = embeddings.get("mask_geometry")
+        if mask_geometry is not None:
+            mask_geometry = self._move_tensor(mask_geometry, device=device, dtype=self.weight_dtype)
         img_shapes = embeddings["img_shapes"]
         batch_size = image_latents.shape[0]
         if "mask" in embeddings:
@@ -864,14 +945,161 @@ class QwenImageEditTrainer(BaseTrainer):
             encoder_hidden_states=prompt_embeds,
             img_shapes=img_shapes,
             txt_seq_lens=txt_seq_lens,
+            mask_geometry=mask_geometry,
             return_dict=False,
         )[0]
         model_pred = model_pred[:, : image_latents.size(1)]
         weighting = compute_loss_weighting_for_sd3(weighting_scheme="none", sigmas=sigmas)
         target = noise - image_latents
         # pred shape [2, 4104, 64], target shape [2, 4104, 64]
-        loss = self.forward_loss(model_pred, target, weighting, edit_mask)
-        return loss
+        latent_mse = self.forward_loss(model_pred, target, weighting, edit_mask)
+
+        use_region = (
+            getattr(self.config.loss, "region_perceptual", False)
+            and getattr(self, "region_perceptual_criterion", None) is not None
+        )
+        if not use_region:
+            # Only total loss is used for progress bar; no region TB metrics.
+            self._step_loss_metrics = {
+                "train/latent_mse": latent_mse.detach().float().reshape(()),
+            }
+            return latent_mse
+
+        height = int(embeddings["height"])
+        width = int(embeddings["width"])
+        if "pixel_mask" not in embeddings:
+            raise ValueError(
+                "region_perceptual requires embeddings['pixel_mask']; "
+                "enable loss.mask_loss and ensure tar_mask is present"
+            )
+
+        # Validate key-only contracts before the timestep gate so malformed
+        # region-loss batches fail deterministically instead of only when a
+        # later low-noise sample happens to activate the pixel-space path.
+        ref_dino_weight = float(getattr(self.config.loss, "ref_dino_weight", 0.0))
+        if ref_dino_weight > 0.0 and (
+            "ref_image_for_loss" not in embeddings or "ref_mask_for_loss" not in embeddings
+        ):
+            raise ValueError(
+                "ref_dino_weight > 0 requires embeddings['ref_image_for_loss'] and "
+                "embeddings['ref_mask_for_loss'] (InsertAnything prepare_embeddings "
+                "attaches these when region_perceptual=true)"
+            )
+
+        # Compute w(t) before building the full-resolution VAE decoder graph.  The
+        # max-sigma gate produces exact zeros, so an entirely gated local batch has
+        # no region-loss contribution and can safely skip all pixel-space work.
+        # Mixed batches deliberately continue through the unchanged criterion path.
+        from src.loss.region_perceptual_loss import region_timestep_weights
+
+        sample_weights = region_timestep_weights(
+            sigmas,
+            power=float(self.config.loss.region_sigma_power),
+            max_sigma=float(self.config.loss.region_max_sigma),
+        ).to(device=device)
+        latent_w = float(self.config.loss.latent_mse_weight)
+        if torch.count_nonzero(sample_weights).item() == 0:
+            zero_metric = latent_mse.detach().float().new_zeros(())
+            total = latent_w * latent_mse
+            self._step_loss_metrics = {
+                "train/latent_mse": latent_mse.detach().float().reshape(()),
+                "train/latent_mse_weighted": total.detach().float().reshape(()),
+                "train/region_total": zero_metric,
+                "train/region_fg_lpips": zero_metric.clone(),
+                "train/region_bg_l1": zero_metric.clone(),
+                "train/region_ref_dino": zero_metric.clone(),
+                "train/region_w_t_mean": sample_weights.detach().float().mean().reshape(()),
+                "train/region_w_t_max": sample_weights.detach().float().max().reshape(()),
+                "train/sigma_mean": sigmas.detach().float().reshape(sigmas.shape[0], -1)[:, 0].mean().reshape(()),
+            }
+            return total
+
+        # Flow-matching clean estimate: x0 = x_t - sigma * v_pred, with v_pred ~ noise - x0.
+        pred_x0 = noisy_model_input - sigmas * model_pred
+        pixel_mask = self._move_tensor(embeddings["pixel_mask"], device=device, dtype=torch.float32)
+
+        # Only decode the prediction. GT uses the original pixel tar_image when available
+        # (cheaper and free of VAE reconstruction error). Fallback: decode image_latents.
+        with self._loaded_model_decode_context():
+            pred_images = self.decode_vae_latent_for_loss(pred_x0, height, width)
+
+        # Keep pred_images in the autograd graph (no detach).
+        pred_images = pred_images.to(device=device)
+        if pred_images.shape[-2:] != (height, width):
+            raise ValueError(
+                f"decoded pred spatial size {tuple(pred_images.shape[-2:])} must match "
+                f"embeddings height/width {(height, width)}"
+            )
+        if pixel_mask.shape[-2:] != (height, width):
+            raise ValueError(
+                f"pixel_mask spatial size {tuple(pixel_mask.shape[-2:])} must match "
+                f"embeddings height/width {(height, width)}"
+            )
+
+        if "target_image_for_loss" in embeddings:
+            target_images = self._move_tensor(
+                embeddings["target_image_for_loss"], device=device, dtype=torch.float32
+            )
+            target_range = "0-1"
+            # Align geometry if dataset resolution differs slightly from VAE decode size.
+            if target_images.shape[-2:] != (height, width):
+                target_images = F.interpolate(
+                    target_images,
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+        else:
+            with self._loaded_model_decode_context():
+                with torch.no_grad():
+                    target_images = self.decode_vae_latent_for_loss(image_latents, height, width)
+            target_images = target_images.to(device=device)
+            target_range = "-1-1"
+
+        ref_images = None
+        ref_mask = None
+        if ref_dino_weight > 0.0:
+            ref_images = self._move_tensor(
+                embeddings["ref_image_for_loss"], device=device, dtype=torch.float32
+            )
+            ref_mask = self._move_tensor(
+                embeddings["ref_mask_for_loss"], device=device, dtype=torch.float32
+            )
+
+        # Explicit value-range contracts:
+        # - VAE decode pred path returns [-1,1]
+        # - InsertAnything tar/ref images are [0,1]
+        region_out = self.region_perceptual_criterion(
+            pred_images,
+            target_images,
+            pixel_mask,
+            fg_weight=float(self.config.loss.fg_lpips_weight),
+            bg_weight=float(self.config.loss.bg_l1_weight),
+            ref_dino_weight=ref_dino_weight,
+            ref_images=ref_images,
+            ref_mask=ref_mask,
+            pred_range="-1-1",
+            target_range=target_range,
+            ref_range="0-1",
+            sample_weights=sample_weights,
+        )
+        region_total = region_out["total"]
+        total = latent_w * latent_mse + region_total
+
+        # TensorBoard metrics only (no text spam). Progress bar still shows total loss only.
+        # fg_lpips / bg_l1 / ref_dino already include w(t) from sample_weights.
+        self._step_loss_metrics = {
+            "train/latent_mse": latent_mse.detach().float().reshape(()),
+            "train/latent_mse_weighted": (latent_w * latent_mse).detach().float().reshape(()),
+            "train/region_total": region_total.detach().float().reshape(()),
+            "train/region_fg_lpips": region_out["fg_lpips"].detach().float().reshape(()),
+            "train/region_bg_l1": region_out["bg_l1"].detach().float().reshape(()),
+            "train/region_ref_dino": region_out["ref_dino"].detach().float().reshape(()),
+            "train/region_w_t_mean": sample_weights.detach().float().mean().reshape(()),
+            "train/region_w_t_max": sample_weights.detach().float().max().reshape(()),
+            "train/sigma_mean": sigmas.detach().float().reshape(sigmas.shape[0], -1)[:, 0].mean().reshape(()),
+        }
+        return total
 
     def _get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
         """Calculate sigma values for noise scheduler"""
@@ -1153,6 +1381,7 @@ class QwenImageEditTrainer(BaseTrainer):
         control_latents = embeddings["control_latents"]
         prompt_embeds = embeddings["prompt_embeds"]
         prompt_embeds_mask = embeddings["prompt_embeds_mask"]
+        mask_geometry = embeddings.get("mask_geometry")
         batch_size = embeddings["control_latents"].shape[0]
         img_shapes = self._get_image_shapes(embeddings, batch_size)
         height_image = embeddings["height"]
@@ -1207,6 +1436,17 @@ class QwenImageEditTrainer(BaseTrainer):
         device = self._dit_device()
         dit_config = self._dit_config()
 
+        control_latents = control_latents.to(device=device, dtype=self.weight_dtype)
+        if mask_geometry is not None:
+            self._validate_mask_geometry_image_grid(
+                mask_geometry,
+                name="positive mask_geometry",
+                batch_size=batch_size,
+                height_image=height_image,
+                width_image=width_image,
+            )
+            mask_geometry = mask_geometry.to(device=device, dtype=self.weight_dtype)
+
         if do_true_cfg:
             # 清理显存以确保有足够空间进行 CFG
             torch.cuda.empty_cache()
@@ -1227,10 +1467,54 @@ class QwenImageEditTrainer(BaseTrainer):
             reference_cfg_prompt_embeds_mask = reference_cfg_embeddings["prompt_embeds_mask"].to(
                 device, dtype=torch.int64
             )
+            raw_reference_cfg_mask_geometry = reference_cfg_embeddings.get("mask_geometry")
+            if (mask_geometry is None) != (raw_reference_cfg_mask_geometry is None):
+                raise ValueError(
+                    "reference_cfg positive and null-reference branches must use the same mask geometry contract"
+                )
+            reference_height = int(reference_cfg_embeddings["height"])
+            reference_width = int(reference_cfg_embeddings["width"])
+            if (reference_height, reference_width) != (int(height_image), int(width_image)):
+                raise ValueError(
+                    "reference_cfg positive and null-reference target image grids must match, "
+                    f"got {(height_image, width_image)} and {(reference_height, reference_width)}"
+                )
+            if raw_reference_cfg_mask_geometry is not None:
+                self._validate_mask_geometry_image_grid(
+                    raw_reference_cfg_mask_geometry,
+                    name="reference_cfg null mask_geometry",
+                    batch_size=batch_size,
+                    height_image=reference_height,
+                    width_image=reference_width,
+                )
+                if not self._mask_geometries_equal(
+                    embeddings["mask_geometry"],
+                    raw_reference_cfg_mask_geometry,
+                ):
+                    raise ValueError(
+                        "reference_cfg positive and null-reference mask geometry must be identical"
+                    )
             if reference_cfg_control_latents.shape[0] != batch_size:
                 raise ValueError("reference_cfg batch size must match the positive branch batch size")
             reference_cfg_img_shapes = self._get_image_shapes(reference_cfg_embeddings, batch_size)
+            if reference_cfg_img_shapes[0][0] != img_shapes[0][0]:
+                raise ValueError(
+                    "reference_cfg positive and null-reference target token grids must match, "
+                    f"got {img_shapes[0][0]} and {reference_cfg_img_shapes[0][0]}"
+                )
             reference_cfg_txt_seq_lens = reference_cfg_prompt_embeds_mask.sum(dim=1).tolist()
+
+        mask_geometry_tokens = None
+        if mask_geometry is not None:
+            with torch.inference_mode():
+                mask_geometry_tokens = self._unwrap_dit().prepare_mask_geometry_tokens(
+                    mask_geometry,
+                    img_shapes,
+                )
+            if do_reference_cfg:
+                reference_cfg_mask_geometry_tokens = mask_geometry_tokens
+        elif do_reference_cfg:
+            reference_cfg_mask_geometry_tokens = None
 
         logging.info(f"mask shape: {prompt_embeds_mask.shape}, dtype: {prompt_embeds_mask.dtype}")
         logging.info(f"prompt_embeds shape: {prompt_embeds.shape}, dtype: {prompt_embeds.dtype}")
@@ -1368,14 +1652,12 @@ class QwenImageEditTrainer(BaseTrainer):
                             encoder_hidden_states=prompt_embeds,
                             img_shapes=img_shapes,
                             txt_seq_lens=txt_seq_lens,
+                            mask_geometry_tokens=mask_geometry_tokens,
                             attention_kwargs=self.attention_kwargs,
                             return_dict=False,
                         )[0]
                         noise_pred = noise_pred[:, : latents.size(1)]
                 if do_reference_cfg:
-                    noise_pred_cpu = noise_pred.cpu()
-                    torch.cuda.empty_cache()
-
                     reference_cfg_latent_model_input = latents
                     if reference_cfg_control_latents is not None:
                         reference_cfg_latent_model_input = torch.cat(
@@ -1392,12 +1674,12 @@ class QwenImageEditTrainer(BaseTrainer):
                                 encoder_hidden_states=reference_cfg_prompt_embeds,
                                 img_shapes=reference_cfg_img_shapes,
                                 txt_seq_lens=reference_cfg_txt_seq_lens,
+                                mask_geometry_tokens=reference_cfg_mask_geometry_tokens,
                                 attention_kwargs=self.attention_kwargs,
                                 return_dict=False,
                             )[0]
                             reference_cfg_noise_pred = reference_cfg_noise_pred[:, : latents.size(1)]
 
-                    noise_pred = noise_pred_cpu.to(device)
                     noise_pred = self._combine_reference_cfg_predictions(
                         noise_pred=noise_pred,
                         reference_cfg_noise_pred=reference_cfg_noise_pred,
@@ -1408,7 +1690,6 @@ class QwenImageEditTrainer(BaseTrainer):
                     )
 
                     del reference_cfg_noise_pred
-                    torch.cuda.empty_cache()
 
                 if do_true_cfg:
                     # 临时释放正面推理结果的显存，避免两次推理同时占用显存
@@ -1424,6 +1705,7 @@ class QwenImageEditTrainer(BaseTrainer):
                                 encoder_hidden_states=negative_prompt_embeds,
                                 img_shapes=img_shapes,
                                 txt_seq_lens=negative_txt_seq_lens,
+                                mask_geometry_tokens=mask_geometry_tokens,
                                 attention_kwargs=self.attention_kwargs,
                                 return_dict=False,
                             )[0]
@@ -1481,3 +1763,34 @@ class QwenImageEditTrainer(BaseTrainer):
         # 后处理
         final_image = self.image_processor.postprocess(final_image, output_type="pt")
         return final_image
+
+    def decode_vae_latent_for_loss(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        """Decode packed latents to [B,3,H,W] in [-1,1] while keeping the autograd graph.
+
+        Unlike ``decode_vae_latent`` (inference path), this skips image_processor.postprocess
+        so gradients from pixel losses can flow back into ``latents`` / the DiT prediction.
+        VAE parameters remain frozen; only the input graph is used.
+        """
+        decode_device = self._vae_decode_device()
+        decode_dtype = self._vae_decode_dtype()
+        # Flow-matching arithmetic can promote pred_x0 to float32 even when the
+        # frozen VAE is bf16. Match the actual first decode module instead of a
+        # configured precision value. Tensor.to(dtype=...) remains differentiable,
+        # so region-loss gradients still propagate back to pred_x0 / the DiT.
+        latents = latents.to(device=decode_device, dtype=decode_dtype)
+        latents = self._unpack_latents(latents, height, width, self.vae_scale_factor)
+        latents_mean = (
+            torch.tensor(self.vae.config.latents_mean)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(device=latents.device, dtype=latents.dtype)
+        )
+        latents_std = (
+            1.0
+            / torch.tensor(self.vae.config.latents_std)
+            .view(1, self.vae.config.z_dim, 1, 1, 1)
+            .to(device=latents.device, dtype=latents.dtype)
+        )
+        latents = latents / latents_std + latents_mean
+        # VAE weights are frozen but the forward still propagates grads to inputs.
+        images = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        return images

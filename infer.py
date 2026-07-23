@@ -19,8 +19,11 @@ from src.utils.adaptive_crop_anchoring import (
     prepare_adaptive_crop_for_inference,
 )
 from src.utils.inference_metadata import (
+    CHECKPOINT_COMPANION_FILE_NAMES,
+    MASK_GEOMETRY_COMPANION_FILE_NAME,
     build_effective_inference_metadata,
     build_inference_config_metadata,
+    resolve_effective_mask_control,
     resolve_guidance_embeds_enabled,
     validate_checkpoint_compatibility,
     validate_inference_mode_inputs,
@@ -154,7 +157,11 @@ def resolve_lora_path(path: Path) -> Path:
         if candidate.exists():
             return candidate
 
-    safetensors_files = sorted(path.glob("*.safetensors"))
+    safetensors_files = sorted(
+        candidate
+        for candidate in path.glob("*.safetensors")
+        if candidate.name not in CHECKPOINT_COMPANION_FILE_NAMES
+    )
     if len(safetensors_files) == 1:
         return safetensors_files[0]
     if len(safetensors_files) > 1:
@@ -162,6 +169,10 @@ def resolve_lora_path(path: Path) -> Path:
             f"Multiple safetensors files found in checkpoint directory {path}: {safetensors_files}"
         )
     raise FileNotFoundError(f"No safetensors file found in checkpoint directory: {path}")
+
+
+def checkpoint_dir_for_lora(lora_path: Path) -> Path:
+    return lora_path.parent if lora_path.is_file() else lora_path
 
 
 def validate_configured_inference(config, args, resolved_lora_path: Path | None) -> None:
@@ -173,6 +184,24 @@ def validate_configured_inference(config, args, resolved_lora_path: Path | None)
 
     if resolved_lora_path is None and not args.allow_base_model:
         raise ValueError("LoRA weight is required. Pass --lora or set model.lora.pretrained_weight in config.")
+
+    if resolve_effective_mask_control(config)["geometry_active"]:
+        if resolved_lora_path is None:
+            raise ValueError(
+                "Geometric mask control requires a LoRA checkpoint directory with "
+                f"{MASK_GEOMETRY_COMPANION_FILE_NAME}; it cannot be used with "
+                "--allow-base-model."
+            )
+        geometry_path = (
+            checkpoint_dir_for_lora(resolved_lora_path)
+            / MASK_GEOMETRY_COMPANION_FILE_NAME
+        )
+        if not geometry_path.is_file():
+            raise FileNotFoundError(
+                "Geometric mask control is enabled but companion weights were not found: "
+                f"{geometry_path}"
+            )
+
 
 def resolve_ref_mask_for_visualization(ref_img: Image.Image, ref_mask: Image.Image | None) -> Image.Image:
     if ref_mask is not None:
@@ -360,7 +389,10 @@ def main():
         raise FileNotFoundError(f"Config file not found: {args.config}")
     validate_args(args)
 
-    config = load_config_from_yaml(str(args.config))
+    # OPD Teachers are training-time dependencies.  Strip that graph before
+    # validating a Student deployment config so moved/archived Teacher files
+    # are not required for inference.
+    config = load_config_from_yaml(str(args.config), for_inference=True)
     latent_anchoring_config = apply_latent_anchoring_cli_overrides(config, args)
     validate_adaptive_crop_inference_args(config, args)
     validate_latent_anchoring_runtime(

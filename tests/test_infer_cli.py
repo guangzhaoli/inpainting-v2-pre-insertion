@@ -11,7 +11,12 @@ import torch
 from PIL import Image
 
 import infer
-from src.data.config import AdaptiveCropConfig, ImageProcessorConfig, ModelConfig
+from src.data.config import (
+    AdaptiveCropConfig,
+    ImageProcessorConfig,
+    MaskControlConfig,
+    ModelConfig,
+)
 
 
 class FakeCliTrainer:
@@ -56,6 +61,59 @@ def make_config(adaptive_crop: AdaptiveCropConfig):
 
 
 class InferCliTest(unittest.TestCase):
+    def test_lora_directory_resolution_ignores_geometry_companion(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_dir = Path(tmpdir)
+            lora_path = checkpoint_dir / "custom_lora.safetensors"
+            lora_path.touch()
+            (checkpoint_dir / "mask_geometry_tokenizer.safetensors").touch()
+
+            self.assertEqual(infer.resolve_lora_path(checkpoint_dir), lora_path)
+
+    def test_lora_directory_with_only_geometry_companion_has_no_lora(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_dir = Path(tmpdir)
+            (checkpoint_dir / "mask_geometry_tokenizer.safetensors").touch()
+
+            with self.assertRaisesRegex(FileNotFoundError, "No safetensors file"):
+                infer.resolve_lora_path(checkpoint_dir)
+
+    def test_geometry_companion_is_checked_before_trainer_setup(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lora_path = Path(tmpdir) / "model.safetensors"
+            lora_path.touch()
+            config = make_config(AdaptiveCropConfig())
+            config.model.mask_control = MaskControlConfig(
+                enabled=True,
+                encoding="geometry_tokenizer",
+            )
+            args = SimpleNamespace(
+                prompt="insert",
+                negative_prompt=None,
+                allow_base_model=False,
+            )
+
+            with self.assertRaisesRegex(FileNotFoundError, "companion weights"):
+                infer.validate_configured_inference(config, args, lora_path)
+
+    def test_geometry_cannot_be_combined_with_allow_base_model(self):
+        config = make_config(AdaptiveCropConfig())
+        config.model.mask_control = MaskControlConfig(
+            enabled=True,
+            encoding="geometry_tokenizer",
+        )
+        args = SimpleNamespace(
+            prompt="insert",
+            negative_prompt=None,
+            allow_base_model=True,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "cannot be used with --allow-base-model",
+        ):
+            infer.validate_configured_inference(config, args, None)
+
     def test_seed_everything_reproduces_python_numpy_and_torch_rng(self):
         infer.seed_everything(1234)
         first = (random.random(), np.random.rand(), torch.randn(4))

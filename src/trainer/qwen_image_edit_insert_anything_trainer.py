@@ -3,18 +3,25 @@ Trainer for the Insert Anything mask_prompt task using QwenImageEdit.
 """
 
 import logging
+import os
 import random
 from typing import Dict, List, Optional, Union
 
 import PIL.Image
+import safetensors.torch
 import torch
+import torch.nn.functional as F
 
+from src.models.mask_geometry import MaskGeometryTokenizer, build_mask_geometry
 from src.trainer.qwen_image_edit_plus_trainer import QwenImageEditPlusTrainer
 from src.utils.images import extract_foreground_from_image_and_mask
 from src.utils.hybrid_masking import (
     INSERT_ANYTHING_AUGMENTED_BOX,
     INSERT_ANYTHING_DILATED_SEGMENTATION,
     INSERT_ANYTHING_EXPANDED_BOX,
+    MASKMIX_V2_ASYMMETRIC_BOX,
+    MASKMIX_V2_EXACT,
+    MASKMIX_V2_RANDOM_MORPHOLOGY,
     apply_hybrid_masking_context_guard,
     build_insert_anything_hybrid_masks,
 )
@@ -24,6 +31,9 @@ from src.utils.latent_anchoring import (
     latent_anchoring_enabled,
     normalize_latent_anchoring_mode,
 )
+
+
+MASK_GEOMETRY_TOKENIZER_FILE_NAME = "mask_geometry_tokenizer.safetensors"
 
 
 class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
@@ -72,10 +82,151 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
         cfg = self._mask_control_cfg()
         return bool(getattr(cfg, "enabled", False))
 
-    def _should_attach_mask_control(self) -> bool:
-        """Attach the placement mask only when explicitly requested."""
+    def _mask_control_encoding(self) -> str:
+        cfg = self._mask_control_cfg()
+        return str(getattr(cfg, "encoding", "rgb_vae"))
 
-        return self._use_explicit_mask_control()
+    def _use_geometric_mask_control(self) -> bool:
+        return self._use_explicit_mask_control() and self._mask_control_encoding() == "geometry_tokenizer"
+
+    @staticmethod
+    def _resize_mask_for_geometry(
+        mask: torch.Tensor,
+        *,
+        target_height: int,
+        target_width: int,
+        threshold: float,
+    ) -> torch.Tensor:
+        """Return a binary mask expressed in the target-image pixel grid."""
+
+        if mask.ndim != 3:
+            raise ValueError(
+                "geometry source mask must have shape [B,H,W], "
+                f"got {tuple(mask.shape)}"
+            )
+        if target_height <= 0 or target_width <= 0:
+            raise ValueError(
+                "geometry target size must be positive, "
+                f"got {(target_height, target_width)}"
+            )
+        if tuple(mask.shape[-2:]) == (target_height, target_width):
+            return mask
+
+        binary = (mask.detach().float() > float(threshold)).to(dtype=torch.float32)
+        return F.interpolate(
+            binary.unsqueeze(1),
+            size=(target_height, target_width),
+            mode="nearest",
+        )[:, 0]
+
+    @staticmethod
+    def _mask_geometry_target_size(batch: Dict, tar_image: torch.Tensor, stage: str) -> tuple[int, int]:
+        """Resolve the pixel grid on which mask geometry must be defined."""
+
+        source_height, source_width = (int(value) for value in tar_image.shape[-2:])
+        if stage != "predict":
+            return source_height, source_width
+
+        height = batch.get("height")
+        width = batch.get("width")
+        if height is None or width is None:
+            return source_height, source_width
+        if isinstance(height, torch.Tensor):
+            if height.numel() != 1:
+                raise ValueError("prediction height must be a scalar")
+            height = height.item()
+        if isinstance(width, torch.Tensor):
+            if width.numel() != 1:
+                raise ValueError("prediction width must be a scalar")
+            width = width.item()
+        return int(height), int(width)
+
+    def _should_attach_mask_control(self) -> bool:
+        """Attach legacy RGB-VAE control unless geometry replaces it."""
+
+        return self._use_explicit_mask_control() and not self._use_geometric_mask_control()
+
+    def _get_mask_geometry_tokenizer(self) -> Optional[MaskGeometryTokenizer]:
+        return getattr(self._unwrap_dit(), "mask_geometry_tokenizer", None)
+
+    def _get_mask_geometry_weight_path(self) -> Optional[str]:
+        pretrained_weight = getattr(self.config.model.lora, "pretrained_weight", None)
+        if pretrained_weight is None:
+            return None
+        weight_dir = pretrained_weight if os.path.isdir(pretrained_weight) else os.path.dirname(pretrained_weight)
+        return os.path.join(weight_dir, MASK_GEOMETRY_TOKENIZER_FILE_NAME)
+
+    def load_model(self, text_encoder_device=None):
+        super().load_model(text_encoder_device=text_encoder_device)
+        if not self._use_geometric_mask_control():
+            return
+
+        cfg = self._mask_control_cfg()
+        self.dit.mask_geometry_tokenizer = MaskGeometryTokenizer(
+            hidden_channels=int(cfg.tokenizer_hidden_channels),
+            out_channels=int(self.dit.config.in_channels),
+        ).to(dtype=self.weight_dtype)
+
+    def setup_model_device_train_mode(self, stage="fit"):
+        super().setup_model_device_train_mode(stage=stage)
+        if stage != "fit" or not self._use_geometric_mask_control():
+            return
+
+        tokenizer = self._get_mask_geometry_tokenizer()
+        if tokenizer is None:
+            raise ValueError("geometric mask control is enabled but mask_geometry_tokenizer is not attached")
+        tokenizer.requires_grad_(True)
+
+    def save_additional_modules(self, save_folder):
+        super().save_additional_modules(save_folder)
+        if not self._use_geometric_mask_control():
+            return
+
+        tokenizer = self._get_mask_geometry_tokenizer()
+        if tokenizer is None:
+            raise ValueError("geometric mask control is enabled but mask_geometry_tokenizer is not attached")
+        state_dict = {key: value.detach().cpu() for key, value in tokenizer.state_dict().items()}
+        safetensors.torch.save_file(
+            state_dict,
+            os.path.join(save_folder, MASK_GEOMETRY_TOKENIZER_FILE_NAME),
+        )
+
+    def load_additional_modules(self, stage="fit"):
+        super().load_additional_modules(stage=stage)
+        if not self._use_geometric_mask_control():
+            return
+
+        tokenizer = self._get_mask_geometry_tokenizer()
+        if tokenizer is None:
+            raise ValueError("geometric mask control is enabled but mask_geometry_tokenizer is not attached")
+
+        weight_path = self._get_mask_geometry_weight_path()
+        is_resume = getattr(self.config, "resume", None) is not None
+        if weight_path is None:
+            if stage == "predict" or is_resume:
+                raise FileNotFoundError(
+                    "Geometric mask control requires companion weights for prediction or exact resume, "
+                    "but no pretrained checkpoint is configured."
+                )
+            return
+        if not os.path.isfile(weight_path):
+            if stage == "predict" or is_resume:
+                raise FileNotFoundError(
+                    f"Geometric mask control companion weights were not found at {weight_path}"
+                )
+            logging.warning(
+                "Warm-start LoRA has no geometric-mask companion at %s; "
+                "the zero-initialized mask tokenizer will be trained from scratch.",
+                weight_path,
+            )
+            return
+
+        state_dict = safetensors.torch.load_file(weight_path)
+        missing, unexpected = tokenizer.load_state_dict(state_dict, strict=False)
+        if unexpected:
+            raise ValueError(f"Unexpected mask geometry tokenizer keys: {unexpected}")
+        if missing:
+            raise ValueError(f"Missing mask geometry tokenizer keys: {missing}")
 
     def _reference_cfg_cfg(self):
         return self.config.model.reference_cfg
@@ -161,6 +312,9 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
             INSERT_ANYTHING_EXPANDED_BOX,
             INSERT_ANYTHING_DILATED_SEGMENTATION,
             "precomputed",
+            MASKMIX_V2_EXACT,
+            MASKMIX_V2_RANDOM_MORPHOLOGY,
+            MASKMIX_V2_ASYMMETRIC_BOX,
         )
         mode_indicators = torch.zeros(
             (batch_size, len(mode_names)),
@@ -172,6 +326,25 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
             if mode in mode_to_index:
                 mode_indicators[sample_index, mode_to_index[mode]] = 1.0
 
+        gt_area = metadata["gt_area_ratio"].to(torch.float64)
+        sampled_expansion = metadata.get("sampled_condition_expansion")
+        if sampled_expansion is None:
+            sampled_expansion = (
+                metadata["sampled_condition_area_ratio"].to(torch.float64)
+                / gt_area.clamp_min(torch.finfo(torch.float64).eps)
+            )
+        else:
+            sampled_expansion = sampled_expansion.to(torch.float64)
+
+        condition_expansion = metadata.get("condition_expansion")
+        if condition_expansion is None:
+            condition_expansion = (
+                metadata["condition_area_ratio"].to(torch.float64)
+                / gt_area.clamp_min(torch.finfo(torch.float64).eps)
+            )
+        else:
+            condition_expansion = condition_expansion.to(torch.float64)
+
         record = torch.cat(
             [
                 metadata["gt_area_ratio"].reshape(-1, 1),
@@ -180,6 +353,8 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 metadata["context_guard_triggered"].to(torch.float64).reshape(-1, 1),
                 metadata["unavoidable_large_gt"].to(torch.float64).reshape(-1, 1),
                 mode_indicators,
+                sampled_expansion.reshape(-1, 1),
+                condition_expansion.reshape(-1, 1),
             ],
             dim=1,
         ).detach()
@@ -269,6 +444,31 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
 
     def _build_condition_mask(self, batch: Dict, tar_mask: torch.Tensor, stage: str) -> torch.Tensor:
         hybrid_cfg = self._hybrid_masking_cfg()
+        if stage == "opd":
+            if batch.get("_opd_condition_mask_prepared", False):
+                condition_mask = batch.get("tar_mask_cond")
+                if condition_mask is None:
+                    raise ValueError("prepared OPD batch is missing the shared tar_mask_cond")
+                if hybrid_cfg is not None and hybrid_cfg.enabled:
+                    return self._normalize_precomputed_condition_mask(
+                        condition_mask=condition_mask,
+                        tar_mask=tar_mask,
+                        hybrid_cfg=hybrid_cfg,
+                    )
+                if condition_mask.shape != tar_mask.shape:
+                    raise ValueError(
+                        "OPD tar_mask_cond must match tar_mask shape, got "
+                        f"{tuple(condition_mask.shape)} vs {tuple(tar_mask.shape)}"
+                    )
+                return condition_mask.to(device=tar_mask.device, dtype=tar_mask.dtype)
+            if hybrid_cfg is not None and hybrid_cfg.enabled:
+                raise RuntimeError(
+                    "Hybrid Masking for OPD must be sampled once through "
+                    "prepare_opd_batch() before preparing policy conditions"
+                )
+            self._last_hybrid_masking_metadata = None
+            return tar_mask
+
         if stage != "fit" or hybrid_cfg is None or not hybrid_cfg.enabled:
             self._last_hybrid_masking_metadata = None
             return tar_mask
@@ -299,6 +499,18 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
         self._log_context_guard_fallbacks(batch, modes, guard_metadata)
         return condition_mask
 
+    def prepare_opd_batch(self, batch: Dict) -> Dict:
+        """Sample stochastic conditioning once and share it across all policies."""
+
+        prepared = dict(batch)
+        prepared["tar_mask_cond"] = self._build_condition_mask(
+            prepared,
+            prepared["tar_mask"],
+            stage="fit",
+        )
+        prepared["_opd_condition_mask_prepared"] = True
+        return prepared
+
     def build_training_logs(
         self,
         epoch: int,
@@ -323,8 +535,14 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
             {
                 "hybrid/gt_area_mean": float(gathered[:, 0].mean().item()),
                 "hybrid/sampled_condition_area_mean": float(gathered[:, 1].mean().item()),
+                "hybrid/sampled_condition_area_p90": float(
+                    torch.quantile(gathered[:, 1], 0.90).item()
+                ),
                 "hybrid/sampled_condition_area_max": float(gathered[:, 1].max().item()),
                 "hybrid/condition_area_mean": float(gathered[:, 2].mean().item()),
+                "hybrid/condition_area_p90": float(
+                    torch.quantile(gathered[:, 2], 0.90).item()
+                ),
                 "hybrid/condition_area_max": float(gathered[:, 2].max().item()),
                 "hybrid/visible_context_mean": float((1.0 - gathered[:, 2]).mean().item()),
                 "hybrid/context_guard_rate": float(gathered[:, 3].mean().item()),
@@ -333,6 +551,24 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 "hybrid/mode_expanded_box_rate": float(gathered[:, 6].mean().item()),
                 "hybrid/mode_dilated_segmentation_rate": float(gathered[:, 7].mean().item()),
                 "hybrid/mode_precomputed_rate": float(gathered[:, 8].mean().item()),
+                "hybrid/mode_exact_rate": float(gathered[:, 9].mean().item()),
+                "hybrid/mode_random_morphology_rate": float(gathered[:, 10].mean().item()),
+                "hybrid/mode_asymmetric_box_rate": float(gathered[:, 11].mean().item()),
+                "hybrid/sampled_condition_expansion_mean": float(
+                    gathered[:, 12].mean().item()
+                ),
+                "hybrid/sampled_condition_expansion_max": float(
+                    gathered[:, 12].max().item()
+                ),
+                "hybrid/condition_expansion_mean": float(
+                    gathered[:, 13].mean().item()
+                ),
+                "hybrid/condition_expansion_p90": float(
+                    torch.quantile(gathered[:, 13], 0.90).item()
+                ),
+                "hybrid/condition_expansion_max": float(
+                    gathered[:, 13].max().item()
+                ),
             }
         )
         return logs
@@ -437,26 +673,56 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
 
         control = tar_image * (1 - source_hole_mask.unsqueeze(1))
 
-        use_reference_cfg = self._use_reference_cfg()
+        # Teacher and Student guidance policies are independent of standalone
+        # inference defaults. OPD can therefore distill a reference-guided
+        # Teacher into an unguided Student.
+        if stage == "opd" and "_opd_use_reference_cfg" in batch:
+            use_reference_cfg = bool(batch["_opd_use_reference_cfg"])
+        else:
+            use_reference_cfg = self._use_reference_cfg()
         if use_reference_cfg and "negative_prompt" in batch:
             raise ValueError("reference_cfg cannot be combined with negative_prompt text CFG")
 
         drop_reference = self._drop_reference_for_training(stage)
         force_empty_reference_prompt = self._force_empty_reference_prompt()
-        prompt = (
-            self._empty_prompts(batch["prompt"], batch_size)
-            if force_empty_reference_prompt
-            else batch["prompt"]
-        )
+        if stage == "opd" and "_opd_prompt_override" in batch:
+            prompt = batch["_opd_prompt_override"]
+        else:
+            prompt = (
+                self._empty_prompts(batch["prompt"], batch_size)
+                if force_empty_reference_prompt
+                else batch["prompt"]
+            )
         mask_control = (
             self._mask_to_control_image(source_hole_mask) if self._should_attach_mask_control() else None
         )
+        mask_geometry = None
+        if self._use_geometric_mask_control():
+            mask_cfg = self._mask_control_cfg()
+            geometry_height, geometry_width = self._mask_geometry_target_size(
+                batch,
+                tar_image,
+                stage,
+            )
+            geometry_mask = self._resize_mask_for_geometry(
+                source_hole_mask,
+                target_height=geometry_height,
+                target_width=geometry_width,
+                threshold=float(mask_cfg.mask_threshold),
+            )
+            mask_geometry = build_mask_geometry(
+                geometry_mask,
+                sigma_px=float(mask_cfg.sigma_px),
+                threshold=float(mask_cfg.mask_threshold),
+            )
 
         parent_batch = {
             "control": control,
             "prompt": prompt,
             "n_controls": 0,
         }
+        if mask_geometry is not None:
+            parent_batch["mask_geometry"] = mask_geometry
 
         if not drop_reference:
             self._append_additional_control(parent_batch, ref_image, vae_only=False)
@@ -464,13 +730,30 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
         if mask_control is not None:
             self._append_additional_control(parent_batch, mask_control, vae_only=True)
 
-        if stage != "predict":
+        if stage not in {"predict", "opd"}:
             parent_batch["image"] = tar_image
             if self.config.loss.mask_loss:
                 parent_batch["mask"] = tar_mask
+            if getattr(self.config.loss, "region_perceptual", False):
+                # Keep the unmodified pixel tensors alongside their VAE controls.
+                # Region losses use the GT mask/image, never the sampled MaskMix
+                # condition mask.  Reference tensors are consumed only when the
+                # optional identity weight is non-zero.
+                parent_batch["target_image_for_loss"] = tar_image
+                parent_batch["ref_image_for_loss"] = ref_image
+                parent_batch["ref_mask_for_loss"] = ref_mask
+
+        if stage == "opd":
+            # The GT image supplies the source canvas but must never be encoded
+            # as the supervised target latent during on-policy distillation.
+            parent_batch["height"] = int(tar_image.shape[-2])
+            parent_batch["width"] = int(tar_image.shape[-1])
 
         for key in ("height", "width", "num_inference_steps", "guidance"):
-            if key in batch:
+            # OPD dimensions belong to the current target tensor.  Do not
+            # overwrite the scalar canvas size with a collated per-sample
+            # metadata tensor supplied by a custom dataset.
+            if key in batch and not (stage == "opd" and key in {"height", "width"}):
                 parent_batch[key] = batch[key]
 
         parent_batch["true_cfg_scale"] = batch.get("true_cfg_scale", 1.0)
@@ -480,7 +763,7 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
 
         reference_cfg_parent_batch = None
         reference_cfg_scale = float(batch.get("true_cfg_scale", 1.0))
-        if stage == "predict" and use_reference_cfg and reference_cfg_scale > 1.0:
+        if stage in {"predict", "opd"} and use_reference_cfg and reference_cfg_scale > 1.0:
             # Null-reference branch keeps source/context (+ optional placement mask)
             # while dropping the reference image.
             reference_cfg_parent_batch = {
@@ -489,10 +772,15 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 "n_controls": 0,
                 "true_cfg_scale": 1.0,
             }
+            if mask_geometry is not None:
+                reference_cfg_parent_batch["mask_geometry"] = mask_geometry
+            if stage == "opd":
+                reference_cfg_parent_batch["height"] = int(tar_image.shape[-2])
+                reference_cfg_parent_batch["width"] = int(tar_image.shape[-1])
             if mask_control is not None:
                 self._append_additional_control(reference_cfg_parent_batch, mask_control, vae_only=True)
             for key in ("height", "width", "num_inference_steps", "guidance"):
-                if key in batch:
+                if key in batch and not (stage == "opd" and key in {"height", "width"}):
                     reference_cfg_parent_batch[key] = batch[key]
 
         anchor_source_image = batch.get("anchor_source_image")
@@ -518,7 +806,7 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
         parent_batch = super().prepare_embeddings(parent_batch, stage=stage)
 
         for key in ("height", "width", "num_inference_steps", "guidance"):
-            if key in batch:
+            if key in batch and not (stage == "opd" and key in {"height", "width"}):
                 parent_batch[key] = batch[key]
         parent_batch["true_cfg_scale"] = batch.get(
             "true_cfg_scale", parent_batch["true_cfg_scale"]

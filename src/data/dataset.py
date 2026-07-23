@@ -13,6 +13,10 @@ import random
 import pandas as pd
 
 from src.utils.huggingface import load_editing_dataset, is_huggingface_repo
+from src.utils.opencv_runtime import (
+    configure_opencv_dataloader_worker,
+    configure_opencv_runtime,
+)
 from src.data.config import DatasetInitArgs
 import re
 from pathlib import Path
@@ -574,7 +578,9 @@ def loader(
         prefetch_factor: Optional[int] = 4,
         shuffle: bool = True,
         drop_last=True,
-        seed: int = 42) -> DataLoader:
+        seed: int = 42,
+        teacher_routes: Optional[Dict[str, List[str]]] = None,
+        fallback_teacher: Optional[str] = None) -> DataLoader:
     """
     动态加载数据集类并创建 DataLoader。
     Args:
@@ -600,6 +606,11 @@ def loader(
         pass
     ```
     """
+    # Also configure direct callers that bypass ``src.main``.  This is
+    # idempotent in the parent process; worker_init_fn below reapplies it once
+    # per DataLoader child without touching PyTorch/NumPy/Python RNG state.
+    configure_opencv_runtime()
+
     # 解析类路径
     module_path, class_name = class_path.rsplit('.', 1)
 
@@ -611,10 +622,17 @@ def loader(
 
     # 使用init_args实例化类
     dataset = dataset_class(init_args)
-    sampler = EpochShuffleSampler(dataset, seed=seed) if shuffle else SequentialSampler(dataset)
+    if teacher_routes is not None:
+        from src.distillation.routing import CategoryTeacherRouter, RoundRobinTeacherSampler
+
+        router = CategoryTeacherRouter(teacher_routes, fallback=fallback_teacher)
+        sampler = RoundRobinTeacherSampler(dataset, router, seed=seed)
+    else:
+        sampler = EpochShuffleSampler(dataset, seed=seed) if shuffle else SequentialSampler(dataset)
     worker_kwargs = {}
     if num_workers > 0:
         worker_kwargs["persistent_workers"] = persistent_workers
+        worker_kwargs["worker_init_fn"] = configure_opencv_dataloader_worker
         if prefetch_factor is not None:
             worker_kwargs["prefetch_factor"] = prefetch_factor
 

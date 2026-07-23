@@ -580,17 +580,127 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
 
         self.gradient_checkpointing = False
 
+    @staticmethod
+    def _mask_geometry_target_grid(
+        img_shapes: Optional[List[List[Tuple[int, int, int]]]],
+        batch_size: int,
+    ) -> tuple[int, int]:
+        """Validate and return the shared target-token grid for a batch."""
+
+        if not img_shapes or not img_shapes[0]:
+            raise ValueError("mask geometry injection requires non-empty img_shapes")
+        if len(img_shapes) != batch_size:
+            raise ValueError(
+                "mask geometry requires one img_shapes entry per batch item, "
+                f"got {len(img_shapes)} for batch size {batch_size}"
+            )
+
+        target_shape = tuple(img_shapes[0][0])
+        if len(target_shape) != 3:
+            raise ValueError(f"target img_shape must be (frame, height, width), got {target_shape}")
+        frame, target_height, target_width = (int(value) for value in target_shape)
+        if frame != 1:
+            raise ValueError(f"2D mask geometry requires target frame=1, got {frame}")
+
+        for sample_shapes in img_shapes[1:]:
+            if not sample_shapes or tuple(sample_shapes[0]) != target_shape:
+                raise ValueError("mask geometry requires one shared target token grid per batch")
+
+        if target_height <= 0 or target_width <= 0:
+            raise ValueError(
+                "mask geometry target token grid must be positive, "
+                f"got {(target_height, target_width)}"
+            )
+        return target_height, target_width
+
+    def prepare_mask_geometry_tokens(
+        self,
+        mask_geometry: torch.Tensor,
+        img_shapes: Optional[List[List[Tuple[int, int, int]]]],
+    ) -> torch.Tensor:
+        """Tokenize a static geometry condition once for inference reuse."""
+
+        if not isinstance(mask_geometry, torch.Tensor) or mask_geometry.ndim != 4:
+            shape = getattr(mask_geometry, "shape", None)
+            raise ValueError(
+                "mask_geometry must have shape [B,3,H,W], "
+                f"got {tuple(shape) if shape is not None else type(mask_geometry).__name__}"
+            )
+        tokenizer = getattr(self, "mask_geometry_tokenizer", None)
+        if tokenizer is None:
+            raise ValueError(
+                "mask_geometry was provided but the transformer has no mask_geometry_tokenizer"
+            )
+        target_height, target_width = self._mask_geometry_target_grid(
+            img_shapes,
+            int(mask_geometry.shape[0]),
+        )
+        return tokenizer(
+            mask_geometry,
+            target_size=(target_height, target_width),
+        )
+
+    def _inject_mask_geometry(
+        self,
+        hidden_states: torch.Tensor,
+        mask_geometry: Optional[torch.Tensor],
+        img_shapes: Optional[List[List[Tuple[int, int, int]]]],
+        mask_geometry_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Add geometric mask features to the target prefix of the image sequence."""
+
+        if mask_geometry is not None and mask_geometry_tokens is not None:
+            raise ValueError("provide either mask_geometry or mask_geometry_tokens, not both")
+        if mask_geometry is None and mask_geometry_tokens is None:
+            return hidden_states
+
+        target_height, target_width = self._mask_geometry_target_grid(
+            img_shapes,
+            int(hidden_states.shape[0]),
+        )
+
+        target_token_count = target_height * target_width
+        if hidden_states.shape[1] < target_token_count:
+            raise ValueError(
+                "target token geometry is incompatible with hidden_states: "
+                f"grid={(target_height, target_width)}, hidden={tuple(hidden_states.shape)}"
+            )
+
+        if mask_geometry_tokens is None:
+            mask_geometry_tokens = self.prepare_mask_geometry_tokens(mask_geometry, img_shapes)
+        expected_shape = (
+            hidden_states.shape[0],
+            target_token_count,
+            hidden_states.shape[2],
+        )
+        if tuple(mask_geometry_tokens.shape) != expected_shape:
+            raise ValueError(
+                "mask geometry tokens must have shape "
+                f"{expected_shape}, got {tuple(mask_geometry_tokens.shape)}"
+            )
+        mask_geometry_tokens = mask_geometry_tokens.to(
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+        target_hidden = hidden_states[:, :target_token_count] + mask_geometry_tokens
+        if hidden_states.shape[1] == target_token_count:
+            return target_hidden
+        return torch.cat([target_hidden, hidden_states[:, target_token_count:]], dim=1)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor = None,
         encoder_hidden_states_mask: torch.Tensor = None,
         timestep: torch.LongTensor = None,
-        img_shapes: Optional[List[Tuple[int, int, int]]] = None,
+        img_shapes: Optional[List[List[Tuple[int, int, int]]]] = None,
         txt_seq_lens: Optional[List[int]] = None,
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
+        mask_geometry: Optional[torch.Tensor] = None,
+        mask_geometry_tokens: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
         The [`QwenTransformer2DModel`] forward method.
@@ -611,6 +721,14 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
                 tuple.
+            mask_geometry (`torch.Tensor`, *optional*):
+                Three-channel geometric mask encoding. When provided, its
+                zero-initialized tokenizer output is added only to the target
+                image-token prefix before ``img_in``.
+            mask_geometry_tokens (`torch.Tensor`, *optional*):
+                Pre-tokenized geometry shaped ``[B,N_target,C]``. Inference may
+                cache this static tensor and reuse it across denoising and CFG
+                forwards. Mutually exclusive with ``mask_geometry``.
 
         Returns:
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
@@ -631,6 +749,12 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
 
+        hidden_states = self._inject_mask_geometry(
+            hidden_states,
+            mask_geometry,
+            img_shapes,
+            mask_geometry_tokens=mask_geometry_tokens,
+        )
         hidden_states = self.img_in(hidden_states)
 
         timestep = timestep.to(hidden_states.dtype)

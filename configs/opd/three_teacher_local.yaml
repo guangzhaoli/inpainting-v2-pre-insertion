@@ -1,0 +1,206 @@
+# Local, runnable OPD smoke example using three completed legacy r256 teachers
+# currently present in this workspace. It validates the shared-LoRA OPD path;
+# for the final-architecture five-expert run, use the template documented in
+# docs/opd.md after all five final experts have been trained.
+# One balanced round contains accessory, animal, and general-object batches;
+# gradient_accumulation_steps=3 makes one optimizer update after a full round.
+
+trainer: QwenImageEditInsertAnything
+mode: fit
+
+model:
+  pretrained_model_name_or_path: "/inspire/hdd/global_user/250041225002/project/model/qwen-image-edit-2511"
+  quantize: false
+  mask_control:
+    enabled: false
+  reference_cfg:
+    enabled: false
+    train_dropout_rate: 0.0
+    force_empty_prompt: true
+    mask_aware: false
+    delta_clip_enabled: false
+    delta_clip_max_ratio: 0.5
+  lora:
+    r: 256
+    lora_alpha: 256
+    target_modules: &qwen_lora_targets
+      - to_q
+      - to_k
+      - to_v
+      - to_out.0
+      - add_q_proj
+      - add_k_proj
+      - add_v_proj
+      - to_add_out
+      - img_mlp.net.0.proj
+      - img_mlp.net.2
+      - txt_mlp.net.0.proj
+      - txt_mlp.net.2
+    init_lora_weights: gaussian
+    adapter_name: opd_student_lora
+    pretrained_weight: null
+
+data:
+  class_path: src.data.insert_anything_dataset.InsertAnythingDataset
+  init_args:
+    dataset_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/a2edit/data"
+    manifest_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2-final-architecture/manifests/insert_anything_teacher_all_data.csv"
+    categories: [accessory, jewel_filter, cat, dog, others]
+    require_prompt: false
+    processor:
+      class_path: src.data.preprocess.ImageProcessor
+      init_args:
+        process_type: fixed_pixels
+        resize_mode: bilinear
+        controls_pixels: [1048576, 1048576]
+        target_pixels: 1048576
+    adaptive_crop:
+      train_enabled: true
+      predict_enabled: true
+      policy: bbox_area_linear
+      trigger_bbox_area_ratio: 0.1
+      min_crop_area_ratio: 0.25
+      context_margin_ratio: 0.2
+      mask_threshold: 0.5
+      min_crop_side: 16
+      aspect_mode: target
+      blend_mode: strict_mask
+    hybrid_masking:
+      enabled: true
+      strategy: insert_anything
+      person_categories: [person]
+      mask_threshold: 0.5
+      bbox_expand_ratio: 1.1
+      curve_jitter_px: 40
+      dilation_kernel_size: 7
+      dilation_iterations: 2
+      reference_resolution: 768
+      scale_pixel_parameters: true
+      ensure_gt_coverage: true
+      context_guard:
+        enabled: true
+        max_condition_area_ratio: 0.8
+        overflow_policy: fallback_to_gt
+  batch_size: 1
+  num_workers: 8
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  non_blocking: true
+  shuffle: true
+  drop_last: true
+
+distillation:
+  enabled: true
+  balance_tasks: true
+  algorithm:
+    class_path: src.distillation.opd.QwenImageEditOPDStrategy
+    init_args: {}
+  objective:
+    # Swap this for TransitionMeanMatchingObjective with init_args.mode=ode
+    # to use the DiffusionOPD ODE transition-mean formulation.
+    class_path: src.distillation.objectives.VelocityMatchingObjective
+    init_args:
+      coefficient: 0.5
+  teacher_backend:
+    class_path: src.distillation.backends.SharedLoRATeacherBackend
+    init_args: {}
+  rollout:
+    num_inference_steps: 10
+    timestep_fraction: 1.0
+    store_device: cpu
+    seed: 42
+  # Qwen OPD uses an unguided student and guided teachers, so guidance is
+  # internalized into the deployed student rather than required at inference.
+  student_guidance:
+    mode: none
+    scale: 1.0
+    prompt_mode: empty
+  fallback_teacher: null
+  teachers:
+    - name: accessory
+      route_categories: [accessory, jewel_filter]
+      weight: 1.0
+      guidance:
+        mode: reference_cfg
+        scale: 4.0
+        prompt_mode: empty
+      lora:
+        r: 256
+        lora_alpha: 256
+        target_modules: *qwen_lora_targets
+        init_lora_weights: gaussian
+        adapter_name: opd_teacher_accessory
+        pretrained_weight: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2-region-balanced-loss/logs/inpainting_v2_teacher_logs/exp_accessory_adaptive_crop_hybrid_masking_r256_fg3_region_balanced/v0/checkpoint-last-4-9800-last/model.safetensors"
+    - name: animal
+      route_categories: [cat, dog]
+      weight: 1.0
+      guidance:
+        mode: reference_cfg
+        scale: 4.0
+        prompt_mode: empty
+      lora:
+        r: 256
+        lora_alpha: 256
+        target_modules: *qwen_lora_targets
+        init_lora_weights: gaussian
+        adapter_name: opd_teacher_animal
+        pretrained_weight: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2-region-balanced-loss/logs/inpainting_v2_teacher_logs/exp_animal_adaptive_crop_hybrid_masking_r256_fg3_region_balanced/v0/checkpoint-last-4-14490-last/model.safetensors"
+    - name: general_object
+      route_categories: [others]
+      weight: 1.0
+      guidance:
+        mode: reference_cfg
+        scale: 4.0
+        prompt_mode: empty
+      lora:
+        r: 256
+        lora_alpha: 256
+        target_modules: *qwen_lora_targets
+        init_lora_weights: gaussian
+        adapter_name: opd_teacher_general_object
+        pretrained_weight: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2-region-balanced-loss/logs/inpainting_v2_teacher_logs/exp_general_object_adaptive_crop_hybrid_masking_r256_fg3_region_balanced/v0/checkpoint-last-4-15210-last/model.safetensors"
+
+logging:
+  output_dir: logs/opd/three_teacher_r256
+  tracker_project_name: opd_three_teacher
+  report_to: tensorboard
+  sampling:
+    enable: false
+
+optimizer:
+  class_path: torch.optim.AdamW
+  init_args:
+    lr: 1.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    eps: 1.0e-8
+
+lr_scheduler:
+  scheduler_type: cosine
+  warmup_steps: 100
+
+train:
+  gradient_accumulation_steps: 3
+  max_train_steps: 100000
+  num_epochs: 10
+  checkpointing_steps: 500
+  checkpoints_total_limit: 20
+  max_grad_norm: 1.0
+  mixed_precision: bf16
+  gradient_checkpointing: true
+
+loss:
+  # Supervised target loss is not used by OPD.  These fields remain for
+  # compatibility with the common trainer config.
+  mask_loss: false
+
+predict:
+  devices:
+    # Prediction devices are unused by mode=fit. Keeping them on CPU makes
+    # config validation portable on login/CI nodes without visible CUDA.
+    vae: cpu
+    text_encoder: cpu
+    dit: cpu
+
+resume: null

@@ -241,7 +241,13 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
         if self.config.loss.mask_loss and "mask" in batch:
             mask = batch["mask"]
             height_image, width_image = batch["height"], batch["width"]
-            batch["mask"] = resize_mask_bhw(mask, height_image, width_image)
+            pixel_mask = resize_mask_bhw(mask, height_image, width_image)
+            # InsertAnything uses this Plus override rather than the base
+            # QwenImageEditTrainer implementation. Preserve the pixel-space GT
+            # mask before packing so region-perceptual loss can consume it.
+            if getattr(self.config.loss, "region_perceptual", False):
+                batch["pixel_mask"] = pixel_mask
+            batch["mask"] = pixel_mask
             batch["mask"] = map_mask_to_latent(
                 batch["mask"],
                 vae_scale_factor=self.vae_scale_factor,

@@ -6,6 +6,17 @@ from typing import Any, Optional
 import yaml
 
 from src.utils.latent_anchoring import ensure_latent_anchoring_config
+from src.utils.tools import calculate_sha256_file
+
+
+CHECKPOINT_STATE_FILE_NAME = "state.json"
+CHECKPOINT_ARTIFACT_MANIFEST_VERSION = 1
+MASK_GEOMETRY_COMPANION_FILE_NAME = "mask_geometry_tokenizer.safetensors"
+CHECKPOINT_COMPANION_FILE_NAMES = frozenset(
+    {
+        MASK_GEOMETRY_COMPANION_FILE_NAME,
+    }
+)
 
 
 class UnsupportedSplitConditioningCheckpointError(ValueError):
@@ -38,6 +49,51 @@ def _normalized_target_modules(value: Any) -> Any:
     if isinstance(value, list):
         return sorted(str(item) for item in value)
     return value
+
+
+def resolve_effective_mask_control(config) -> dict:
+    """Describe the placement-mask path the final trainer will execute."""
+
+    mask_control = getattr(config.model, "mask_control", None)
+    configured_enabled = bool(mask_control is not None and mask_control.enabled)
+    configured_encoding = str(
+        _enum_value(getattr(mask_control, "encoding", "rgb_vae"))
+    )
+    geometry_active = (
+        configured_enabled and configured_encoding == "geometry_tokenizer"
+    )
+    return {
+        "configured_enabled": configured_enabled,
+        "configured_encoding": configured_encoding,
+        "active": configured_enabled,
+        "encoding": configured_encoding if configured_enabled else None,
+        "geometry_active": geometry_active,
+    }
+
+
+def _effective_mask_control_contract(config) -> dict:
+    """Return only mask-control fields that can affect the active runtime path."""
+
+    effective = resolve_effective_mask_control(config)
+    if not effective["active"]:
+        return {"enabled": False}
+
+    contract = {
+        "enabled": True,
+        "encoding": effective["encoding"],
+    }
+    if effective["geometry_active"]:
+        mask_control = config.model.mask_control
+        contract.update(
+            {
+                "sigma_px": float(mask_control.sigma_px),
+                "mask_threshold": float(mask_control.mask_threshold),
+                "tokenizer_hidden_channels": int(
+                    mask_control.tokenizer_hidden_channels
+                ),
+            }
+        )
+    return contract
 
 
 def validate_inference_mode_inputs(
@@ -98,8 +154,9 @@ def build_effective_inference_metadata(
     effective_height: Optional[int] = None,
     effective_width: Optional[int] = None,
 ) -> dict:
-    mask_control_enabled = bool(getattr(config.model, "mask_control", None) and config.model.mask_control.enabled)
-    mask_control_active = mask_control_enabled
+    effective_mask_control = resolve_effective_mask_control(config)
+    mask_control_enabled = effective_mask_control["configured_enabled"]
+    mask_control_active = effective_mask_control["active"]
     reference_cfg_enabled = bool(config.model.reference_cfg.enabled)
     reference_cfg_force_empty_prompt = (
         reference_cfg_enabled and bool(config.model.reference_cfg.force_empty_prompt)
@@ -148,6 +205,10 @@ def build_effective_inference_metadata(
         "modes": {
             "mask_control_enabled": mask_control_enabled,
             "mask_control_active": mask_control_active,
+            "mask_control_encoding": effective_mask_control["encoding"],
+            "mask_control_configured_encoding": effective_mask_control[
+                "configured_encoding"
+            ],
             "reference_cfg_enabled": reference_cfg_enabled,
             "reference_cfg_force_empty_prompt": reference_cfg_force_empty_prompt,
             "text_true_cfg_active": text_true_cfg_active,
@@ -199,11 +260,7 @@ def _checkpoint_contract(config, adaptive_enabled_field: str) -> dict:
                 "target_modules": _normalized_target_modules(config.model.lora.target_modules),
                 "adapter_name": str(config.model.lora.adapter_name),
             },
-            "mask_control": (
-                config.model.mask_control.model_dump(mode="json")
-                if getattr(config.model, "mask_control", None) is not None
-                else {"enabled": False}
-            ),
+            "mask_control": _effective_mask_control_contract(config),
             "reference_cfg": config.model.reference_cfg.model_dump(mode="json"),
         },
         "data": {
@@ -283,10 +340,218 @@ def _load_checkpoint_train_config(train_config_path: Path):
         lora_config = model_config.get("lora")
         if isinstance(lora_config, dict):
             lora_config["pretrained_weight"] = None
+    # OPD teachers are training-time dependencies. A deployed Student
+    # checkpoint must remain verifiable after those large Teacher artifacts are
+    # removed or moved to another machine.
+    if "distillation" in filtered_config:
+        filtered_config["distillation"] = {"enabled": False}
     # Checkpoint compatibility is device-independent. Force CPU devices so the
     # saved config can be validated on login/CI nodes without CUDA.
     filtered_config["predict"] = {"devices": {}}
     return Config.model_validate(filtered_config)
+
+
+def validate_resume_mask_control_compatibility(config, checkpoint_dir: Path) -> dict:
+    """Require an exact effective mask-control contract for true resume."""
+
+    checkpoint_dir = Path(checkpoint_dir)
+    train_config_path = find_checkpoint_train_config(
+        checkpoint_dir,
+        max_parent_levels=0,
+    )
+    if train_config_path is None:
+        raise FileNotFoundError(
+            f"Resume checkpoint is missing train_config.yaml: {checkpoint_dir}"
+        )
+
+    checkpoint_config = _load_checkpoint_train_config(train_config_path)
+    checkpoint_contract = _effective_mask_control_contract(checkpoint_config)
+    current_contract = _effective_mask_control_contract(config)
+    mismatches = _flatten_contract_mismatches(
+        checkpoint_contract,
+        current_contract,
+        prefix="model.mask_control",
+    )
+    if mismatches:
+        preview = "; ".join(
+            f"{item['field']}: checkpoint={item['checkpoint']!r}, "
+            f"current={item['inference']!r}"
+            for item in mismatches
+        )
+        raise ValueError(
+            "Resume checkpoint mask-control contract mismatch. "
+            f"{preview}. Use model.lora.pretrained_weight instead of resume "
+            "for an intentional warm start."
+        )
+    return {
+        "train_config": str(train_config_path.resolve()),
+        "mask_control": current_contract,
+        "mismatches": [],
+    }
+
+
+def _legacy_artifact_verification(state_path: Optional[Path] = None) -> dict:
+    return {
+        "status": "legacy_unverified",
+        "verified": False,
+        "state_file": (
+            str(state_path.resolve()) if state_path is not None else None
+        ),
+        "files": [],
+    }
+
+
+def _required_checkpoint_artifacts(config, resolved_lora_path: Path) -> list[dict]:
+    required = [
+        {
+            "filename": resolved_lora_path.name,
+            "roles": {"lora_peft", "lora_diffusers", "lora"},
+        }
+    ]
+    if resolve_effective_mask_control(config)["geometry_active"]:
+        required.append(
+            {
+                "filename": MASK_GEOMETRY_COMPANION_FILE_NAME,
+                "roles": {"mask_geometry_tokenizer"},
+            }
+        )
+    return required
+
+
+def validate_checkpoint_artifacts(
+    config,
+    resolved_lora_path: Path,
+    *,
+    allow_mismatch: bool,
+) -> dict:
+    """Verify the selected LoRA and active geometry companion via state.json."""
+
+    resolved_lora_path = Path(resolved_lora_path).resolve()
+    checkpoint_dir = resolved_lora_path.parent
+    state_path = checkpoint_dir / CHECKPOINT_STATE_FILE_NAME
+    if not state_path.is_file():
+        return _legacy_artifact_verification()
+
+    try:
+        with state_path.open("r", encoding="utf-8") as file:
+            state = json.load(file)
+    except (OSError, json.JSONDecodeError) as error:
+        if not allow_mismatch:
+            raise ValueError(
+                f"Failed to read checkpoint artifact manifest {state_path}: {error}"
+            ) from error
+        result = _legacy_artifact_verification(state_path)
+        result["status"] = "invalid_manifest_allowed"
+        result["validation_error"] = str(error)
+        return result
+
+    manifest = state.get("artifacts")
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
+        return _legacy_artifact_verification(state_path)
+    if manifest.get("version") != CHECKPOINT_ARTIFACT_MANIFEST_VERSION:
+        message = (
+            "Unsupported checkpoint artifact manifest version: "
+            f"{manifest.get('version')!r}; expected "
+            f"{CHECKPOINT_ARTIFACT_MANIFEST_VERSION}"
+        )
+        if not allow_mismatch:
+            raise ValueError(message)
+        return {
+            "status": "unsupported_manifest_allowed",
+            "verified": False,
+            "state_file": str(state_path.resolve()),
+            "manifest_version": manifest.get("version"),
+            "files": [],
+            "errors": [message],
+        }
+
+    entries_by_filename: dict[str, list[dict]] = {}
+    malformed_entries = []
+    for entry in manifest["files"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("filename"), str):
+            malformed_entries.append(entry)
+            continue
+        entries_by_filename.setdefault(entry["filename"], []).append(entry)
+
+    errors = []
+    verified_files = []
+    if malformed_entries:
+        errors.append(f"malformed manifest entries: {malformed_entries!r}")
+
+    for required in _required_checkpoint_artifacts(config, resolved_lora_path):
+        filename = required["filename"]
+        matching_entries = entries_by_filename.get(filename, [])
+        if len(matching_entries) != 1:
+            errors.append(
+                f"{filename}: expected exactly one manifest entry, "
+                f"found {len(matching_entries)}"
+            )
+            continue
+
+        entry = matching_entries[0]
+        role = entry.get("role")
+        if role not in required["roles"]:
+            errors.append(
+                f"{filename}: manifest role {role!r} is not one of "
+                f"{sorted(required['roles'])}"
+            )
+            continue
+
+        artifact_path = checkpoint_dir / filename
+        if not artifact_path.is_file():
+            errors.append(f"{filename}: artifact file is missing")
+            continue
+
+        expected_size = entry.get("size_bytes")
+        expected_sha256 = entry.get("sha256")
+        actual_size = artifact_path.stat().st_size
+        if not isinstance(expected_size, int) or expected_size != actual_size:
+            errors.append(
+                f"{filename}: size mismatch, manifest={expected_size!r}, "
+                f"actual={actual_size}"
+            )
+            continue
+        if not isinstance(expected_sha256, str):
+            errors.append(f"{filename}: manifest sha256 is missing")
+            continue
+        actual_sha256 = calculate_sha256_file(str(artifact_path))
+        if expected_sha256.lower() != actual_sha256.lower():
+            errors.append(
+                f"{filename}: sha256 mismatch, manifest={expected_sha256}, "
+                f"actual={actual_sha256}"
+            )
+            continue
+        verified_files.append(
+            {
+                "role": role,
+                "filename": filename,
+                "size_bytes": actual_size,
+                "sha256": actual_sha256,
+            }
+        )
+
+    if errors:
+        if not allow_mismatch:
+            raise ValueError(
+                "Checkpoint artifact integrity validation failed. "
+                + "; ".join(errors)
+            )
+        return {
+            "status": "mismatch_allowed",
+            "verified": False,
+            "state_file": str(state_path.resolve()),
+            "manifest_version": manifest.get("version"),
+            "files": verified_files,
+            "errors": errors,
+        }
+
+    return {
+        "status": "verified",
+        "verified": True,
+        "state_file": str(state_path.resolve()),
+        "manifest_version": manifest.get("version"),
+        "files": verified_files,
+    }
 
 
 def validate_checkpoint_compatibility(
@@ -309,6 +574,12 @@ def validate_checkpoint_compatibility(
         "status": "unverified",
         "mismatches": [],
     }
+    artifact_verification = validate_checkpoint_artifacts(
+        config,
+        resolved_lora_path,
+        allow_mismatch=allow_mismatch,
+    )
+    result["artifact_verification"] = artifact_verification
     train_config_path = find_checkpoint_train_config(resolved_lora_path)
     if train_config_path is None:
         if not allow_mismatch:
@@ -352,6 +623,11 @@ def validate_checkpoint_compatibility(
         result["status"] = "mismatch_allowed"
         return result
 
-    result["status"] = "verified"
-    result["verified"] = True
+    result["verified"] = bool(artifact_verification["verified"])
+    if result["verified"]:
+        result["status"] = "verified"
+    elif artifact_verification["status"] == "legacy_unverified":
+        result["status"] = "config_verified_artifacts_unverified"
+    else:
+        result["status"] = f"artifact_{artifact_verification['status']}"
     return result

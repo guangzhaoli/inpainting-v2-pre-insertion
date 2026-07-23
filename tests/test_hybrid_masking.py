@@ -20,10 +20,16 @@ from src.utils.hybrid_masking import (
     INSERT_ANYTHING_AUGMENTED_BOX,
     INSERT_ANYTHING_DILATED_SEGMENTATION,
     INSERT_ANYTHING_EXPANDED_BOX,
+    MASKMIX_V2_ASYMMETRIC_BOX,
+    MASKMIX_V2_EXACT,
+    MASKMIX_V2_RANDOM_MORPHOLOGY,
     apply_hybrid_masking_context_guard,
     build_insert_anything_hybrid_masks,
     build_insert_anything_mask_for_mode,
+    build_maskmix_v2_hybrid_masks,
+    build_maskmix_v2_mask_for_mode,
     sample_insert_anything_mask_mode,
+    sample_maskmix_v2_mode,
 )
 
 
@@ -45,6 +51,55 @@ def make_mask(size=32):
     mask = np.zeros((size, size), dtype=np.float32)
     mask[size // 3 : 2 * size // 3, size // 3 : 2 * size // 3] = 1.0
     return mask
+
+
+def make_maskmix_v2_config(**overrides):
+    """Config-shaped fixture so the algorithm remains testable in isolation."""
+
+    config = SimpleNamespace(
+        strategy="maskmix_v2",
+        mask_threshold=0.5,
+        ensure_gt_coverage=True,
+        scale_pixel_parameters=False,
+        reference_resolution=768,
+        maskmix_v2=SimpleNamespace(
+            mode_weights=SimpleNamespace(
+                augmented_box=0.10,
+                asymmetric_box=0.10,
+                exact=0.60,
+                random_morphology=0.20,
+            ),
+            asymmetric_box=SimpleNamespace(
+                margin_ratio_min=0.0,
+                margin_ratio_max=0.10,
+            ),
+            augmented_box=SimpleNamespace(
+                jitter_object_scale_min=0.05,
+                jitter_object_scale_max=0.20,
+                jitter_min_px=2,
+                jitter_max_px=64,
+            ),
+            morphology=SimpleNamespace(
+                radius_object_scale_min=0.02,
+                radius_object_scale_max=0.12,
+                radius_min_px=1,
+                radius_max_px=32,
+                anisotropy_min=1.5,
+                anisotropy_max=3.0,
+                kernel_weights=SimpleNamespace(
+                    ellipse=0.40,
+                    rectangle=0.20,
+                    horizontal_ellipse=0.20,
+                    vertical_ellipse=0.20,
+                ),
+            ),
+        ),
+    )
+    for section, values in overrides.items():
+        target = getattr(config.maskmix_v2, section)
+        for name, value in values.items():
+            setattr(target, name, value)
+    return config
 
 
 def make_batch():
@@ -264,6 +319,146 @@ class HybridMaskingAlgorithmTest(unittest.TestCase):
         self.assertEqual(first_modes, second_modes)
 
 
+class MaskMixV2AlgorithmTest(unittest.TestCase):
+    def setUp(self):
+        self.config = make_maskmix_v2_config()
+        self.mask = make_mask(size=64)
+
+    @staticmethod
+    def _bbox_size(mask):
+        ys, xs = np.where(mask > 0)
+        return int(ys.max() - ys.min() + 1), int(xs.max() - xs.min() + 1)
+
+    def test_mode_probability_boundaries_are_category_independent(self):
+        expected = (
+            (0.0, INSERT_ANYTHING_AUGMENTED_BOX),
+            (0.099999, INSERT_ANYTHING_AUGMENTED_BOX),
+            (0.1, MASKMIX_V2_ASYMMETRIC_BOX),
+            (0.199999, MASKMIX_V2_ASYMMETRIC_BOX),
+            (0.2, MASKMIX_V2_EXACT),
+            (0.799999, MASKMIX_V2_EXACT),
+            (0.8, MASKMIX_V2_RANDOM_MORPHOLOGY),
+            (0.999999, MASKMIX_V2_RANDOM_MORPHOLOGY),
+        )
+        for probability, expected_mode in expected:
+            for category in ("person", "accessory", "unseen_category"):
+                with self.subTest(probability=probability, category=category):
+                    self.assertEqual(
+                        sample_maskmix_v2_mode(
+                            category,
+                            self.config,
+                            FixedProbabilityRng(probability),
+                        ),
+                        expected_mode,
+                    )
+
+    def test_all_modes_are_binary_cover_gt_and_exact_is_unchanged(self):
+        modes = (
+            INSERT_ANYTHING_AUGMENTED_BOX,
+            MASKMIX_V2_ASYMMETRIC_BOX,
+            MASKMIX_V2_EXACT,
+            MASKMIX_V2_RANDOM_MORPHOLOGY,
+        )
+        for mode in modes:
+            with self.subTest(mode=mode):
+                output = build_maskmix_v2_mask_for_mode(
+                    self.mask,
+                    mode,
+                    self.config,
+                    rng=random.Random(7),
+                )
+                self.assertEqual(output.shape, self.mask.shape)
+                self.assertTrue(set(np.unique(output)).issubset({0, 1}))
+                self.assertTrue(np.all(output[self.mask > 0] == 1))
+                if mode == MASKMIX_V2_EXACT:
+                    self.assertTrue(np.array_equal(output, self.mask.astype(np.uint8)))
+
+    def test_batch_builder_is_reproducible_and_legacy_entrypoint_dispatches(self):
+        masks = torch.from_numpy(np.stack([self.mask, self.mask])).to(torch.bfloat16)
+        expected, expected_modes = build_maskmix_v2_hybrid_masks(
+            masks,
+            ["person", "accessory"],
+            self.config,
+            rng=random.Random(1234),
+        )
+        actual, actual_modes = build_insert_anything_hybrid_masks(
+            masks,
+            ["jewel_filter", "unseen_category"],
+            self.config,
+            rng=random.Random(1234),
+        )
+        self.assertEqual(expected.shape, masks.shape)
+        self.assertEqual(expected.dtype, masks.dtype)
+        self.assertTrue(torch.equal(actual, expected))
+        self.assertEqual(actual_modes, expected_modes)
+        self.assertTrue(torch.all(expected >= masks).item())
+
+    def test_morphology_scales_with_object_size_and_orientation(self):
+        config = make_maskmix_v2_config(
+            morphology={
+                "radius_object_scale_min": 0.25,
+                "radius_object_scale_max": 0.25,
+                "radius_min_px": 1,
+                "radius_max_px": 32,
+                "anisotropy_min": 2.0,
+                "anisotropy_max": 2.0,
+                "kernel_weights": SimpleNamespace(
+                    ellipse=0.0,
+                    rectangle=0.0,
+                    horizontal_ellipse=1.0,
+                    vertical_ellipse=0.0,
+                ),
+            },
+        )
+        small = np.zeros((64, 64), dtype=np.float32)
+        small[30:34, 30:34] = 1
+        large = np.zeros((64, 64), dtype=np.float32)
+        large[24:40, 24:40] = 1
+        small_output = build_maskmix_v2_mask_for_mode(
+            small, MASKMIX_V2_RANDOM_MORPHOLOGY, config, rng=random.Random(1)
+        )
+        large_output = build_maskmix_v2_mask_for_mode(
+            large, MASKMIX_V2_RANDOM_MORPHOLOGY, config, rng=random.Random(1)
+        )
+        self.assertGreater(
+            self._bbox_size(large_output)[0] - self._bbox_size(large)[0],
+            self._bbox_size(small_output)[0] - self._bbox_size(small)[0],
+        )
+        orientation_config = make_maskmix_v2_config(
+            morphology={
+                "radius_object_scale_min": 0.01,
+                "radius_object_scale_max": 0.01,
+                "radius_min_px": 4,
+                "radius_max_px": 4,
+                "anisotropy_min": 2.0,
+                "anisotropy_max": 2.0,
+                "kernel_weights": config.maskmix_v2.morphology.kernel_weights,
+            },
+        )
+        one_pixel = np.zeros((33, 33), dtype=np.float32)
+        one_pixel[16, 16] = 1
+        horizontal = build_maskmix_v2_mask_for_mode(
+            one_pixel,
+            MASKMIX_V2_RANDOM_MORPHOLOGY,
+            orientation_config,
+            rng=random.Random(5),
+        )
+        horizontal_height, horizontal_width = self._bbox_size(horizontal)
+        self.assertGreater(horizontal_width, horizontal_height)
+
+    def test_unknown_mode_and_nonfinite_masks_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            build_maskmix_v2_mask_for_mode(self.mask, "unknown", self.config)
+        nonfinite = self.mask.copy()
+        nonfinite[0, 0] = np.nan
+        with self.assertRaisesRegex(ValueError, "finite"):
+            build_maskmix_v2_mask_for_mode(
+                nonfinite,
+                MASKMIX_V2_EXACT,
+                self.config,
+            )
+
+
 class HybridMaskingContextGuardTest(unittest.TestCase):
     @staticmethod
     def _config(*, enabled=True, max_ratio=0.80):
@@ -341,6 +536,8 @@ class HybridMaskingContextGuardTest(unittest.TestCase):
         self.assertFalse(bool(metadata["unavoidable_large_gt"][0]))
         self.assertEqual(float(metadata["sampled_condition_area_ratio"][0]), 1.0)
         self.assertEqual(float(metadata["condition_area_ratio"][0]), 0.04)
+        self.assertEqual(float(metadata["sampled_condition_expansion"][0]), 25.0)
+        self.assertEqual(float(metadata["condition_expansion"][0]), 1.0)
 
     def test_large_gt_is_preserved_and_marked_unavoidable(self):
         gt_mask = self._mask_with_area(90)
@@ -356,6 +553,20 @@ class HybridMaskingContextGuardTest(unittest.TestCase):
         self.assertTrue(bool(metadata["context_guard_triggered"][0]))
         self.assertTrue(bool(metadata["unavoidable_large_gt"][0]))
         self.assertEqual(float(metadata["condition_area_ratio"][0]), 0.90)
+
+    def test_expansion_metadata_uses_gt_pixel_count_as_denominator(self):
+        gt_mask = self._mask_with_area(4)
+        condition_mask = self._mask_with_area(16)
+
+        guarded, metadata = apply_hybrid_masking_context_guard(
+            condition_mask,
+            gt_mask,
+            self._config(enabled=False),
+        )
+
+        self.assertTrue(torch.equal(guarded, condition_mask))
+        self.assertEqual(float(metadata["sampled_condition_expansion"][0]), 4.0)
+        self.assertEqual(float(metadata["condition_expansion"][0]), 4.0)
 
 
 class HybridMaskingTrainerRoutingTest(unittest.TestCase):

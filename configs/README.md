@@ -16,6 +16,12 @@ configs/
     general_object.yaml
     human.yaml
   exp/
+    final_architecture.yaml              # accessory_jewelry domain
+    final_architecture_animal.yaml
+    final_architecture_fashion_tryon.yaml
+    final_architecture_general_object.yaml
+    final_architecture_human.yaml
+    final_architecture_all.yaml
     accessory/
       r256.yaml
       fg5.yaml
@@ -23,6 +29,9 @@ configs/
       adaptive_crop_r256_fg3.yaml
       hybrid_masking.yaml
       hybrid_masking_r256_fg3.yaml
+  opd/
+    three_teacher_local.yaml                    # legacy OPD smoke run
+    final_architecture_five_teacher.yaml.example # five final experts template
   legacy/
     native.yaml
   README.md
@@ -36,6 +45,8 @@ configs/
 | `scale/N.yaml` | Launch default when `TOTAL_PROCESSES=N` |
 | `teacher/<domain>.yaml` | Domain baseline (data split only / domain baseline) |
 | `exp/accessory/<idea>.yaml` | Accessory/jewelry idea ablation |
+| `exp/final_architecture.yaml` | Integrated final architecture (accessory_jewelry) |
+| `exp/final_architecture_<domain>.yaml` | Same architecture knobs on another data domain |
 | `legacy/` | Old path kept for reference |
 
 ## Current active accessory experiments (r256, fg:bg=3:1)
@@ -51,6 +62,38 @@ Shared baseline for both:
 - other optional controls off: `mask_control`
 - data: accessory + jewel_filter
 - `batch_size: 1`
+
+## Integrated final architecture
+
+`exp/final_architecture*.yaml` enable Adaptive Crop, reference CFG,
+MaskMix-v2, the geometric-mask tokenizer, region-balanced latent loss and
+foreground-LPIPS/background-L1 region-perceptual loss together. Reference DINO
+remains off. See `../docs/final_architecture.md` for the two-mask data contract
+and checkpoint requirements.
+
+## OPD distillation
+
+OPD is a second phase after the five domain experts are trained. Use
+`configs/opd/final_architecture_five_teacher.yaml.example` only after replacing
+the five placeholder LoRA paths with expert `model.safetensors` files; each
+final expert must also have its neighboring
+`mask_geometry_tokenizer.safetensors`. The template uses mutually exclusive
+routes and `batch_size: 1`/`gradient_accumulation_steps: 5` for a balanced
+five-teacher round. `configs/opd/three_teacher_local.yaml` is a runnable legacy
+smoke configuration for validating the OPD plumbing before the final experts
+exist.
+
+Architecture knobs are identical across domains; only data split, adapter name,
+tracker name, and validation folder differ:
+
+| File | Data | validation_data |
+|---|---|---|
+| `exp/final_architecture.yaml` | accessory + jewel_filter | `testset_20260120/accessory` |
+| `exp/final_architecture_animal.yaml` | cat + dog | `testset_20260120/pets` |
+| `exp/final_architecture_fashion_tryon.yaml` | clothes/dress/TopRef_*/BottomRef_*/pure_color | `testset_20260120/clothes` |
+| `exp/final_architecture_general_object.yaml` | others | `testset_20260120/corner_cases` |
+| `exp/final_architecture_human.yaml` | person + person_hair | `testset_20260120/person` |
+| `exp/final_architecture_all.yaml` | all teacher categories | null (`num_epochs: 3`, ckpt every 2000) |
 
 ## Teacher domain baselines
 
@@ -114,6 +157,17 @@ bash run.sh configs/exp/accessory/adaptive_crop_r256_fg3.yaml
 # 8-GPU Hybrid Masking experiment
 TOTAL_PROCESSES=8 NPROC_PER_NODE=8 NUM_MACHINES=1 MACHINE_RANK=0 \
 bash run.sh configs/exp/accessory/hybrid_masking_r256_fg3.yaml
+
+# 8-GPU integrated final architecture (accessory_jewelry)
+TOTAL_PROCESSES=8 NPROC_PER_NODE=8 NUM_MACHINES=1 MACHINE_RANK=0 \
+bash run.sh configs/exp/final_architecture.yaml
+
+# Same architecture on other domains
+bash run.sh configs/exp/final_architecture_animal.yaml
+bash run.sh configs/exp/final_architecture_fashion_tryon.yaml
+bash run.sh configs/exp/final_architecture_general_object.yaml
+bash run.sh configs/exp/final_architecture_human.yaml
+bash run.sh configs/exp/final_architecture_all.yaml
 
 # Domain baseline
 bash run.sh configs/teacher/accessory_jewelry.yaml

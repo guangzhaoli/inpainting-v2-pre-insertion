@@ -1,8 +1,8 @@
 import diffusers
 import transformers
-from src.data.dataset import loader
 from src.utils.options import parse_args
 from src.utils.logger import get_logger
+from src.utils.opencv_runtime import configure_opencv_runtime
 from src.utils.seed import seed_everything
 from src.data.config import Config
 
@@ -24,6 +24,15 @@ def import_trainer(config: Config):
 
 def main():
     """使用模块化的 Trainer 类进行训练"""
+    # Apply this before trainer construction and dataset loading.  The helper
+    # is process-local and idempotent, so every distributed rank is limited.
+    configure_opencv_runtime()
+
+    # Import the dataset after OpenCV is configured but before seeding.  This
+    # keeps any future import-time side effects from perturbing the seeded
+    # training RNG streams.
+    from src.data.dataset import loader
+
     # 解析配置
     config = parse_args()
 
@@ -43,6 +52,15 @@ def main():
     # 加载数据
     batch_size = config.data.batch_size
     shuffle = config.data.shuffle
+    teacher_routes = None
+    fallback_teacher = None
+    distillation = getattr(config, "distillation", None)
+    if distillation is not None and distillation.enabled and distillation.balance_tasks:
+        teacher_routes = {
+            teacher.name: list(teacher.route_categories)
+            for teacher in distillation.teachers
+        }
+        fallback_teacher = distillation.fallback_teacher
     train_dataloader = loader(
         config.data.class_path,
         config.data.init_args,
@@ -54,6 +72,8 @@ def main():
         shuffle=shuffle,
         drop_last=config.data.drop_last,
         seed=42,
+        teacher_routes=teacher_routes,
+        fallback_teacher=fallback_teacher,
     )
 
     # 开始训练

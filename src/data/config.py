@@ -291,8 +291,8 @@ class LoraConfig(BaseModel):
     @field_validator("pretrained_weight")
     @classmethod
     def _check_weight_path(cls, v: Optional[str]):
-        if v is not None and not os.path.exists(v):
-            raise ValueError(f"pretrained_weight path not found: {v}")
+        if v is not None and not os.path.isfile(v):
+            raise ValueError(f"pretrained_weight path not found or is not a file: {v}")
         return v
 
     @field_validator("adapter_name")
@@ -300,14 +300,51 @@ class LoraConfig(BaseModel):
     def _check_adapter_name(cls, v: Optional[str]):
         if v is not None and not isinstance(v, str):
             raise ValueError("adapter_name must be a string")
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("adapter_name must be a non-empty string")
+        # PEFT stores adapters in ModuleDict-like containers; dots are module
+        # path separators and make add_adapter fail only much later. Keep the
+        # name portable across PEFT and Diffusers serialization formats.
+        if re.fullmatch(r"[A-Za-z0-9_-]+", v) is None:
+            raise ValueError(
+                "adapter_name may contain only letters, numbers, '_' and '-'"
+            )
         return v
 
 
 class MaskControlConfig(BaseModel):
-    """Explicit placement-mask control as an additional VAE-only RGB image."""
+    """Placement-mask conditioning with RGB-VAE or geometric token encoding."""
 
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
+    encoding: Literal["rgb_vae", "geometry_tokenizer"] = "rgb_vae"
+    sigma_px: float = 16.0
+    mask_threshold: float = 0.5
+    tokenizer_hidden_channels: int = 32
+
+    @field_validator("sigma_px")
+    @classmethod
+    def _check_sigma_px(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("mask_control.sigma_px must be a positive finite value")
+        return value
+
+    @field_validator("mask_threshold")
+    @classmethod
+    def _check_mask_threshold(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0 or value >= 1:
+            raise ValueError("mask_control.mask_threshold must be finite and in [0, 1)")
+        return value
+
+    @field_validator("tokenizer_hidden_channels")
+    @classmethod
+    def _check_tokenizer_hidden_channels(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("mask_control.tokenizer_hidden_channels must be positive")
+        return value
 
 
 class ReferenceCFGConfig(BaseModel):
@@ -475,8 +512,227 @@ class HybridMaskingContextGuardConfig(BaseModel):
         return value
 
 
+class MaskMixV2ModeWeightsConfig(BaseModel):
+    """Sampling probabilities for the four MaskMix-v2 mask families."""
+
+    model_config = ConfigDict(extra="forbid")
+    augmented_box: float = 0.10
+    asymmetric_box: float = 0.10
+    exact: float = 0.60
+    random_morphology: float = 0.20
+
+    @field_validator(
+        "augmented_box",
+        "asymmetric_box",
+        "exact",
+        "random_morphology",
+    )
+    @classmethod
+    def _check_probability(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0 or value > 1:
+            raise ValueError("MaskMix-v2 mode weights must be finite and in [0, 1]")
+        return value
+
+    @model_validator(mode="after")
+    def _check_probability_sum(self):
+        total = (
+            self.augmented_box
+            + self.asymmetric_box
+            + self.exact
+            + self.random_morphology
+        )
+        if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError(
+                "hybrid_masking.maskmix_v2.mode_weights must sum to 1 "
+                f"(got {total})"
+            )
+        return self
+
+
+class MaskMixV2AsymmetricBoxConfig(BaseModel):
+    """Independent per-side margin range relative to the tight-box extent."""
+
+    model_config = ConfigDict(extra="forbid")
+    margin_ratio_min: float = 0.0
+    margin_ratio_max: float = 0.10
+
+    @field_validator("margin_ratio_min", "margin_ratio_max")
+    @classmethod
+    def _check_margin_ratio(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0 or value > 1:
+            raise ValueError(
+                "MaskMix-v2 asymmetric-box margin ratios must be finite and in [0, 1]"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _check_margin_ratio_order(self):
+        if self.margin_ratio_min > self.margin_ratio_max:
+            raise ValueError(
+                "hybrid_masking.maskmix_v2.asymmetric_box.margin_ratio_min "
+                "must be <= margin_ratio_max"
+            )
+        return self
+
+
+class MaskMixV2AugmentedBoxConfig(BaseModel):
+    """Object-scale-aware Bezier jitter settings for augmented boxes."""
+
+    model_config = ConfigDict(extra="forbid")
+    jitter_object_scale_min: float = 0.05
+    jitter_object_scale_max: float = 0.20
+    jitter_min_px: int = 2
+    jitter_max_px: int = 64
+
+    @field_validator("jitter_object_scale_min", "jitter_object_scale_max")
+    @classmethod
+    def _check_jitter_ratio(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0 or value > 1:
+            raise ValueError(
+                "MaskMix-v2 augmented-box jitter ratios must be finite and in [0, 1]"
+            )
+        return value
+
+    @field_validator("jitter_min_px", "jitter_max_px")
+    @classmethod
+    def _check_jitter_pixels(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("MaskMix-v2 augmented-box pixel clamps must be >= 0")
+        return value
+
+    @model_validator(mode="after")
+    def _check_jitter_ranges(self):
+        if self.jitter_object_scale_min > self.jitter_object_scale_max:
+            raise ValueError(
+                "hybrid_masking.maskmix_v2.augmented_box.jitter_object_scale_min "
+                "must be <= jitter_object_scale_max"
+            )
+        if self.jitter_min_px > self.jitter_max_px:
+            raise ValueError(
+                "hybrid_masking.maskmix_v2.augmented_box.jitter_min_px "
+                "must be <= jitter_max_px"
+            )
+        return self
+
+
+class MaskMixV2MorphologyKernelWeightsConfig(BaseModel):
+    """Sampling probabilities for morphology structuring-element shapes."""
+
+    model_config = ConfigDict(extra="forbid")
+    ellipse: float = 0.40
+    rectangle: float = 0.20
+    horizontal_ellipse: float = 0.20
+    vertical_ellipse: float = 0.20
+
+    @field_validator(
+        "ellipse",
+        "rectangle",
+        "horizontal_ellipse",
+        "vertical_ellipse",
+    )
+    @classmethod
+    def _check_probability(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0 or value > 1:
+            raise ValueError(
+                "MaskMix-v2 morphology kernel weights must be finite and in [0, 1]"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _check_probability_sum(self):
+        total = (
+            self.ellipse
+            + self.rectangle
+            + self.horizontal_ellipse
+            + self.vertical_ellipse
+        )
+        if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-6):
+            raise ValueError(
+                "hybrid_masking.maskmix_v2.morphology.kernel_weights must sum "
+                f"to 1 (got {total})"
+            )
+        return self
+
+
+class MaskMixV2MorphologyConfig(BaseModel):
+    """Object-scale-aware random dilation settings."""
+
+    model_config = ConfigDict(extra="forbid")
+    radius_object_scale_min: float = 0.02
+    radius_object_scale_max: float = 0.12
+    radius_min_px: int = 1
+    radius_max_px: int = 32
+    anisotropy_min: float = 1.5
+    anisotropy_max: float = 3.0
+    kernel_weights: MaskMixV2MorphologyKernelWeightsConfig = Field(
+        default_factory=MaskMixV2MorphologyKernelWeightsConfig
+    )
+
+    @field_validator("radius_object_scale_min", "radius_object_scale_max")
+    @classmethod
+    def _check_radius_ratio(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0 or value > 1:
+            raise ValueError(
+                "MaskMix-v2 morphology radius ratios must be finite and in [0, 1]"
+            )
+        return value
+
+    @field_validator("anisotropy_min", "anisotropy_max")
+    @classmethod
+    def _check_anisotropy(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 1:
+            raise ValueError(
+                "MaskMix-v2 morphology anisotropy values must be finite and >= 1"
+            )
+        return value
+
+    @field_validator("radius_min_px", "radius_max_px")
+    @classmethod
+    def _check_radius_pixels(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("MaskMix-v2 morphology pixel clamps must be positive")
+        return value
+
+    @model_validator(mode="after")
+    def _check_ranges(self):
+        if self.radius_object_scale_min > self.radius_object_scale_max:
+            raise ValueError(
+                "hybrid_masking.maskmix_v2.morphology.radius_object_scale_min "
+                "must be <= radius_object_scale_max"
+            )
+        if self.radius_min_px > self.radius_max_px:
+            raise ValueError(
+                "hybrid_masking.maskmix_v2.morphology.radius_min_px "
+                "must be <= radius_max_px"
+            )
+        if self.anisotropy_min > self.anisotropy_max:
+            raise ValueError(
+                "hybrid_masking.maskmix_v2.morphology.anisotropy_min "
+                "must be <= anisotropy_max"
+            )
+        return self
+
+
+class MaskMixV2Config(BaseModel):
+    """Configuration for the scale-aware, four-family MaskMix-v2 policy."""
+
+    model_config = ConfigDict(extra="forbid")
+    mode_weights: MaskMixV2ModeWeightsConfig = Field(
+        default_factory=MaskMixV2ModeWeightsConfig
+    )
+    asymmetric_box: MaskMixV2AsymmetricBoxConfig = Field(
+        default_factory=MaskMixV2AsymmetricBoxConfig
+    )
+    augmented_box: MaskMixV2AugmentedBoxConfig = Field(
+        default_factory=MaskMixV2AugmentedBoxConfig
+    )
+    morphology: MaskMixV2MorphologyConfig = Field(
+        default_factory=MaskMixV2MorphologyConfig
+    )
+
+
 class HybridMaskingConfig(BaseModel):
-    """Training-only Hybrid Masking from the official Insert Anything pipeline."""
+    """Training-only Insert Anything or MaskMix-v2 mask augmentation."""
 
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
@@ -490,6 +746,7 @@ class HybridMaskingConfig(BaseModel):
     reference_resolution: int = 768
     scale_pixel_parameters: bool = True
     ensure_gt_coverage: bool = True
+    maskmix_v2: MaskMixV2Config = Field(default_factory=MaskMixV2Config)
     context_guard: HybridMaskingContextGuardConfig = Field(
         default_factory=HybridMaskingContextGuardConfig
     )
@@ -497,7 +754,7 @@ class HybridMaskingConfig(BaseModel):
     @field_validator("strategy")
     @classmethod
     def _check_strategy(cls, value: str) -> str:
-        allowed = {"insert_anything"}
+        allowed = {"insert_anything", "maskmix_v2"}
         if value not in allowed:
             raise ValueError(f"hybrid_masking.strategy must be one of {allowed}")
         return value
@@ -551,6 +808,11 @@ class HybridMaskingConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_context_guard_gt_coverage(self):
+        if self.strategy == "maskmix_v2" and not self.ensure_gt_coverage:
+            raise ValueError(
+                "hybrid_masking.strategy=maskmix_v2 requires "
+                "ensure_gt_coverage=true"
+            )
         if self.context_guard.enabled and not self.ensure_gt_coverage:
             raise ValueError(
                 "hybrid_masking.context_guard requires ensure_gt_coverage=true "
@@ -900,6 +1162,35 @@ class LossConfig(BaseModel):
     # token_weighted: global sum(w*e)/sum(w); region_balanced: fixed-ratio mean_fg/mean_bg mix
     mask_loss_mode: Literal["token_weighted", "region_balanced"] = "token_weighted"
 
+    # Optional pixel-space region loss.  The latent mask above always remains the
+    # ground-truth edit mask; MaskMix only changes the conditioning/hole mask.
+    region_perceptual: bool = False
+    latent_mse_weight: float = 1.0
+    fg_lpips_weight: float = 0.5
+    bg_l1_weight: float = 0.5
+    fg_metric: Literal["lpips", "none"] = "lpips"
+    lpips_net: Literal["alex", "vgg", "squeeze"] = "alex"
+    lpips_input_size: int = 256
+    # Backward-compatible name used by the region-perceptual experiment branch.
+    lpips_downsample: Optional[int] = None
+    lpips_bbox_pad_ratio: float = 0.1
+    mask_threshold: float = 0.5
+    lpips_linear_path: Optional[str] = None
+    lpips_torch_home: Optional[str] = None
+    lpips_trunk_path: Optional[str] = None
+    region_sigma_power: float = 2.0
+    region_max_sigma: float = 1.0
+
+    # Reference identity is deliberately independent from foreground LPIPS and
+    # stays disabled by default because it needs an additional frozen encoder.
+    ref_dino_weight: float = 0.0
+    dino_backend: Literal["transformers", "torch_hub"] = "transformers"
+    dino_model_name: str = "facebook/dinov2-small"
+    dino_repo_path: Optional[str] = None
+    dino_checkpoint_path: Optional[str] = None
+    dino_input_size: int = 224
+    dino_bbox_pad_ratio: float = 0.1
+
     @field_validator("forground_weight", "background_weight")
     @classmethod
     def _positive(cls, v: float) -> float:
@@ -914,6 +1205,365 @@ class LossConfig(BaseModel):
         if v not in allowed:
             raise ValueError(f"mask_loss_mode must be one of {allowed}")
         return v
+
+    @field_validator(
+        "latent_mse_weight",
+        "fg_lpips_weight",
+        "bg_l1_weight",
+        "ref_dino_weight",
+    )
+    @classmethod
+    def _non_negative_loss_weight(cls, v: float) -> float:
+        value = float(v)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("region loss weights must be finite and >= 0")
+        return value
+
+    @field_validator("lpips_input_size", "dino_input_size")
+    @classmethod
+    def _positive_region_input_size(cls, v: int) -> int:
+        value = int(v)
+        if value <= 0:
+            raise ValueError("region metric input sizes must be positive")
+        return value
+
+    @field_validator("lpips_downsample")
+    @classmethod
+    def _positive_lpips_downsample(cls, v: Optional[int]) -> Optional[int]:
+        if v is None:
+            return None
+        value = int(v)
+        if value <= 0:
+            raise ValueError("lpips_downsample must be positive when set")
+        return value
+
+    @field_validator("mask_threshold")
+    @classmethod
+    def _region_mask_threshold(cls, v: float) -> float:
+        value = float(v)
+        if not math.isfinite(value) or value < 0 or value >= 1:
+            raise ValueError("loss.mask_threshold must be finite and in [0, 1)")
+        return value
+
+    @field_validator("lpips_bbox_pad_ratio", "dino_bbox_pad_ratio")
+    @classmethod
+    def _non_negative_bbox_pad_ratio(cls, v: float) -> float:
+        value = float(v)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("region bbox pad ratios must be finite and >= 0")
+        return value
+
+    @field_validator("region_sigma_power")
+    @classmethod
+    def _non_negative_region_sigma_power(cls, v: float) -> float:
+        value = float(v)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("region_sigma_power must be finite and >= 0")
+        return value
+
+    @field_validator("region_max_sigma")
+    @classmethod
+    def _unit_interval_region_max_sigma(cls, v: float) -> float:
+        value = float(v)
+        if not math.isfinite(value) or value < 0 or value > 1:
+            raise ValueError("region_max_sigma must be finite and in [0, 1]")
+        return value
+
+    @field_validator("dino_model_name")
+    @classmethod
+    def _non_empty_dino_model_name(cls, v: str) -> str:
+        value = str(v).strip()
+        if not value:
+            raise ValueError("dino_model_name must be non-empty")
+        return value
+
+    @field_validator(
+        "lpips_linear_path",
+        "lpips_torch_home",
+        "lpips_trunk_path",
+        "dino_repo_path",
+        "dino_checkpoint_path",
+    )
+    @classmethod
+    def _normalize_region_optional_path(cls, v: Optional[str]) -> Optional[str]:
+        return _normalize_path(v)
+
+    @model_validator(mode="after")
+    def _check_region_perceptual_contract(self):
+        if self.lpips_downsample is not None:
+            self.lpips_input_size = int(self.lpips_downsample)
+
+        if not self.region_perceptual:
+            return self
+        if not self.mask_loss:
+            raise ValueError(
+                "loss.region_perceptual=true requires loss.mask_loss=true"
+            )
+
+        if self.fg_metric == "none" and self.fg_lpips_weight > 0:
+            raise ValueError(
+                "loss.fg_lpips_weight must be 0 when loss.fg_metric='none'"
+            )
+
+        active_weights = [
+            self.bg_l1_weight,
+            self.ref_dino_weight,
+        ]
+        if self.fg_metric == "lpips":
+            active_weights.append(self.fg_lpips_weight)
+        if all(weight == 0 for weight in active_weights):
+            raise ValueError(
+                "loss.region_perceptual is enabled but all pixel-region loss weights are 0"
+            )
+
+        lpips_active = self.fg_metric == "lpips" and self.fg_lpips_weight > 0
+        if lpips_active:
+            if self.lpips_linear_path is not None and not os.path.isfile(self.lpips_linear_path):
+                raise ValueError(f"lpips_linear_path not found: {self.lpips_linear_path}")
+            if self.lpips_torch_home is not None and not os.path.isdir(self.lpips_torch_home):
+                raise ValueError(f"lpips_torch_home not found: {self.lpips_torch_home}")
+            if self.lpips_trunk_path is not None and not os.path.isfile(self.lpips_trunk_path):
+                raise ValueError(f"lpips_trunk_path not found: {self.lpips_trunk_path}")
+            if self.lpips_trunk_path is not None and self.lpips_torch_home is None:
+                raise ValueError(
+                    "loss.lpips_trunk_path requires loss.lpips_torch_home so the "
+                    "torchvision trunk cache can be configured"
+                )
+            if self.lpips_torch_home is not None and self.lpips_trunk_path is None:
+                trunk_name = {
+                    "alex": "alexnet-owt-7be5be79.pth",
+                    "vgg": "vgg16-397923af.pth",
+                }.get(self.lpips_net)
+                if trunk_name is not None:
+                    trunk = os.path.join(
+                        self.lpips_torch_home,
+                        "hub",
+                        "checkpoints",
+                        trunk_name,
+                    )
+                    if not os.path.isfile(trunk):
+                        raise ValueError(
+                            f"LPIPS trunk missing for net={self.lpips_net!r}: {trunk}. "
+                            "Set loss.lpips_trunk_path or install it under "
+                            "loss.lpips_torch_home/hub/checkpoints/."
+                        )
+
+        if self.ref_dino_weight > 0 and self.dino_backend == "torch_hub":
+            hubconf = (
+                os.path.join(self.dino_repo_path, "hubconf.py")
+                if self.dino_repo_path is not None
+                else None
+            )
+            if hubconf is None or not os.path.isfile(hubconf):
+                raise ValueError(
+                    f"dino_repo_path is not a local torch-hub repo: {self.dino_repo_path}"
+                )
+            if self.dino_checkpoint_path is None or not os.path.isfile(
+                self.dino_checkpoint_path
+            ):
+                raise ValueError(
+                    f"dino_checkpoint_path not found: {self.dino_checkpoint_path}"
+                )
+        return self
+
+
+# ----------------------------
+# OPD distillation
+# ----------------------------
+
+
+class PluginConfig(BaseModel):
+    """Import path and constructor arguments for a replaceable OPD component."""
+
+    model_config = ConfigDict(extra="forbid")
+    class_path: str
+    init_args: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("class_path")
+    @classmethod
+    def _check_class_path(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("plugin class_path must be non-empty")
+        return value
+
+
+class OPDGuidanceConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["none", "reference_cfg", "text_cfg"] = "none"
+    scale: float = 1.0
+    prompt_mode: Literal["batch", "empty"] = "batch"
+
+    @field_validator("scale")
+    @classmethod
+    def _check_scale(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 1:
+            raise ValueError("OPD guidance scale must be finite and >= 1")
+        return value
+
+    @model_validator(mode="after")
+    def _check_unguided_scale(self):
+        if self.mode == "none" and self.scale != 1:
+            raise ValueError("OPD guidance mode='none' requires scale=1")
+        return self
+
+
+class OPDTeacherConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
+    route_categories: List[str]
+    lora: Optional[LoraConfig] = None
+    mask_geometry_pretrained_weight: Optional[str] = None
+    weight: float = 1.0
+    guidance: OPDGuidanceConfig = Field(default_factory=OPDGuidanceConfig)
+    policy: Optional[PluginConfig] = None
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("OPD teacher name must be non-empty")
+        return value
+
+    @field_validator("route_categories")
+    @classmethod
+    def _check_route_categories(cls, values: List[str]) -> List[str]:
+        if not values:
+            raise ValueError("OPD teacher route_categories must be non-empty")
+
+        normalized = []
+        for value in values:
+            value = value.strip()
+            if not value:
+                raise ValueError("OPD teacher route_categories cannot contain empty values")
+            if value in normalized:
+                raise ValueError("OPD teacher route_categories must contain unique values")
+            normalized.append(value)
+        return normalized
+
+    @field_validator("mask_geometry_pretrained_weight")
+    @classmethod
+    def _check_mask_geometry_weight(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = _normalize_path(value)
+        if not os.path.isfile(value):
+            raise ValueError(f"mask geometry pretrained weight not found: {value}")
+        return value
+
+    @field_validator("weight")
+    @classmethod
+    def _check_weight(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("OPD teacher weight must be finite and > 0")
+        return value
+
+
+class OPDRolloutConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    num_inference_steps: int = 28
+    timestep_fraction: float = 1.0
+    store_device: Literal["cpu", "cuda"] = "cpu"
+    seed: int = 0
+
+    @field_validator("num_inference_steps")
+    @classmethod
+    def _check_num_inference_steps(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("OPD rollout num_inference_steps must be > 0")
+        return value
+
+    @field_validator("timestep_fraction")
+    @classmethod
+    def _check_timestep_fraction(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0 or value > 1:
+            raise ValueError("OPD rollout timestep_fraction must be finite and in (0, 1]")
+        return value
+
+
+class DistillationConfig(BaseModel):
+    """Declarative OPD composition; concrete components are imported at runtime."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    algorithm: PluginConfig = Field(
+        default_factory=lambda: PluginConfig(class_path="src.distillation.opd.QwenImageEditOPDStrategy")
+    )
+    objective: PluginConfig = Field(
+        default_factory=lambda: PluginConfig(class_path="src.distillation.objectives.VelocityMatchingObjective")
+    )
+    teacher_backend: PluginConfig = Field(
+        default_factory=lambda: PluginConfig(class_path="src.distillation.backends.SharedLoRATeacherBackend")
+    )
+    rollout: OPDRolloutConfig = Field(default_factory=OPDRolloutConfig)
+    student_guidance: OPDGuidanceConfig = Field(default_factory=OPDGuidanceConfig)
+    teachers: List[OPDTeacherConfig] = Field(default_factory=list)
+    fallback_teacher: Optional[str] = None
+    balance_tasks: bool = True
+
+    @field_validator("fallback_teacher")
+    @classmethod
+    def _check_fallback_teacher(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("fallback_teacher must be a non-empty teacher name")
+        return value
+
+    @model_validator(mode="after")
+    def _check_enabled_teacher_graph(self):
+        if not self.enabled:
+            return self
+        if not self.teachers:
+            raise ValueError("enabled OPD distillation requires at least one teacher")
+
+        teacher_names = set()
+        adapter_names = set()
+        routed_categories: Dict[str, str] = {}
+        shared_lora_backend = self.teacher_backend.class_path == "src.distillation.backends.SharedLoRATeacherBackend"
+        independent_backend = self.teacher_backend.class_path == "src.distillation.backends.IndependentTeacherBackend"
+        for teacher in self.teachers:
+            if teacher.name in teacher_names:
+                raise ValueError(f"duplicate OPD teacher name: {teacher.name}")
+            teacher_names.add(teacher.name)
+
+            if shared_lora_backend and teacher.lora is None:
+                raise ValueError(f"OPD teacher {teacher.name!r} requires lora when using SharedLoRATeacherBackend")
+            if shared_lora_backend and teacher.policy is not None:
+                raise ValueError(
+                    f"OPD teacher {teacher.name!r} cannot use policy with "
+                    "SharedLoRATeacherBackend; select IndependentTeacherBackend"
+                )
+            if independent_backend and teacher.policy is None:
+                raise ValueError(
+                    f"OPD teacher {teacher.name!r} requires policy when using IndependentTeacherBackend"
+                )
+
+            if teacher.lora is not None:
+                adapter_name = teacher.lora.adapter_name.strip()
+                if not adapter_name:
+                    raise ValueError(f"OPD teacher {teacher.name!r} must use a non-empty LoRA adapter_name")
+                if adapter_name in adapter_names:
+                    raise ValueError(f"duplicate OPD teacher LoRA adapter_name: {adapter_name}")
+                adapter_names.add(adapter_name)
+
+                checkpoint = teacher.lora.pretrained_weight
+                if shared_lora_backend and not checkpoint:
+                    raise ValueError(f"OPD teacher {teacher.name!r} requires lora.pretrained_weight")
+
+            for category in teacher.route_categories:
+                owner = routed_categories.get(category)
+                if owner is not None:
+                    raise ValueError(
+                        f"OPD route category {category!r} is assigned to both {owner!r} and {teacher.name!r}"
+                    )
+                routed_categories[category] = teacher.name
+
+        if self.fallback_teacher is not None and self.fallback_teacher not in teacher_names:
+            raise ValueError(f"fallback_teacher {self.fallback_teacher!r} does not name a configured teacher")
+        return self
 
 
 # ----------------------------
@@ -937,6 +1587,7 @@ class Config(BaseModel):
     train: TrainConfig = Field(default_factory=TrainConfig)
     predict: PredictConfig = Field(default_factory=PredictConfig)
     loss: LossConfig = Field(default_factory=LossConfig)
+    distillation: DistillationConfig = Field(default_factory=DistillationConfig)
 
     @computed_field  # type: ignore[prop-declared]
     @property
@@ -990,6 +1641,66 @@ class Config(BaseModel):
         self.train.train_batch_size = self.data.batch_size
         if self.quantization_type in {"pretrain_fp4", "pretrain_fp8", "pretrain_fp16"}:
             self.model.quantize = False
+        if (
+            self.model.mask_control.enabled
+            and self.model.mask_control.encoding == "geometry_tokenizer"
+            and self.trainer != TrainerKind.QwenImageEditInsertAnything
+        ):
+            raise ValueError(
+                "mask_control.encoding=geometry_tokenizer is only implemented for "
+                "trainer=QwenImageEditInsertAnything"
+            )
+
+        if self.distillation.enabled:
+            built_in_strategy = (
+                self.distillation.algorithm.class_path == "src.distillation.opd.QwenImageEditOPDStrategy"
+            )
+            if built_in_strategy and self.trainer != TrainerKind.QwenImageEditInsertAnything:
+                raise ValueError(
+                    "QwenImageEditOPDStrategy requires trainer=QwenImageEditInsertAnything "
+                    "so stage='opd' cannot encode the ground-truth target latent"
+                )
+
+            shared_lora_backend = (
+                self.distillation.teacher_backend.class_path
+                == "src.distillation.backends.SharedLoRATeacherBackend"
+            )
+            if shared_lora_backend:
+                student_adapter = self.model.lora.adapter_name
+                collisions = [
+                    teacher.name
+                    for teacher in self.distillation.teachers
+                    if teacher.lora is not None and teacher.lora.adapter_name == student_adapter
+                ]
+                if collisions:
+                    raise ValueError(
+                        f"OPD Teacher adapters {collisions} reuse Student adapter name {student_adapter!r}"
+                    )
+
+                geometry_enabled = (
+                    self.model.mask_control.enabled
+                    and self.model.mask_control.encoding == "geometry_tokenizer"
+                )
+                if geometry_enabled:
+                    missing_companions = []
+                    for teacher in self.distillation.teachers:
+                        companion = teacher.mask_geometry_pretrained_weight
+                        if companion is None and teacher.lora is not None:
+                            lora_weight = teacher.lora.pretrained_weight
+                            if lora_weight:
+                                weight_dir = lora_weight if os.path.isdir(lora_weight) else os.path.dirname(lora_weight)
+                                candidate = os.path.join(weight_dir, "mask_geometry_tokenizer.safetensors")
+                                if os.path.isfile(candidate):
+                                    companion = candidate
+                        if companion is None:
+                            missing_companions.append(teacher.name)
+                    if missing_companions:
+                        raise ValueError(
+                            "geometry-tokenized SharedLoRA OPD requires each Teacher checkpoint "
+                            "to include mask_geometry_tokenizer.safetensors (or set "
+                            "mask_geometry_pretrained_weight); missing for "
+                            f"{missing_companions}"
+                        )
         return self
 
 
@@ -998,9 +1709,13 @@ class Config(BaseModel):
 # ----------------------------
 
 
-def load_config_from_yaml(yaml_path: str) -> Config:
+def load_config_from_yaml(yaml_path: str, *, for_inference: bool = False) -> Config:
     """
-    从 YAML 文件加载配置并验证
+    从 YAML 文件加载配置并验证。
+
+    ``distillation`` is a training-only dependency graph.  Inference callers
+    may opt into ``for_inference`` so a portable Student config does not try to
+    validate or import moved Teacher checkpoint paths.
     """
     if not os.path.exists(yaml_path):
         raise FileNotFoundError(f"Configuration file not found: {yaml_path}")
@@ -1011,6 +1726,11 @@ def load_config_from_yaml(yaml_path: str) -> Config:
         raise RuntimeError(f"Error loading YAML file {yaml_path}: {e}") from e
 
     data = OmegaConf.to_container(yaml_config, resolve=True) or {}
+
+    if for_inference and isinstance(data, dict):
+        distillation = data.get("distillation")
+        if isinstance(distillation, dict) and bool(distillation.get("enabled", False)):
+            data["distillation"] = {"enabled": False}
 
     # 直接一次性校验嵌套结构
     # 若希望保持你之前对 lora/rank 的手动对齐，这里已在 ModelConfig 的 model_validator 中处理

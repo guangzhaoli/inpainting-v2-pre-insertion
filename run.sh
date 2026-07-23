@@ -38,6 +38,7 @@ require_file "ACCELERATE_CONFIG" "${ACCELERATE_CONFIG}"
 
 export PYTHONPATH="${SCRIPT_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+export QWEN_INPAINTING_OPENCV_THREADS="${QWEN_INPAINTING_OPENCV_THREADS:-1}"
 
 echo "=================================================="
 echo "Launching training from: ${SCRIPT_DIR}"
@@ -51,6 +52,7 @@ echo "TOTAL_PROCESSES: ${TOTAL_PROCESSES}"
 echo "MAIN_PROCESS_IP: ${MAIN_PROCESS_IP}"
 echo "MAIN_PROCESS_PORT: ${MAIN_PROCESS_PORT}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
+echo "QWEN_INPAINTING_OPENCV_THREADS: ${QWEN_INPAINTING_OPENCV_THREADS}"
 echo "CORE_DUMP_LIMIT: $(ulimit -c)"
 echo "=================================================="
 

@@ -4,9 +4,15 @@ Defines the core interface that all trainers must implement.
 """
 
 from accelerate import Accelerator
-from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs, ProjectConfiguration
+from accelerate.utils import (
+    DataLoaderConfiguration,
+    DistributedDataParallelKwargs,
+    ProjectConfiguration,
+    broadcast_object_list,
+)
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Dict, Optional, Tuple
 import math
 import re
@@ -17,7 +23,7 @@ import time
 import torch
 import torch.nn as nn
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy  # transformer_auto_wrap_policy
-from torch.distributed.fsdp import ShardingStrategy, BackwardPrefetch
+from torch.distributed.fsdp import ShardingStrategy
 import os
 import glob
 import json
@@ -41,6 +47,12 @@ from src.utils.model_summary import print_model_summary_table
 from src.utils.lora_utils import FpsLogger
 from src.utils.tools import get_git_info
 from src.utils.tools import instantiate_class
+from src.utils.inference_metadata import (
+    CHECKPOINT_ARTIFACT_MANIFEST_VERSION,
+    MASK_GEOMETRY_COMPANION_FILE_NAME,
+    validate_checkpoint_artifacts,
+    validate_resume_mask_control_compatibility,
+)
 from src.scheduler.custom_flowmatch_scheduler import FlowMatchEulerDiscreteScheduler
 from src.utils.lora_utils import classify_lora_weight, filter_lora_state_keys
 from src.trainer.constants import LORA_FILE_BASE_NAME
@@ -53,6 +65,11 @@ TRAIN_STATE_FILE_NAME = "state.json"
 RANDOM_STATE_FILE_TEMPLATE = "random_states_{process_index}.pkl"
 CHECKPOINT_TYPE_LORA_ONLY = "lora_only"
 PEFT_LORA_FILE_NAME = "model.safetensors"
+CHECKPOINT_ARTIFACT_ROLES = {
+    PEFT_LORA_FILE_NAME: "lora_peft",
+    LORA_FILE_BASE_NAME: "lora_diffusers",
+    MASK_GEOMETRY_COMPANION_FILE_NAME: "mask_geometry_tokenizer",
+}
 PEFT_LORA_PARAMETER_PREFIXES = (
     "lora_A",
     "lora_B",
@@ -106,6 +123,7 @@ class BaseTrainer(ABC):
         self.quantize = self.config.model.quantize
         self.adapter_name = self.config.model.lora.adapter_name
         self.predict_setted = False
+        self.training_strategy = None
 
         # 为save_last_checkpoint功能添加属性
         self.training_interrupted = False
@@ -182,8 +200,9 @@ class BaseTrainer(ABC):
         """Log model information."""
         logger.info(f"Batch Size: {self.batch_size}")
 
-    def setup_versioned_logging_dir(self):
-        """设置版本化的日志目录"""
+    def _logging_project_dir(self) -> str:
+        """Return the unversioned directory shared by all runs of a project."""
+
         base_output_dir = self.config.logging.output_dir
         project_name = self.config.logging.tracker_project_name
         if not project_name:
@@ -198,31 +217,61 @@ class BaseTrainer(ABC):
             project_dir = base_output_dir
         else:
             project_dir = os.path.join(base_output_dir, project_name)
+        return project_dir
 
-        # 如果项目目录不存在，直接使用 v0
-        if not os.path.exists(project_dir):
-            versioned_dir = os.path.join(project_dir, "v0")
-            self.config.logging.output_dir = versioned_dir
-            logging.info(f"创建新的训练版本目录: {versioned_dir}")
-            return
+    def setup_versioned_logging_dir(self) -> str:
+        """Atomically reserve and return a new versioned logging directory.
 
-        # 查找现有版本
+        This method must only run on the global main process.  ``os.mkdir`` is
+        the cross-process reservation: concurrent jobs may initially select the
+        same version number, but only one can create it and the others retry the
+        next number.
+        """
+
+        project_dir = self._logging_project_dir()
+        os.makedirs(project_dir, exist_ok=True)
+
         existing_versions = []
         for item in os.listdir(project_dir):
             item_path = os.path.join(project_dir, item)
             if os.path.isdir(item_path) and item.startswith("v") and item[1:].isdigit():
                 version_num = int(item[1:])
-                existing_versions.append((version_num, item_path))
+                existing_versions.append(version_num)
 
         if existing_versions:
-            next_version = max(version_num for version_num, _ in existing_versions) + 1
+            next_version = max(existing_versions) + 1
         else:
             next_version = 0
 
-        # 创建新版本目录
-        versioned_dir = os.path.join(project_dir, f"v{next_version}")
+        while True:
+            versioned_dir = os.path.join(project_dir, f"v{next_version}")
+            try:
+                os.mkdir(versioned_dir)
+            except FileExistsError:
+                next_version += 1
+                continue
+            break
+
         self.config.logging.output_dir = versioned_dir
-        logging.info(f"使用训练版本目录: {versioned_dir}")
+        logging.info(f"已预留训练版本目录: {versioned_dir}")
+        return versioned_dir
+
+    def _synchronize_versioned_logging_dir(self) -> str:
+        """Reserve one run directory and broadcast it to every worker."""
+
+        selected_dir = [None]
+        if self.accelerator.is_main_process:
+            selected_dir[0] = self.setup_versioned_logging_dir()
+        broadcast_object_list(selected_dir, from_process=0)
+
+        versioned_dir = selected_dir[0]
+        if not isinstance(versioned_dir, str) or not versioned_dir:
+            raise RuntimeError("Failed to synchronize the versioned logging directory")
+
+        self.config.logging.output_dir = versioned_dir
+        self.accelerator.project_configuration.project_dir = versioned_dir
+        self.accelerator.project_configuration.logging_dir = versioned_dir
+        return versioned_dir
 
     def accelerator_prepare(self, train_dataloader):
         """Prepare accelerator"""
@@ -234,6 +283,11 @@ class BaseTrainer(ABC):
 
         plug = getattr(self.accelerator.state, "fsdp_plugin", None)
         if plug is not None:
+            if getattr(self.dit, "mask_geometry_tokenizer", None) is not None:
+                raise NotImplementedError(
+                    "mask_control.encoding=geometry_tokenizer does not support FSDP checkpointing yet; "
+                    "use the project's MULTI_GPU/DDP accelerate configuration"
+                )
             from torch.distributed.fsdp import BackwardPrefetch, MixedPrecision
 
             # torch.backends.cuda.enable_flash_sdp(False)
@@ -341,6 +395,38 @@ class BaseTrainer(ABC):
         embeddings = self.prepare_embeddings(batch, stage="fit")
         return self._compute_loss(embeddings)
 
+    def setup_training_strategy(self):
+        """Instantiate and initialize an optional pluggable training strategy."""
+
+        distillation = getattr(self.config, "distillation", None)
+        if distillation is None or not distillation.enabled:
+            self.training_strategy = None
+            return
+
+        class_path = distillation.algorithm.class_path
+        module_name, class_name = class_path.rsplit(".", 1)
+        strategy_class = getattr(importlib.import_module(module_name), class_name)
+        self.training_strategy = strategy_class(
+            distillation,
+            **dict(distillation.algorithm.init_args),
+        )
+        self.training_strategy.setup(self)
+
+    def backward_training_step(self, batch: dict) -> torch.Tensor:
+        """Backpropagate one batch and return its detached scalar logging loss.
+
+        Ordinary supervised training owns one graph and one backward call. OPD
+        backpropagates a sequence of timestep micro-losses immediately so it
+        never retains an entire Qwen rollout graph in memory.
+        """
+
+        if self.training_strategy is not None:
+            return self.training_strategy.backward_step(self, batch)
+
+        loss = self.training_step(batch)
+        self.accelerator.backward(loss)
+        return loss.detach()
+
     @abstractmethod
     def _compute_loss(self, embeddings: dict) -> torch.Tensor:
         """Compute loss. returned the flow matching loss tensor"""
@@ -367,6 +453,8 @@ class BaseTrainer(ABC):
         self.batch_in_epoch = skip_batches
         accumulated_loss_sum = None
         accumulated_loss_count = None
+        accumulated_metric_sums = None
+        accumulated_metric_count = None
         optimizer_step_start_time = None
         if skip_batches > 0:
             logging.info(f"Resuming epoch {epoch}, skipping {skip_batches} already-consumed batches.")
@@ -391,7 +479,8 @@ class BaseTrainer(ABC):
                 optimizer_step_start_time = time.perf_counter()
 
             with self.accelerator.accumulate(self.dit):
-                loss = self.training_step(batch)
+                self._step_loss_metrics = None
+                loss = self.backward_training_step(batch)
                 loss_for_logging = loss.detach().float()
                 if loss_for_logging.ndim != 0:
                     loss_for_logging = loss_for_logging.mean()
@@ -400,11 +489,32 @@ class BaseTrainer(ABC):
                     accumulated_loss_count = torch.zeros_like(loss_for_logging)
                 accumulated_loss_sum = accumulated_loss_sum + loss_for_logging
                 accumulated_loss_count = accumulated_loss_count + torch.ones_like(loss_for_logging)
+
+                step_metrics = getattr(self, "_step_loss_metrics", None) or {}
+                if step_metrics:
+                    if accumulated_metric_sums is None:
+                        accumulated_metric_sums = {
+                            key: torch.zeros((), device=loss_for_logging.device, dtype=torch.float32)
+                            for key in step_metrics
+                        }
+                        accumulated_metric_count = torch.zeros(
+                            (), device=loss_for_logging.device, dtype=torch.float32
+                        )
+                    for key, value in step_metrics.items():
+                        metric = value.detach().float().reshape(())
+                        if key not in accumulated_metric_sums:
+                            accumulated_metric_sums[key] = torch.zeros(
+                                (), device=loss_for_logging.device, dtype=torch.float32
+                            )
+                        accumulated_metric_sums[key] = accumulated_metric_sums[key] + metric
+                    accumulated_metric_count = accumulated_metric_count + torch.ones(
+                        (), device=loss_for_logging.device, dtype=torch.float32
+                    )
+
                 self.fps_logger.update(
                     batch_size=self.batch_size * self.accelerator.num_processes,
                     num_tokens=None,
                 )
-                self.accelerator.backward(loss)
                 grad_norm = self.clip_gradients()
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -421,6 +531,20 @@ class BaseTrainer(ABC):
                 accumulated_loss_sum = None
                 accumulated_loss_count = None
                 self.running_loss = 0.9 * self.running_loss + 0.1 * self.train_loss
+
+                # Average optional loss breakdowns across micro-batches and ranks.
+                self.train_loss_metrics = {}
+                if accumulated_metric_sums is not None and accumulated_metric_count is not None:
+                    gathered_metric_count = self.accelerator.gather(accumulated_metric_count).sum()
+                    if gathered_metric_count.item() > 0:
+                        for key, metric_sum in accumulated_metric_sums.items():
+                            gathered_metric_sum = self.accelerator.gather(metric_sum).sum()
+                            self.train_loss_metrics[key] = (
+                                gathered_metric_sum / gathered_metric_count
+                            ).item()
+                accumulated_metric_sums = None
+                accumulated_metric_count = None
+
                 self.update_progressbar(
                     logs=self.build_training_logs(
                         epoch=epoch,
@@ -480,6 +604,7 @@ class BaseTrainer(ABC):
         last_fps = float(self.fps_logger.last_fps())
         logs = {
             # Backward-compatible names used by the existing progress bar and old TB views.
+            # Progress bar only displays total loss (see update_progressbar).
             "loss": float(self.train_loss),
             "smooth_loss": float(self.running_loss),
             "lr": lr,
@@ -498,11 +623,16 @@ class BaseTrainer(ABC):
             "perf/samples_seen": int(self.fps_logger.global_samples),
             "perf/optimizer_step_time_sec": float(optimizer_step_time_sec),
         }
+        # Optional loss breakdown for TensorBoard (region perceptual, etc.).
+        for key, value in getattr(self, "train_loss_metrics", {}).items():
+            logs[key] = float(value)
         if grad_norm is not None:
             logs["optim/grad_norm"] = float(grad_norm)
         for index, group_lr in enumerate(lr_values):
             logs[f"optim/lr_group_{index}"] = float(group_lr)
         logs.update(self.cuda_memory_logs())
+        if self.training_strategy is not None:
+            logs.update(self.training_strategy.consume_metrics(self.accelerator))
         return logs
 
     def cuda_memory_logs(self) -> dict:
@@ -560,6 +690,8 @@ class BaseTrainer(ABC):
     def setup_progressbar(self):
         self.train_loss = 0.0
         self.running_loss = 0.0
+        self.train_loss_metrics = {}
+        self._step_loss_metrics = None
         self.progress_bar = tqdm(
             range(self.global_step, self.effective_max_train_steps),
             desc="fit",
@@ -567,8 +699,10 @@ class BaseTrainer(ABC):
         )
 
     def update_progressbar(self, logs: dict):
+        # Full dict (including optional loss breakdowns) goes to TensorBoard / trackers.
         self.accelerator.log(logs, step=self.global_step)
-        logs = {
+        # Progress bar keeps only total loss (+ light runtime info).
+        postfix = {
             "loss": f"{logs['loss']:.3f}",
             "smooth_loss": f"{logs['smooth_loss']:.3f}",
             "lr": f"{logs['lr']:.1e}",
@@ -577,7 +711,7 @@ class BaseTrainer(ABC):
         }
         self.progress_bar.update(1)
         self.global_step += 1
-        self.progress_bar.set_postfix(logs)
+        self.progress_bar.set_postfix(postfix)
 
     def fit(self, train_dataloader):
         """Main training loop implementation."""
@@ -595,6 +729,11 @@ class BaseTrainer(ABC):
             )
         self.__class__.load_pretrain_lora_model(self.dit, self.config, self.adapter_name)
         self.load_additional_modules(stage="fit")
+        distillation = getattr(self.config, "distillation", None)
+        if distillation is not None and bool(getattr(distillation, "enabled", False)):
+            # Teacher adapters and companion modules must exist before optimizer
+            # construction and distributed wrapping.
+            self.setup_training_strategy()
 
         self.setup_model_device_train_mode(stage="fit")
         self.load_resume_progress()
@@ -638,6 +777,49 @@ class BaseTrainer(ABC):
         else:
             self.criterion = nn.MSELoss()
         self.criterion.to(self.accelerator.device)
+
+        self.region_perceptual_criterion = None
+        if getattr(self.config.loss, "region_perceptual", False):
+            from src.loss.region_perceptual_loss import RegionPerceptualLoss
+
+            # Load DINO only when the identity term is actually used (weight > 0).
+            enable_ref_dino = float(getattr(self.config.loss, "ref_dino_weight", 0.0)) > 0.0
+            self.region_perceptual_criterion = RegionPerceptualLoss(
+                fg_metric=self.config.loss.fg_metric,
+                lpips_net=self.config.loss.lpips_net,
+                lpips_input_size=self.config.loss.lpips_input_size,
+                lpips_bbox_pad_ratio=self.config.loss.lpips_bbox_pad_ratio,
+                mask_threshold=self.config.loss.mask_threshold,
+                lpips_linear_path=getattr(self.config.loss, "lpips_linear_path", None),
+                lpips_torch_home=getattr(self.config.loss, "lpips_torch_home", None),
+                lpips_trunk_path=getattr(self.config.loss, "lpips_trunk_path", None),
+                enable_ref_dino=enable_ref_dino,
+                dino_backend=getattr(self.config.loss, "dino_backend", "transformers"),
+                dino_model_name=self.config.loss.dino_model_name,
+                dino_repo_path=getattr(self.config.loss, "dino_repo_path", None),
+                dino_checkpoint_path=getattr(self.config.loss, "dino_checkpoint_path", None),
+                dino_input_size=self.config.loss.dino_input_size,
+                dino_bbox_pad_ratio=self.config.loss.dino_bbox_pad_ratio,
+            )
+            self.region_perceptual_criterion.to(self.accelerator.device)
+            self.region_perceptual_criterion.eval()
+            logging.info(
+                "Region-perceptual enabled: net=%s crop=%s linear=%s torch_home=%s trunk=%s "
+                "w(t)=(1-sigma)^%s max_sigma=%s ref_dino_weight=%s",
+                self.config.loss.lpips_net,
+                self.config.loss.lpips_input_size,
+                getattr(self.config.loss, "lpips_linear_path", None),
+                getattr(self.config.loss, "lpips_torch_home", None),
+                getattr(self.config.loss, "lpips_trunk_path", None),
+                self.config.loss.region_sigma_power,
+                self.config.loss.region_max_sigma,
+                self.config.loss.ref_dino_weight,
+            )
+            if enable_ref_dino:
+                logging.info(
+                    "Region-perceptual ref DINO identity enabled: model=%s",
+                    self.config.loss.dino_model_name,
+                )
 
     def setup_predict(
         self,
@@ -753,14 +935,13 @@ class BaseTrainer(ABC):
 
     def setup_accelerator(self):
         """Initialize accelerator and logging configuration"""
-        # Setup versioned logging directory
-        self.setup_versioned_logging_dir()
-
-        # Set logging_dir to the versioned output directory directly
-        # Use project_dir as logging_dir to avoid extra subdirectory creation
+        # Initialize the process group before allocating a run directory.  The
+        # global main process will reserve one directory atomically and then
+        # broadcast it to all workers before tracker initialization.
+        project_dir = self._logging_project_dir()
         accelerator_project_config = ProjectConfiguration(
-            project_dir=self.config.logging.output_dir,
-            logging_dir=self.config.logging.output_dir,
+            project_dir=project_dir,
+            logging_dir=project_dir,
         )
 
         self.accelerator = Accelerator(
@@ -773,6 +954,8 @@ class BaseTrainer(ABC):
                 non_blocking=self.config.data.non_blocking,
             ),
         )
+
+        self._synchronize_versioned_logging_dir()
 
         # Initialize tracker with empty project name to avoid subdirectory
         if self.config.logging.report_to == "tensorboard":
@@ -798,11 +981,27 @@ class BaseTrainer(ABC):
         # Set weight data type
         self.weight_dtype = self._resolve_weight_dtype(self.accelerator.mixed_precision)
 
-        # Create output directory
-        if self.accelerator.is_main_process and self.config.logging.output_dir is not None:
-            os.makedirs(self.config.logging.output_dir, exist_ok=True)
-
         logging.info(f"Mixed precision: {self.accelerator.mixed_precision}")
+
+    @staticmethod
+    def _build_checkpoint_artifact_manifest(checkpoint_dir: str) -> dict:
+        files = []
+        for filename, role in CHECKPOINT_ARTIFACT_ROLES.items():
+            artifact_path = os.path.join(checkpoint_dir, filename)
+            if not os.path.isfile(artifact_path):
+                continue
+            files.append(
+                {
+                    "role": role,
+                    "filename": filename,
+                    "size_bytes": int(os.path.getsize(artifact_path)),
+                    "sha256": calculate_sha256_file(artifact_path),
+                }
+            )
+        return {
+            "version": CHECKPOINT_ARTIFACT_MANIFEST_VERSION,
+            "files": files,
+        }
 
     def save_checkpoint(self, epoch, global_step, is_last=False):
         """Save checkpoint"""
@@ -852,6 +1051,7 @@ class BaseTrainer(ABC):
                 "num_processes": self.accelerator.num_processes,
                 "random_state_pattern": RANDOM_STATE_FILE_TEMPLATE,
                 "train_config": "train_config.yaml",
+                "artifacts": self._build_checkpoint_artifact_manifest(save_path),
             }
             if is_last:
                 git_info = get_git_info()
@@ -912,7 +1112,22 @@ class BaseTrainer(ABC):
         if not os.path.isdir(checkpoint_dir):
             raise FileNotFoundError(f"Resume checkpoint directory not found: {checkpoint_dir}")
         train_state = self._load_train_state(checkpoint_dir)
-        self._resolve_resume_lora_weight(checkpoint_dir)
+        lora_weight = Path(self._resolve_resume_lora_weight(checkpoint_dir))
+        validate_resume_mask_control_compatibility(
+            self.config,
+            Path(checkpoint_dir),
+        )
+        artifact_verification = validate_checkpoint_artifacts(
+            self.config,
+            lora_weight,
+            allow_mismatch=False,
+        )
+        if not artifact_verification["verified"]:
+            logging.warning(
+                "Resume checkpoint predates artifact hashes; LoRA and geometry "
+                "companion integrity is unverified: %s",
+                checkpoint_dir,
+            )
         saved_num_processes = train_state.get("num_processes")
         if (
             saved_num_processes is not None
@@ -1104,7 +1319,11 @@ class BaseTrainer(ABC):
             if os.path.exists(path):
                 return path
 
-        model_files = sorted(glob.glob(os.path.join(resume_dir, "*.safetensors")))
+        model_files = [
+            path
+            for path in sorted(glob.glob(os.path.join(resume_dir, "*.safetensors")))
+            if os.path.basename(path) != MASK_GEOMETRY_COMPANION_FILE_NAME
+        ]
         if len(model_files) == 1:
             return model_files[0]
         if len(model_files) > 1:
@@ -1118,6 +1337,7 @@ class BaseTrainer(ABC):
         model = quantize_model_to_fp8(
             model,
             engine="bnb",
+            skip_modules=["mask_geometry_tokenizer"],
             verbose=True,
             device=device,
         )
@@ -1169,6 +1389,16 @@ class BaseTrainer(ABC):
                 deduped.append(candidate)
                 seen.add(candidate)
         return deduped
+
+    @staticmethod
+    def _is_lora_key_for_adapter(key: str, adapter_name: str) -> bool:
+        """Return whether a PEFT state key belongs to one exact adapter."""
+
+        wrapped = f".{key}."
+        return any(
+            f".{prefix}.{adapter_name}." in wrapped
+            for prefix in PEFT_LORA_PARAMETER_PREFIXES
+        )
 
     @classmethod
     def _normalize_peft_lora_state_dict(
@@ -1231,7 +1461,15 @@ class BaseTrainer(ABC):
                 f"Unexpected LoRA keys while loading PEFT weights for stage={stage}: "
                 f"{len(unexpected)}, first_unexpected={unexpected[0]}"
             )
-        missing_lora_keys = filter_lora_state_keys(missing)
+        # A shared OPD backbone already contains the Student and any Teachers
+        # loaded earlier. ``load_state_dict(strict=False)`` reports all of those
+        # unrelated adapter keys as missing. Only the adapter being loaded is a
+        # completeness error.
+        missing_lora_keys = [
+            key
+            for key in filter_lora_state_keys(missing)
+            if cls._is_lora_key_for_adapter(key, adapter_name)
+        ]
         if len(missing_lora_keys) > 0:
             raise ValueError(
                 f"Missing LoRA keys while loading PEFT weights for stage={stage}: "

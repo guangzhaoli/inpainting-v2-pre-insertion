@@ -1,0 +1,204 @@
+# Final architecture for general_object (others).
+# Domain-specific final architecture config (same knobs as final_architecture.yaml).
+#
+# Final architecture proposal:
+#
+#   reference CFG + adaptive crop
+#   + MaskMix-v2 (training-only condition-mask augmentation)
+#   + geometric-mask tokenizer (token conditioning from the same condition mask)
+#   + region-balanced latent mask loss
+#   + region-perceptual pixel loss (foreground LPIPS + background L1)
+#
+# The GT tar_mask remains the loss/compositing mask.  MaskMix-v2 only produces
+# tar_mask_cond/source_hole_mask, so the augmented condition cannot leak target
+# pixels into the supervision or region-perceptual terms.
+
+trainer: QwenImageEditInsertAnything
+
+model:
+  pretrained_model_name_or_path: "/inspire/hdd/global_user/250041225002/project/model/qwen-image-edit-2511"
+  quantize: false
+  mask_control:
+    enabled: true
+    encoding: "geometry_tokenizer"
+    sigma_px: 16.0
+    mask_threshold: 0.5
+    tokenizer_hidden_channels: 32
+  reference_cfg:
+    enabled: true
+    train_dropout_rate: 0.1
+    force_empty_prompt: true
+    mask_aware: false
+    delta_clip_enabled: false
+    delta_clip_max_ratio: 0.5
+  lora:
+    r: 256
+    lora_alpha: 256
+    target_modules:
+      [
+        "to_q",
+        "to_k",
+        "to_v",
+        "to_out.0",
+        "add_q_proj",
+        "add_k_proj",
+        "add_v_proj",
+        "to_add_out",
+        "img_mlp.net.0.proj",
+        "img_mlp.net.2",
+        "txt_mlp.net.0.proj",
+        "txt_mlp.net.2",
+      ]
+    init_lora_weights: "gaussian"
+    adapter_name: "final_architecture_maskmix_geometry_region_perceptual_r256_general_object"
+    pretrained_weight: null
+
+data:
+  class_path: "src.data.insert_anything_dataset.InsertAnythingDataset"
+  init_args:
+    dataset_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/a2edit/data"
+    manifest_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/inpainting-v2-final-architecture/manifests/insert_anything_teacher_general_object.csv"
+    categories:
+      - "others"
+    require_prompt: false
+    adaptive_crop:
+      train_enabled: true
+      predict_enabled: true
+      policy: "bbox_area_linear"
+      trigger_bbox_area_ratio: 0.10
+      min_crop_area_ratio: 0.25
+      context_margin_ratio: 0.20
+      mask_threshold: 0.5
+      min_crop_side: 16
+      aspect_mode: "target"
+      blend_mode: "strict_mask"
+    hybrid_masking:
+      enabled: true
+      strategy: "maskmix_v2"
+      person_categories:
+        - "person"
+      mask_threshold: 0.5
+      bbox_expand_ratio: 1.1
+      curve_jitter_px: 40
+      dilation_kernel_size: 7
+      dilation_iterations: 2
+      reference_resolution: 768
+      scale_pixel_parameters: true
+      ensure_gt_coverage: true
+      maskmix_v2:
+        mode_weights:
+          augmented_box: 0.10
+          asymmetric_box: 0.10
+          exact: 0.60
+          random_morphology: 0.20
+        asymmetric_box:
+          margin_ratio_min: 0.0
+          margin_ratio_max: 0.10
+        augmented_box:
+          jitter_object_scale_min: 0.05
+          jitter_object_scale_max: 0.20
+          jitter_min_px: 2
+          jitter_max_px: 64
+        morphology:
+          radius_object_scale_min: 0.02
+          radius_object_scale_max: 0.12
+          radius_min_px: 1
+          radius_max_px: 32
+          anisotropy_min: 1.5
+          anisotropy_max: 3.0
+          kernel_weights:
+            ellipse: 0.40
+            rectangle: 0.20
+            horizontal_ellipse: 0.20
+            vertical_ellipse: 0.20
+      context_guard:
+        enabled: true
+        max_condition_area_ratio: 0.80
+        overflow_policy: "fallback_to_gt"
+    processor:
+      class_path: "src.data.preprocess.ImageProcessor"
+      init_args:
+        process_type: "fixed_pixels"
+        target_pixels: 1048576
+        controls_pixels: [1048576, 1048576]
+        resize_mode: "bilinear"
+  # Adaptive crop + fixed_pixels + context guard require a valid-pixel denominator.
+  batch_size: 1
+  num_workers: 8
+  shuffle: true
+  drop_last: true
+
+logging:
+  output_dir: "logs/final_architecture"
+  tracker_project_name: "final_architecture_general_object"
+  report_to: "tensorboard"
+  sampling:
+    enable: false
+    validation_steps: 1000
+    num_samples: 4
+    seed: 42
+    num_inference_steps: 40
+    true_cfg_scale: 4.0
+    guidance_scale: 1.0
+    output_dir: "validation"
+    panel_size: 320
+    save_composite: true
+    validation_data: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/a2edit/eval/testset_20260120/corner_cases"
+
+optimizer:
+  class_path: "torch.optim.AdamW"
+  init_args:
+    lr: 1.0e-4
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    eps: 1.0e-8
+
+lr_scheduler:
+  scheduler_type: "cosine"
+  warmup_steps: 500
+
+train:
+  gradient_accumulation_steps: 1
+  max_train_steps: 100000000
+  num_epochs: 5
+  checkpointing_steps: 1000
+  checkpoints_total_limit: 20
+  max_grad_norm: 1.0
+  mixed_precision: "bf16"
+  gradient_checkpointing: true
+
+loss:
+  mask_loss: true
+  forground_weight: 3.0
+  background_weight: 1.0
+  mask_loss_mode: "region_balanced"
+  region_perceptual: true
+  latent_mse_weight: 1.0
+  fg_lpips_weight: 0.5
+  bg_l1_weight: 0.5
+  fg_metric: "lpips"
+  lpips_net: "vgg"
+  lpips_linear_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/pretrained_weights/lpips/linear/vgg.pth"
+  lpips_torch_home: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/pretrained_weights/torch"
+  lpips_trunk_path: "/inspire/hdd/global_user/250041225002/project/qwen-inpainting/pretrained_weights/torch/hub/checkpoints/vgg16-397923af.pth"
+  lpips_input_size: 256
+  lpips_bbox_pad_ratio: 0.1
+  mask_threshold: 0.5
+  region_sigma_power: 2.0
+  # Pixel-space supervision is unreliable at high noise and requires a full
+  # differentiable 1 MP VAE decode. Gating it there also skips that graph.
+  region_max_sigma: 0.5
+  # Keep the optional identity encoder off for the first run; enable it only
+  # after verifying a local DINO checkpoint and setting dino_backend/paths.
+  ref_dino_weight: 0.0
+  dino_model_name: "facebook/dinov2-small"
+  dino_input_size: 224
+  dino_bbox_pad_ratio: 0.1
+
+predict:
+  devices:
+    vae: "cuda:0"
+    text_encoder: "cuda:0"
+    dit: "cuda:0"
+
+resume: null

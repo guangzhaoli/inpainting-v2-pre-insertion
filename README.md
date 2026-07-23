@@ -49,6 +49,17 @@ Important paths:
 - `configs/teacher/accessory_jewelry.yaml`: accessory/jewelry teacher baseline.
 - `configs/exp/accessory/adaptive_crop_r256_fg3.yaml`: Adaptive Crop experiment (r256, fg:bg=3:1).
 - `configs/exp/accessory/hybrid_masking_r256_fg3.yaml`: Hybrid Masking experiment (r256, fg:bg=3:1).
+- `configs/exp/final_architecture.yaml`: integrated MaskMix-v2 + geometric mask +
+  region-balanced/region-perceptual + Adaptive Crop + reference-CFG proposal.
+
+See `docs/final_architecture.md` for the mask contract, loss composition,
+checkpoint companion and launch notes.
+
+Online policy distillation (OPD) is an optional second training phase. Train
+the domain-specific final-architecture experts first, then use
+`configs/opd/final_architecture_five_teacher.yaml.example` to route their LoRA
+checkpoints into one Student. The OPD workflow, geometry companion handling,
+and smoke checklist are documented in `docs/opd.md`.
 
 Each config exposes:
 
