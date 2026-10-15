@@ -23,6 +23,7 @@ from src.utils.hybrid_masking import (
     MASKMIX_V2_EXACT,
     MASKMIX_V2_RANDOM_MORPHOLOGY,
     apply_hybrid_masking_context_guard,
+    add_interaction_context,
     build_insert_anything_hybrid_masks,
 )
 from src.utils.latent_anchoring import (
@@ -234,9 +235,16 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
     def _use_reference_cfg(self) -> bool:
         return bool(self._reference_cfg_cfg().enabled)
 
-    def _hybrid_masking_cfg(self):
+    def _hybrid_masking_cfg(self, batch=None):
         data_cfg = getattr(self.config, "data", None)
         init_args = getattr(data_cfg, "init_args", None)
+        profiles = getattr(init_args, "category_conditioning", {})
+        if batch is not None and profiles:
+            categories = batch["category"]
+            category = categories if isinstance(categories, str) else categories[0]
+            profile = profiles.get(category)
+            if profile is not None and profile.hybrid_masking is not None:
+                return profile.hybrid_masking
         return getattr(init_args, "hybrid_masking", None)
 
     def _hybrid_masking_rng(self) -> random.Random:
@@ -443,24 +451,15 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
         return condition_mask
 
     def _build_condition_mask(self, batch: Dict, tar_mask: torch.Tensor, stage: str) -> torch.Tensor:
-        hybrid_cfg = self._hybrid_masking_cfg()
+        hybrid_cfg = self._hybrid_masking_cfg(batch)
         if stage == "opd":
             if batch.get("_opd_condition_mask_prepared", False):
                 condition_mask = batch.get("tar_mask_cond")
                 if condition_mask is None:
                     raise ValueError("prepared OPD batch is missing the shared tar_mask_cond")
-                if hybrid_cfg is not None and hybrid_cfg.enabled:
-                    return self._normalize_precomputed_condition_mask(
-                        condition_mask=condition_mask,
-                        tar_mask=tar_mask,
-                        hybrid_cfg=hybrid_cfg,
-                    )
-                if condition_mask.shape != tar_mask.shape:
-                    raise ValueError(
-                        "OPD tar_mask_cond must match tar_mask shape, got "
-                        f"{tuple(condition_mask.shape)} vs {tuple(tar_mask.shape)}"
-                    )
-                return condition_mask.to(device=tar_mask.device, dtype=tar_mask.dtype)
+                # prepare_opd_batch already normalized this mask, added the
+                # interaction context and applied the context guard once.
+                return condition_mask
             if hybrid_cfg is not None and hybrid_cfg.enabled:
                 raise RuntimeError(
                     "Hybrid Masking for OPD must be sampled once through "
@@ -489,6 +488,10 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 rng=self._hybrid_masking_rng(),
             )
 
+        condition_mask = add_interaction_context(
+            condition_mask, tar_mask,
+            getattr(hybrid_cfg, "interaction_dilation_px", 0), hybrid_cfg.mask_threshold,
+        )
         condition_mask, guard_metadata = apply_hybrid_masking_context_guard(
             condition_masks=condition_mask,
             gt_masks=tar_mask,
@@ -530,7 +533,11 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
 
         local_metrics = torch.cat(metric_buffer, dim=0)
         self._hybrid_masking_metric_buffer = []
-        gathered = self.accelerator.gather(local_metrics)
+        # Raw masks/augmentation statistics stay on CPU. NCCL needs CUDA
+        # inputs; return the small gathered table to CPU once for all logs.
+        gathered = self.accelerator.gather(
+            local_metrics.to(self.accelerator.device)
+        ).cpu()
         logs.update(
             {
                 "hybrid/gt_area_mean": float(gathered[:, 0].mean().item()),
@@ -671,7 +678,20 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 f"{tuple(source_hole_mask.shape)} vs {tuple(tar_mask.shape)}"
             )
 
-        control = tar_image * (1 - source_hole_mask.unsqueeze(1))
+        cache = batch.get("_opd_encoding_cache") if stage == "opd" else None
+
+        def cached(key, compute):
+            if cache is None:
+                return compute()
+            if key not in cache:
+                cache[key] = compute()
+            return cache[key]
+
+        hole_key = id(batch.get("source_hole_mask", batch.get("tar_mask_cond", tar_mask)))
+        control = cached(
+            ("insert_source", id(tar_image), hole_key),
+            lambda: tar_image * (1 - source_hole_mask.unsqueeze(1)),
+        )
 
         # Teacher and Student guidance policies are independent of standalone
         # inference defaults. OPD can therefore distill a reference-guided
@@ -693,9 +713,12 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 if force_empty_reference_prompt
                 else batch["prompt"]
             )
-        mask_control = (
-            self._mask_to_control_image(source_hole_mask) if self._should_attach_mask_control() else None
-        )
+        mask_control = None
+        if self._should_attach_mask_control():
+            mask_control = cached(
+                ("insert_mask_control", hole_key),
+                lambda: self._mask_to_control_image(source_hole_mask),
+            )
         mask_geometry = None
         if self._use_geometric_mask_control():
             mask_cfg = self._mask_control_cfg()
@@ -704,16 +727,18 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 tar_image,
                 stage,
             )
-            geometry_mask = self._resize_mask_for_geometry(
-                source_hole_mask,
-                target_height=geometry_height,
-                target_width=geometry_width,
-                threshold=float(mask_cfg.mask_threshold),
-            )
-            mask_geometry = build_mask_geometry(
-                geometry_mask,
-                sigma_px=float(mask_cfg.sigma_px),
-                threshold=float(mask_cfg.mask_threshold),
+            mask_geometry = cached(
+                ("geometry", hole_key, geometry_height, geometry_width,
+                 float(mask_cfg.sigma_px), float(mask_cfg.mask_threshold)),
+                lambda: build_mask_geometry(
+                    self._resize_mask_for_geometry(
+                        source_hole_mask,
+                        target_height=geometry_height,
+                        target_width=geometry_width,
+                        threshold=float(mask_cfg.mask_threshold),
+                    ),
+                    sigma_px=float(mask_cfg.sigma_px), threshold=float(mask_cfg.mask_threshold)
+                ),
             )
 
         parent_batch = {
@@ -721,6 +746,8 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
             "prompt": prompt,
             "n_controls": 0,
         }
+        if cache is not None:
+            parent_batch["_opd_encoding_cache"] = cache
         if mask_geometry is not None:
             parent_batch["mask_geometry"] = mask_geometry
 
@@ -731,6 +758,10 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
             self._append_additional_control(parent_batch, mask_control, vae_only=True)
 
         if stage not in {"predict", "opd"}:
+            parent_batch["reference_present_for_loss"] = not drop_reference
+            for key in ("target_face_mask", "reference_face_mask"):
+                if key in batch:
+                    parent_batch[key] = batch[key]
             parent_batch["image"] = tar_image
             if self.config.loss.mask_loss:
                 parent_batch["mask"] = tar_mask
@@ -772,6 +803,8 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 "n_controls": 0,
                 "true_cfg_scale": 1.0,
             }
+            if cache is not None:
+                reference_cfg_parent_batch["_opd_encoding_cache"] = cache
             if mask_geometry is not None:
                 reference_cfg_parent_batch["mask_geometry"] = mask_geometry
             if stage == "opd":
@@ -855,9 +888,14 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                     reference_cfg_embeddings[key] = batch[key]
             parent_batch["reference_cfg_embeddings"] = reference_cfg_embeddings
             parent_batch["reference_cfg_scale"] = reference_cfg_scale
-            parent_batch["reference_cfg_delta_clip_enabled"] = bool(reference_cfg_cfg.delta_clip_enabled)
-            parent_batch["reference_cfg_delta_clip_max_ratio"] = float(reference_cfg_cfg.delta_clip_max_ratio)
-            if reference_cfg_cfg.mask_aware:
+            policy_cfg = batch.get("_opd_reference_cfg", {}) if stage == "opd" else {}
+            parent_batch["reference_cfg_delta_clip_enabled"] = bool(
+                policy_cfg.get("delta_clip_enabled", reference_cfg_cfg.delta_clip_enabled)
+            )
+            parent_batch["reference_cfg_delta_clip_max_ratio"] = float(
+                policy_cfg.get("delta_clip_max_ratio", reference_cfg_cfg.delta_clip_max_ratio)
+            )
+            if policy_cfg.get("mask_aware", reference_cfg_cfg.mask_aware):
                 parent_batch["reference_cfg_mask_aware"] = True
                 parent_batch["reference_cfg_mask"] = tar_mask_cond
 

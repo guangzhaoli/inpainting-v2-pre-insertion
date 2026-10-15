@@ -490,6 +490,18 @@ def build_maskmix_v2_hybrid_masks(
     return stacked, modes
 
 
+def add_interaction_context(condition_masks, gt_masks, radius_px, threshold=0.5):
+    """Remove object-adjacent context too, so contact/shadow pixels must be learned."""
+    if radius_px <= 0:
+        return condition_masks
+    radius_px = int(radius_px)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius_px + 1,) * 2)
+    binary = (gt_masks.detach().float().cpu().numpy() > threshold).astype(np.uint8)
+    expanded = np.stack([cv2.dilate(mask, kernel) for mask in binary])
+    expanded = torch.from_numpy(expanded).to(device=condition_masks.device, dtype=condition_masks.dtype)
+    return torch.maximum(condition_masks, expanded)
+
+
 def build_insert_anything_hybrid_masks(
     masks: torch.Tensor,
     categories: Sequence[str] | str,

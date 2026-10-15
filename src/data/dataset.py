@@ -9,7 +9,6 @@ import numpy as np
 import cv2
 import importlib
 import logging
-import random
 import pandas as pd
 
 from src.utils.huggingface import load_editing_dataset, is_huggingface_repo
@@ -627,6 +626,10 @@ def loader(
 
         router = CategoryTeacherRouter(teacher_routes, fallback=fallback_teacher)
         sampler = RoundRobinTeacherSampler(dataset, router, seed=seed)
+    elif shuffle and getattr(init_args, "category_balanced_sampling", False):
+        from src.data.balanced_sampler import CategoryBalancedSampler
+
+        sampler = CategoryBalancedSampler(dataset, seed=seed)
     else:
         sampler = EpochShuffleSampler(dataset, seed=seed) if shuffle else SequentialSampler(dataset)
     worker_kwargs = {}
@@ -645,6 +648,9 @@ def loader(
         pin_memory=pin_memory,
         collate_fn=collate_fn,
         drop_last=drop_last,
+        # Worker/iterator initialization must not consume checkpointed training
+        # noise/timestep RNG when a dataloader is reconstructed for resume.
+        generator=torch.Generator().manual_seed(seed),
         **worker_kwargs,
     )
     return dataloader

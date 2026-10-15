@@ -43,7 +43,7 @@ def _normalize_categories(categories: object) -> list[str]:
     raise TypeError("OPD expects batch['category'] to be a string or a sequence of strings")
 
 
-def _index_batch_value(value: Any, indices: torch.Tensor, batch_size: int) -> Any:
+def _index_batch_value(value: Any, indices: torch.Tensor, batch_size: int, memo=None) -> Any:
     """Select batch items from a nested condition mapping.
 
     Scalars and metadata shared by the batch are retained.  Tensor/list values
@@ -52,12 +52,16 @@ def _index_batch_value(value: Any, indices: torch.Tensor, batch_size: int) -> An
     branches, provided those fields follow the usual leading-batch convention.
     """
 
+    if memo is None:
+        memo = {}
     if isinstance(value, torch.Tensor):
         if value.ndim > 0 and value.shape[0] == batch_size:
-            return value.index_select(0, indices.to(value.device))
+            if id(value) not in memo:
+                memo[id(value)] = value.index_select(0, indices.to(value.device))
+            return memo[id(value)]
         return value
     if isinstance(value, Mapping):
-        return {key: _index_batch_value(item, indices, batch_size) for key, item in value.items()}
+        return {key: _index_batch_value(item, indices, batch_size, memo) for key, item in value.items()}
     if isinstance(value, list) and len(value) == batch_size:
         selected = indices.detach().cpu().tolist()
         return [value[index] for index in selected]
@@ -68,7 +72,10 @@ def _index_batch_value(value: Any, indices: torch.Tensor, batch_size: int) -> An
 
 
 def _select_condition(condition: Mapping[str, Any], indices: torch.Tensor, batch_size: int) -> Dict[str, Any]:
-    return {key: _index_batch_value(value, indices, batch_size) for key, value in condition.items()}
+    if indices.device.type == "cpu" and torch.equal(indices, torch.arange(batch_size)):
+        return dict(condition)
+    memo = {}
+    return {key: _index_batch_value(value, indices, batch_size, memo) for key, value in condition.items()}
 
 
 @contextmanager
@@ -151,15 +158,18 @@ class QwenImageEditOPDStrategy:
             )
 
     @staticmethod
-    def _condition_key(guidance) -> Tuple[str, str, float]:
+    def _condition_key(guidance) -> tuple:
         # Scale affects whether CFG auxiliary embeddings are prepared. Keeping
         # it in the key prevents a scale=1 policy from being reused by a guided
         # policy with otherwise identical prompt/mode fields.
-        return guidance.prompt_mode, guidance.mode, float(guidance.scale)
+        return (guidance.prompt_mode, guidance.mode, float(guidance.scale),
+                getattr(guidance, "mask_aware", None), getattr(guidance, "delta_clip_enabled", None),
+                getattr(guidance, "delta_clip_max_ratio", None))
 
-    def _required_condition_policies(self) -> Dict[Tuple[str, str, float], object]:
+    def _required_condition_policies(self, teacher_names=None) -> dict:
         policies = {self._condition_key(self.config.student_guidance): self.config.student_guidance}
-        for teacher in self.teachers.values():
+        for name in self.teachers if teacher_names is None else teacher_names:
+            teacher = self.teachers[name]
             policies.setdefault(self._condition_key(teacher.guidance), teacher.guidance)
         return policies
 
@@ -171,14 +181,22 @@ class QwenImageEditOPDStrategy:
         self,
         trainer,
         batch: Mapping[str, Any],
+        teacher_names=None,
     ) -> Dict[Tuple[str, str, float], Dict[str, Any]]:
         categories = _normalize_categories(batch.get("category"))
         batch_size = len(categories)
         conditions: Dict[Tuple[str, str, float], Dict[str, Any]] = {}
 
-        for key, guidance in self._required_condition_policies().items():
-            prompt_mode, guidance_mode, _ = key
+        encoding_cache = {}
+        for key, guidance in self._required_condition_policies(teacher_names).items():
+            prompt_mode, guidance_mode = key[:2]
             local_batch: MutableMapping[str, Any] = dict(batch)
+            local_batch["_opd_encoding_cache"] = encoding_cache
+            local_batch["_opd_reference_cfg"] = {
+                field: getattr(guidance, field) for field in
+                ("mask_aware", "delta_clip_enabled", "delta_clip_max_ratio")
+                if getattr(guidance, field, None) is not None
+            }
             if prompt_mode == "empty":
                 local_batch["_opd_prompt_override"] = self._empty_prompts(batch_size)
             else:
@@ -199,7 +217,84 @@ class QwenImageEditOPDStrategy:
             with torch.no_grad():
                 conditions[key] = trainer.prepare_embeddings(dict(local_batch), stage="opd")
 
+            def cache_lengths(condition):
+                condition["_opd_txt_seq_lens"] = condition["prompt_embeds_mask"].sum(dim=1).cpu().tolist()
+                if "negative_prompt_embeds_mask" in condition:
+                    condition["_opd_negative_txt_seq_lens"] = condition["negative_prompt_embeds_mask"].sum(dim=1).cpu().tolist()
+                if "reference_cfg_embeddings" in condition:
+                    cache_lengths(condition["reference_cfg_embeddings"])
+
+            cache_lengths(conditions[key])
+            condition = conditions[key]
+            if condition.get("reference_cfg_mask_aware", False) and condition.get("reference_cfg_mask") is not None:
+                shapes = trainer._get_image_shapes(condition, batch_size)
+                condition["_opd_reference_cfg_mask"] = trainer._prepare_reference_cfg_mask(
+                    reference_cfg_mask=condition["reference_cfg_mask"],
+                    batch_size=batch_size,
+                    height_image=int(condition["height"]), width_image=int(condition["width"]),
+                    image_seq_len=math.prod(shapes[0][0]), device=self._module_device(trainer),
+                )
+
         return conditions
+
+    @staticmethod
+    def _prepare_student_condition(trainer, condition):
+        """Pool fixed geometry once; keep the trainable tokenizer in DiT.forward."""
+        unwrap = getattr(trainer, "_unwrap_dit", None)
+        model = unwrap() if unwrap else trainer.dit
+        tokenizer = getattr(model, "mask_geometry_tokenizer", None)
+        if tokenizer is None:
+            return condition
+        cache = {}
+
+        def prepare(value):
+            result = dict(value)
+            geometry = result.get("mask_geometry")
+            if geometry is not None:
+                shapes = trainer._get_image_shapes(result, geometry.shape[0])
+                size = model._mask_geometry_target_grid(shapes, geometry.shape[0])
+                key = (id(geometry), tuple(size))
+                if key not in cache:
+                    with torch.no_grad():
+                        # Match the ordinary training path's cast order. Keep
+                        # the pooled FP32 result in FP32 on subsequent forwards.
+                        value = geometry.to(device=trainer._dit_device(), dtype=trainer.weight_dtype)
+                        value = value.to(dtype=tokenizer.conv_in.weight.dtype)
+                        cache[key] = tokenizer._resize_geometry(value, size).detach()
+                result["mask_geometry"] = cache[key]
+                result["_opd_geometry_prepared"] = True
+            if "reference_cfg_embeddings" in result:
+                result["reference_cfg_embeddings"] = prepare(result["reference_cfg_embeddings"])
+            return result
+
+        return prepare(condition)
+
+    @staticmethod
+    def _cache_student_geometry(trainer, condition):
+        """Only no-grad rollout tokens are cached; training keeps raw geometry."""
+        unwrap = getattr(trainer, "_unwrap_dit", None)
+        model = unwrap() if unwrap else trainer.dit
+        tokenize = getattr(model, "prepare_mask_geometry_tokens", None)
+        if not callable(tokenize):
+            return condition
+        cache = {}
+
+        def prepare(value):
+            result = dict(value)
+            geometry = result.pop("mask_geometry", None)
+            if geometry is not None:
+                if id(geometry) not in cache:
+                    autocast = getattr(getattr(trainer, "accelerator", None), "autocast", nullcontext)
+                    with torch.no_grad(), autocast():
+                        cache[id(geometry)] = tokenize(
+                            geometry, trainer._get_image_shapes(result, geometry.shape[0])
+                        ).detach()
+                result["mask_geometry_tokens"] = cache[id(geometry)]
+            if "reference_cfg_embeddings" in result:
+                result["reference_cfg_embeddings"] = prepare(result["reference_cfg_embeddings"])
+            return result
+
+        return prepare(condition)
 
     @staticmethod
     def _module_device(trainer) -> torch.device:
@@ -234,7 +329,9 @@ class QwenImageEditOPDStrategy:
         prompt_embeds = condition["prompt_embeds"].to(device=device, dtype=trainer.weight_dtype)
         prompt_mask = condition["prompt_embeds_mask"].to(device=device, dtype=torch.int64)
         img_shapes = trainer._get_image_shapes(condition, batch_size)
-        txt_seq_lens = prompt_mask.sum(dim=1).tolist()
+        txt_seq_lens = condition.get("_opd_txt_seq_lens")
+        if txt_seq_lens is None:
+            txt_seq_lens = prompt_mask.sum(dim=1).tolist()
 
         if not isinstance(timestep, torch.Tensor):
             timestep = torch.as_tensor(timestep, device=device)
@@ -270,7 +367,7 @@ class QwenImageEditOPDStrategy:
         if mask_geometry is not None:
             geometry_kwargs["mask_geometry"] = mask_geometry.to(
                 device=device,
-                dtype=trainer.weight_dtype,
+                dtype=mask_geometry.dtype if condition.get("_opd_geometry_prepared") else trainer.weight_dtype,
             )
         if mask_geometry_tokens is not None:
             geometry_kwargs["mask_geometry_tokens"] = mask_geometry_tokens.to(
@@ -286,6 +383,7 @@ class QwenImageEditOPDStrategy:
             encoder_hidden_states=prompt_embeds,
             img_shapes=img_shapes,
             txt_seq_lens=txt_seq_lens,
+            output_token_count=state.shape[1],
             **geometry_kwargs,
             return_dict=False,
         )[0]
@@ -308,10 +406,10 @@ class QwenImageEditOPDStrategy:
             if null_condition is None:
                 raise ValueError("reference_cfg OPD policy requires prepared null-reference embeddings")
             null_prediction = self._predict_raw_velocity(trainer, state, timestep, null_condition)
-            reference_mask = None
+            reference_mask = condition.get("_opd_reference_cfg_mask")
             if condition.get("reference_cfg_mask_aware", False):
                 raw_mask = condition.get("reference_cfg_mask")
-                if raw_mask is not None:
+                if reference_mask is None and raw_mask is not None:
                     reference_mask = trainer._prepare_reference_cfg_mask(
                         reference_cfg_mask=raw_mask,
                         batch_size=state.shape[0],
@@ -335,6 +433,7 @@ class QwenImageEditOPDStrategy:
             negative_condition = dict(condition)
             negative_condition["prompt_embeds"] = condition["negative_prompt_embeds"]
             negative_condition["prompt_embeds_mask"] = condition["negative_prompt_embeds_mask"]
+            negative_condition["_opd_txt_seq_lens"] = condition.get("_opd_negative_txt_seq_lens")
             negative = self._predict_raw_velocity(trainer, state, timestep, negative_condition)
             combined = negative + float(guidance.scale) * (positive - negative)
             positive_norm = torch.norm(positive, dim=-1, keepdim=True)
@@ -354,11 +453,9 @@ class QwenImageEditOPDStrategy:
         width = int(condition["width"])
         num_channels = trainer._dit_config().in_channels // 4
 
-        seed = (
-            int(self.config.rollout.seed)
-            + int(trainer.global_step) * max(1, trainer.accelerator.num_processes)
-            + int(trainer.accelerator.process_index)
-        )
+        # The process RNG is checkpointed. A fresh draw also distinguishes
+        # microbatches within one optimizer step and survives elastic resumes.
+        seed = (int(self.config.rollout.seed) + torch.randint(0, 2**63 - 1, ()).item()) % (2**63 - 1)
         generator = torch.Generator(device=device).manual_seed(seed)
         latents = trainer.prepare_initial_latents(
             batch_size=batch_size,
@@ -381,6 +478,7 @@ class QwenImageEditOPDStrategy:
         states = [latents.detach().to(store_device)]
         self.backend.activate_student()
         with _temporary_eval(trainer.dit), torch.no_grad():
+            condition = self._cache_student_geometry(trainer, condition)
             for step_index, timestep in enumerate(timesteps):
                 velocity = self._predict_guided_velocity(
                     trainer,
@@ -408,78 +506,81 @@ class QwenImageEditOPDStrategy:
         return torch.randperm(num_steps, generator=generator)[:selected_count].sort().values
 
     def _teacher_targets(
-        self,
-        trainer,
-        state: torch.Tensor,
-        timestep: torch.Tensor,
-        batch: Mapping[str, Any],
-        conditions: Mapping[Tuple[str, str, float], Mapping[str, Any]],
-        groups: Mapping[str, torch.Tensor],
-        batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        target = torch.empty_like(state, device=self._module_device(trainer))
-        teacher_weight = torch.empty((batch_size,), device=target.device, dtype=torch.float32)
+        self, trainer, states, timesteps, batch, conditions, groups, batch_size,
+        routed_conditions=None, routed_batches=None,
+    ):
+        """Cache detached targets before any Student backward in this batch.
 
-        with _temporary_eval(trainer.dit):
+        The optimizer does not update inside a rollout, so all selected Teacher
+        targets can be evaluated together with one adapter activation.
+        """
+        from src.distillation.objectives import _prepare_teacher_weight
+
+        device = self._module_device(trainer)
+        targets = [None] * len(states)
+        teacher_weight = torch.empty(batch_size, dtype=torch.float32)
+        batch_predictor = getattr(self.backend, "predict_velocities", None)
+        with _temporary_eval(trainer.dit), torch.no_grad():
             for teacher_name, indices in groups.items():
                 teacher = self.teachers[teacher_name]
-                selected_state = state.index_select(0, indices.to(state.device))
-                # FlowTrajectory also permits per-sample timesteps [B, T].
-                # Route those values together with the state subset; a shared
-                # scalar/step vector is intentionally passed through unchanged.
-                selected_timestep = timestep
-                if (
-                    isinstance(timestep, torch.Tensor)
-                    and timestep.ndim == 1
-                    and timestep.shape[0] == batch_size
-                ):
-                    selected_timestep = timestep.index_select(0, indices.to(timestep.device))
-                selected_condition = _select_condition(
-                    conditions[self._condition_key(teacher.guidance)],
-                    indices,
-                    batch_size,
+                all_samples = torch.equal(indices, torch.arange(batch_size))
+                device_indices = indices.to(device)
+                selected_states = [
+                    state if all_samples else state.index_select(0, device_indices)
+                    for state in states
+                ]
+                selected_timesteps = [
+                    timestep.index_select(0, device_indices)
+                    if not all_samples and timestep.ndim == 1 and timestep.shape[0] == batch_size
+                    else timestep
+                    for timestep in timesteps
+                ]
+                condition = routed_conditions[teacher_name] if routed_conditions is not None else _select_condition(
+                    conditions[self._condition_key(teacher.guidance)], indices, batch_size,
                 )
-                selected_batch = _select_condition(batch, indices, batch_size)
-                backend_predictor = getattr(self.backend, "predict_velocity", None)
-                with torch.no_grad():
-                    if callable(backend_predictor):
-                        prediction = backend_predictor(
-                            teacher,
-                            trainer=trainer,
-                            state=selected_state,
-                            timestep=selected_timestep,
-                            condition=selected_condition,
-                            batch=selected_batch,
-                            guidance=teacher.guidance,
-                            shared_predictor=self._predict_guided_velocity,
-                        )
-                    else:
-                        # Compatibility path for third-party backends written
-                        # before the independent-teacher forward contract.
-                        with self.backend.teacher(teacher_name):
-                            prediction = self._predict_guided_velocity(
-                                trainer,
-                                selected_state,
-                                selected_timestep,
-                                selected_condition,
-                                teacher.guidance,
-                            )
-                if not isinstance(prediction, torch.Tensor):
-                    raise TypeError(f"Teacher backend {type(self.backend).__name__} must return a tensor")
-                if prediction.shape != selected_state.shape:
-                    raise ValueError(
-                        f"Teacher {teacher_name!r} returned velocity shape "
-                        f"{tuple(prediction.shape)}, expected {tuple(selected_state.shape)}"
+                selected_batch = routed_batches[teacher_name] if routed_batches is not None else _select_condition(
+                    batch, indices, batch_size,
+                )
+                kwargs = dict(trainer=trainer, condition=condition, batch=selected_batch,
+                              guidance=teacher.guidance, shared_predictor=self._predict_guided_velocity)
+                if callable(batch_predictor):
+                    predictions = batch_predictor(
+                        teacher, states=selected_states, timesteps=selected_timesteps, **kwargs,
                     )
-                target.index_copy_(
-                    0,
-                    indices.to(target.device),
-                    prediction.detach().to(device=target.device, dtype=target.dtype),
-                )
-                teacher_weight.index_fill_(0, indices.to(teacher_weight.device), float(teacher.weight))
-
-        self.backend.activate_student()
-        return target, teacher_weight
+                else:
+                    predictor = getattr(self.backend, "predict_velocity", None)
+                    predictions = []
+                    for state, timestep in zip(selected_states, selected_timesteps):
+                        if callable(predictor):
+                            prediction = predictor(teacher, state=state, timestep=timestep, **kwargs)
+                        else:
+                            with self.backend.teacher(teacher_name):
+                                prediction = self._predict_guided_velocity(
+                                    trainer, state, timestep, condition, teacher.guidance,
+                                )
+                        predictions.append(prediction)
+                for position, (prediction, state) in enumerate(zip(predictions, selected_states, strict=True)):
+                    if not isinstance(prediction, torch.Tensor):
+                        raise TypeError(f"Teacher backend {type(self.backend).__name__} must return a tensor")
+                    if prediction.shape != state.shape:
+                        raise ValueError(
+                            f"Teacher {teacher_name!r} returned velocity shape "
+                            f"{tuple(prediction.shape)}, expected {tuple(state.shape)}"
+                        )
+                    prediction = prediction.detach().to(device=device, dtype=state.dtype)
+                    if all_samples:
+                        targets[position] = prediction
+                    else:
+                        if targets[position] is None:
+                            targets[position] = torch.empty_like(states[position], device=device)
+                        targets[position].index_copy_(0, device_indices, prediction)
+                teacher_weight.index_fill_(0, indices, float(teacher.weight))
+        if not callable(batch_predictor):
+            self.backend.activate_student()
+        # Validate static weights once on CPU instead of synchronizing CUDA
+        # three times per timestep inside each objective call.
+        teacher_weight = _prepare_teacher_weight(teacher_weight, torch.empty(batch_size)).to(device)
+        return targets, teacher_weight
 
     def _objective_result(
         self,
@@ -490,12 +591,15 @@ class QwenImageEditOPDStrategy:
         teacher_velocity: torch.Tensor,
         teacher_weight: torch.Tensor,
     ):
+        weight_kwargs = {"teacher_weight": teacher_weight}
+        if getattr(self.objective, "supports_prevalidated_teacher_weight", False):
+            weight_kwargs["teacher_weight_prevalidated"] = True
         prediction_space = getattr(self.objective, "prediction_space", None)
         if prediction_space == "velocity":
             return self.objective(
                 student_velocity,
                 teacher_velocity,
-                teacher_weight=teacher_weight,
+                **weight_kwargs,
             )
         if prediction_space == "transition_mean":
             if getattr(self.objective, "mode", "ode") != "ode":
@@ -515,7 +619,7 @@ class QwenImageEditOPDStrategy:
             return self.objective(
                 student_mean,
                 teacher_mean,
-                teacher_weight=teacher_weight,
+                **weight_kwargs,
             )
         raise TypeError(
             f"Objective {type(self.objective).__name__} must declare "
@@ -546,8 +650,18 @@ class QwenImageEditOPDStrategy:
                 "Distributed SharedLoRA OPD received a mixed-Teacher local batch; "
                 "use data.batch_size=1 or a synchronized homogeneous batch sampler"
             )
-        conditions = self._prepare_conditions(trainer, batch)
+        conditions = self._prepare_conditions(trainer, batch, groups)
         student_condition = conditions[self._condition_key(self.config.student_guidance)]
+        routed_conditions, routed_batches = {}, {}
+        prepare_condition = getattr(self.backend, "prepare_condition", None)
+        for name, indices in groups.items():
+            teacher = self.teachers[name]
+            condition = _select_condition(conditions[self._condition_key(teacher.guidance)], indices, batch_size)
+            if callable(prepare_condition):
+                condition = prepare_condition(teacher, trainer=trainer, condition=condition)
+            routed_conditions[name] = condition
+            routed_batches[name] = _select_condition(batch, indices, batch_size)
+        student_condition = self._prepare_student_condition(trainer, student_condition)
         trajectory = self._rollout(trainer, student_condition)
         if not isinstance(trajectory, FlowTrajectory):
             raise TypeError(
@@ -559,31 +673,28 @@ class QwenImageEditOPDStrategy:
                 "OPD rollout batch size must match the routed input batch: "
                 f"got trajectory B={trajectory.batch_size}, input B={batch_size}"
             )
-        selected_steps = self._selected_timesteps(trainer, trajectory.num_steps)
-
-        total_loss = torch.zeros((), device=self._module_device(trainer), dtype=torch.float32)
+        selected_steps = self._selected_timesteps(trainer, trajectory.num_steps).tolist()
+        device = self._module_device(trainer)
+        states = [trajectory.states[:, step].to(device=device, dtype=trainer.weight_dtype) for step in selected_steps]
+        timesteps = [
+            (trajectory.timesteps[step] if trajectory.timesteps.ndim == 1 else trajectory.timesteps[:, step]).to(device)
+            for step in selected_steps
+        ]
+        teacher_velocities, teacher_weight = self._teacher_targets(
+            trainer, states, timesteps, batch, conditions, groups, batch_size,
+            routed_conditions=routed_conditions, routed_batches=routed_batches,
+        )
+        device_groups = {name: indices.to(device) for name, indices in groups.items()}
+        total_loss = torch.zeros((), device=device, dtype=torch.float32)
         teacher_loss_sums = {name: 0.0 for name in self.teachers}
         teacher_loss_counts = {name: 0.0 for name in self.teachers}
 
-        trainer.dit.train()
-        self.backend.activate_student()
-        selected_step_count = int(selected_steps.numel())
-        for selected_position, step_tensor in enumerate(selected_steps):
-            step_index = int(step_tensor.item())
-            state = trajectory.states[:, step_index].to(device=self._module_device(trainer), dtype=trainer.weight_dtype)
-            if trajectory.timesteps.ndim == 1:
-                timestep = trajectory.timesteps[step_index].to(device=self._module_device(trainer))
-            else:
-                timestep = trajectory.timesteps[:, step_index].to(device=self._module_device(trainer))
-            teacher_velocity, teacher_weight = self._teacher_targets(
-                trainer,
-                state,
-                timestep,
-                batch,
-                conditions,
-                groups,
-                batch_size,
-            )
+        if not trainer.dit.training:
+            trainer.dit.train()
+        selected_step_count = len(selected_steps)
+        for selected_position, step_index in enumerate(selected_steps):
+            state, timestep = states[selected_position], timesteps[selected_position]
+            teacher_velocity = teacher_velocities[selected_position]
             # DDP's no_sync context must cover both the Student forward and its
             # backward.  Accumulate the first T-1 timestep gradients locally,
             # then let only the final timestep participate in the outer
@@ -615,16 +726,16 @@ class QwenImageEditOPDStrategy:
             total_loss = total_loss + result.loss.detach().float()
 
             per_sample = result.per_sample.detach().float()
-            for teacher_name, indices in groups.items():
-                selected = per_sample.index_select(0, indices.to(per_sample.device))
-                teacher_loss_sums[teacher_name] += float(selected.sum().item())
+            for teacher_name, indices in device_groups.items():
+                selected = per_sample.index_select(0, indices)
+                teacher_loss_sums[teacher_name] += selected.sum()
                 teacher_loss_counts[teacher_name] += float(selected.numel())
 
-        mean_loss = total_loss / selected_steps.numel()
-        self._metric_sums["loss"] += float(total_loss.item())
-        self._metric_sums["loss_count"] += float(selected_steps.numel())
+        mean_loss = total_loss / selected_step_count
+        self._metric_sums["loss"] += total_loss.detach()
+        self._metric_sums["loss_count"] += float(selected_step_count)
         self._metric_sums["rollout_steps"] += float(trajectory.num_steps)
-        self._metric_sums["trained_steps"] += float(selected_steps.numel())
+        self._metric_sums["trained_steps"] += float(selected_step_count)
         self._metric_sums["batches"] += 1.0
         self._metric_sums["samples"] += float(batch_size)
         for teacher_name, indices in groups.items():
@@ -640,13 +751,12 @@ class QwenImageEditOPDStrategy:
         """Reduce a stable metric vector on every rank and clear local state."""
 
         keys = tuple(self._metric_sums)
-        values = torch.tensor(
-            [self._metric_sums[key] for key in keys],
-            device=accelerator.device,
-            dtype=torch.float64,
-        )
+        values = torch.stack([
+            torch.as_tensor(self._metric_sums[key], device=accelerator.device, dtype=torch.float64)
+            for key in keys
+        ])
         reduced = accelerator.reduce(values, reduction="sum")
-        totals = {key: float(reduced[index].item()) for index, key in enumerate(keys)}
+        totals = dict(zip(keys, reduced.cpu().tolist()))
         self._reset_metrics()
 
         loss_count = max(totals["loss_count"], 1.0)

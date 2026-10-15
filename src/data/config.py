@@ -113,7 +113,7 @@ class ImageProcessorInitArgs(BaseModel):
     @field_validator("process_type")
     @classmethod
     def _check_process_type(cls, v: str) -> str:
-        allowed = {"resize", "center_padding", "right_padding", "center_crop", "fixed_pixels"}
+        allowed = {"resize", "center_padding", "right_padding", "center_crop", "fixed_pixels", "aspect_pixels"}
         if v not in allowed:
             raise ValueError(f"process_type must be one of {allowed}")
         return v
@@ -372,6 +372,10 @@ class ReferenceCFGConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
+    attention_backend: Literal["sdpa", "flash_attention_2"] = "flash_attention_2"
+    # Legacy checkpoints used one timestep for every image token. New 2511
+    # training configs explicitly enable clean-condition (t=0) modulation.
+    zero_cond_t: bool = False
     model_config = ConfigDict(extra="forbid")
     pretrained_model_name_or_path: str = "Qwen/Qwen-Image-Edit"
     pretrained_embeddings: Optional[dict] = None  # if want to load different embeeding model vs main model (dit)
@@ -751,6 +755,9 @@ class HybridMaskingConfig(BaseModel):
         default_factory=HybridMaskingContextGuardConfig
     )
 
+    # Extra context removed around the supervised object, in processed pixels.
+    interaction_dilation_px: int = Field(default=0, ge=0, le=128)
+
     @field_validator("strategy")
     @classmethod
     def _check_strategy(cls, value: str) -> str:
@@ -821,6 +828,14 @@ class HybridMaskingConfig(BaseModel):
         return self
 
 
+class CategoryConditioningConfig(BaseModel):
+    """Preserve domain-specific teacher augmentations in a joint OPD dataset."""
+
+    model_config = ConfigDict(extra="forbid")
+    adaptive_crop: Optional[AdaptiveCropConfig] = None
+    hybrid_masking: Optional[HybridMaskingConfig] = None
+
+
 class DatasetInitArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     dataset_path: Union[str, List, None] = None
@@ -833,6 +848,9 @@ class DatasetInitArgs(BaseModel):
     processor: ImageProcessorConfig = Field(default_factory=ImageProcessorConfig)
     adaptive_crop: AdaptiveCropConfig = Field(default_factory=AdaptiveCropConfig)
     hybrid_masking: HybridMaskingConfig = Field(default_factory=HybridMaskingConfig)
+    category_balanced_sampling: bool = False
+    face_identity_supervision: bool = False
+    category_conditioning: Dict[str, CategoryConditioningConfig] = Field(default_factory=dict)
 
     @field_validator("selected_control_indexes")
     @classmethod
@@ -847,9 +865,9 @@ class DatasetInitArgs(BaseModel):
         adaptive_crop_enabled = (
             self.adaptive_crop.train_enabled or self.adaptive_crop.predict_enabled
         )
-        if adaptive_crop_enabled and process_type not in {"fixed_pixels", "resize"}:
+        if adaptive_crop_enabled and process_type not in {"fixed_pixels", "aspect_pixels", "resize"}:
             raise ValueError(
-                "adaptive crop requires processor.process_type to be 'fixed_pixels' or 'resize': "
+                "adaptive crop requires processor.process_type to be 'fixed_pixels', 'aspect_pixels' or 'resize': "
                 "crop/padding processors cannot be inverted by the original-coordinate restore step"
             )
         return self
@@ -898,9 +916,12 @@ class DataConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_adaptive_fixed_pixels_batching(self):
+        if self.init_args.category_conditioning and self.batch_size != 1:
+            raise ValueError("category_conditioning requires data.batch_size=1")
         if (
-            self.init_args.adaptive_crop.train_enabled
-            and self.init_args.processor.init_args.process_type == "fixed_pixels"
+            (self.init_args.adaptive_crop.train_enabled
+             and self.init_args.processor.init_args.process_type == "fixed_pixels"
+             or self.init_args.processor.init_args.process_type == "aspect_pixels")
             and self.batch_size > 1
         ):
             raise ValueError(
@@ -926,6 +947,8 @@ class SamplingConfig(BaseModel):
     validation_steps: int = 100
     num_samples: int = 4
     seed: int = 42
+    fixed_seed_across_steps: bool = False
+    validate_on_start: bool = False
     num_inference_steps: int = 20
     true_cfg_scale: float = 4.0
     guidance_scale: float = 1.0
@@ -1104,6 +1127,12 @@ class TrainerKind(str, Enum):
 
 
 class TrainConfig(BaseModel):
+    seed: int = Field(default=42, ge=0, lt=2**32)
+    rank_specific_rng: bool = True
+    trainable_precision: Literal["float32", "model"] = "float32"
+    offload_text_encoder: bool = False
+    checkpoint_vae_decode: bool = False
+    memory_policy: Literal["configured", "auto"] = "configured"
     model_config = ConfigDict(extra="forbid")
     train_batch_size: int = 1
     gradient_accumulation_steps: int = 4
@@ -1168,6 +1197,11 @@ class LossConfig(BaseModel):
     latent_mse_weight: float = 1.0
     fg_lpips_weight: float = 0.5
     bg_l1_weight: float = 0.5
+    detail_lpips_weight: float = 0.0
+    detail_num_patches: int = Field(default=4, ge=1, le=16)
+    detail_patch_size: int = Field(default=256, ge=16, le=1024)
+    boundary_l1_weight: float = 0.0
+    interaction_radius_px: int = Field(default=0, ge=0, le=128)
     fg_metric: Literal["lpips", "none"] = "lpips"
     lpips_net: Literal["alex", "vgg", "squeeze"] = "alex"
     lpips_input_size: int = 256
@@ -1184,6 +1218,7 @@ class LossConfig(BaseModel):
     # Reference identity is deliberately independent from foreground LPIPS and
     # stays disabled by default because it needs an additional frozen encoder.
     ref_dino_weight: float = 0.0
+    face_dino_weight: float = 0.0
     dino_backend: Literal["transformers", "torch_hub"] = "transformers"
     dino_model_name: str = "facebook/dinov2-small"
     dino_repo_path: Optional[str] = None
@@ -1211,6 +1246,9 @@ class LossConfig(BaseModel):
         "fg_lpips_weight",
         "bg_l1_weight",
         "ref_dino_weight",
+        "face_dino_weight",
+        "detail_lpips_weight",
+        "boundary_l1_weight",
     )
     @classmethod
     def _non_negative_loss_weight(cls, v: float) -> float:
@@ -1308,6 +1346,9 @@ class LossConfig(BaseModel):
         active_weights = [
             self.bg_l1_weight,
             self.ref_dino_weight,
+            self.face_dino_weight,
+            self.detail_lpips_weight,
+            self.boundary_l1_weight,
         ]
         if self.fg_metric == "lpips":
             active_weights.append(self.fg_lpips_weight)
@@ -1316,7 +1357,9 @@ class LossConfig(BaseModel):
                 "loss.region_perceptual is enabled but all pixel-region loss weights are 0"
             )
 
-        lpips_active = self.fg_metric == "lpips" and self.fg_lpips_weight > 0
+        if self.boundary_l1_weight > 0 and self.interaction_radius_px == 0:
+            raise ValueError("boundary_l1_weight requires interaction_radius_px > 0")
+        lpips_active = (self.fg_metric == "lpips" and self.fg_lpips_weight > 0) or self.detail_lpips_weight > 0
         if lpips_active:
             if self.lpips_linear_path is not None and not os.path.isfile(self.lpips_linear_path):
                 raise ValueError(f"lpips_linear_path not found: {self.lpips_linear_path}")
@@ -1348,7 +1391,7 @@ class LossConfig(BaseModel):
                             "loss.lpips_torch_home/hub/checkpoints/."
                         )
 
-        if self.ref_dino_weight > 0 and self.dino_backend == "torch_hub":
+        if (self.ref_dino_weight > 0 or self.face_dino_weight > 0) and self.dino_backend == "torch_hub":
             hubconf = (
                 os.path.join(self.dino_repo_path, "hubconf.py")
                 if self.dino_repo_path is not None
@@ -1393,6 +1436,10 @@ class OPDGuidanceConfig(BaseModel):
     mode: Literal["none", "reference_cfg", "text_cfg"] = "none"
     scale: float = 1.0
     prompt_mode: Literal["batch", "empty"] = "batch"
+    # None means inherit the teacher checkpoint's policy, never the student's.
+    mask_aware: Optional[bool] = None
+    delta_clip_enabled: Optional[bool] = None
+    delta_clip_max_ratio: Optional[float] = Field(default=None, gt=0, allow_inf_nan=False)
 
     @field_validator("scale")
     @classmethod
@@ -1464,7 +1511,7 @@ class OPDRolloutConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     num_inference_steps: int = 28
     timestep_fraction: float = 1.0
-    store_device: Literal["cpu", "cuda"] = "cpu"
+    store_device: Literal["cpu", "cuda"] = "cuda"
     seed: int = 0
 
     @field_validator("num_inference_steps")
@@ -1638,6 +1685,8 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def _wire_cross_defaults(self):
+        if self.loss.face_dino_weight > 0 and not self.data.init_args.face_identity_supervision:
+            raise ValueError("face_dino_weight requires data.init_args.face_identity_supervision")
         self.train.train_batch_size = self.data.batch_size
         if self.quantization_type in {"pretrain_fp4", "pretrain_fp8", "pretrain_fp16"}:
             self.model.quantize = False
@@ -1726,6 +1775,10 @@ def load_config_from_yaml(yaml_path: str, *, for_inference: bool = False) -> Con
         raise RuntimeError(f"Error loading YAML file {yaml_path}: {e}") from e
 
     data = OmegaConf.to_container(yaml_config, resolve=True) or {}
+    if isinstance(data, dict):
+        # Earlier train_config snapshots included read-only computed fields.
+        for name in Config.model_computed_fields:
+            data.pop(name, None)
 
     if for_inference and isinstance(data, dict):
         distillation = data.get("distillation")

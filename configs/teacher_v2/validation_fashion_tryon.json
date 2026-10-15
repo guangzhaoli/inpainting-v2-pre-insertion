@@ -1,0 +1,632 @@
+[
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/1.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/1.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/1.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/1.png",
+    "stem": "1",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/10.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/10.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/10.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/10.png",
+    "stem": "10",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/11.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/11.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/11.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/11.png",
+    "stem": "11",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/12.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/12.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/12.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/12.png",
+    "stem": "12",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/13.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/13.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/13.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/13.png",
+    "stem": "13",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/14.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/14.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/14.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/14.png",
+    "stem": "14",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/15.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/15.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/15.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/15.png",
+    "stem": "15",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/16.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/16.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/16.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/16.png",
+    "stem": "16",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/17.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/17.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/17.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/17.png",
+    "stem": "17",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/18.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/18.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/18.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/18.png",
+    "stem": "18",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/19.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/19.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/19.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/19.png",
+    "stem": "19",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/2.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/2.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/2.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/2.png",
+    "stem": "2",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/20.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/20.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/20.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/20.png",
+    "stem": "20",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/21.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/21.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/21.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/21.png",
+    "stem": "21",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/22.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/22.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/22.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/22.png",
+    "stem": "22",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/23.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/23.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/23.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/23.png",
+    "stem": "23",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/24.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/24.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/24.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/24.png",
+    "stem": "24",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/25.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/25.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/25.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/25.png",
+    "stem": "25",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/26.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/26.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/26.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/26.png",
+    "stem": "26",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/27.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/27.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/27.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/27.png",
+    "stem": "27",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/28.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/28.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/28.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/28.png",
+    "stem": "28",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/29.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/29.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/29.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/29.png",
+    "stem": "29",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/3.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/3.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/3.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/3.png",
+    "stem": "3",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/30.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/30.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/30.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/30.png",
+    "stem": "30",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/31.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/31.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/31.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/31.png",
+    "stem": "31",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/32.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/32.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/32.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/32.png",
+    "stem": "32",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/33.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/33.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/33.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/33.png",
+    "stem": "33",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/34.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/34.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/34.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/34.png",
+    "stem": "34",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/35.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/35.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/35.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/35.png",
+    "stem": "35",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/36.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/36.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/36.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/36.png",
+    "stem": "36",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/37.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/37.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/37.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/37.png",
+    "stem": "37",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/38.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/38.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/38.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/38.png",
+    "stem": "38",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/39.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/39.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/39.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/39.png",
+    "stem": "39",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/4.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/4.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/4.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/4.png",
+    "stem": "4",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/40.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/40.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/40.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/40.png",
+    "stem": "40",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/41.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/41.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/41.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/41.png",
+    "stem": "41",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/42.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/42.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/42.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/42.png",
+    "stem": "42",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/43.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/43.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/43.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/43.png",
+    "stem": "43",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/44.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/44.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/44.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/44.png",
+    "stem": "44",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/45.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/45.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/45.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/45.png",
+    "stem": "45",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/46.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/46.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/46.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/46.png",
+    "stem": "46",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/47.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/47.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/47.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/47.png",
+    "stem": "47",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/48.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/48.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/48.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/48.png",
+    "stem": "48",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/49.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/49.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/49.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/49.png",
+    "stem": "49",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/5.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/5.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/5.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/5.png",
+    "stem": "5",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/50.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/50.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/50.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/50.png",
+    "stem": "50",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/51.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/51.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/51.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/51.png",
+    "stem": "51",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/52.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/52.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/52.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/52.png",
+    "stem": "52",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/53.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/53.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/53.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/53.png",
+    "stem": "53",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/54.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/54.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/54.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/54.png",
+    "stem": "54",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/55.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/55.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/55.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/55.png",
+    "stem": "55",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/56.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/56.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/56.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/56.png",
+    "stem": "56",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/57.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/57.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/57.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/57.png",
+    "stem": "57",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/58.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/58.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/58.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/58.png",
+    "stem": "58",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/59.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/59.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/59.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/59.png",
+    "stem": "59",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/6.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/6.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/6.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/6.png",
+    "stem": "6",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/60.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/60.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/60.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/60.png",
+    "stem": "60",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/7.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/7.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/7.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/7.png",
+    "stem": "7",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/8.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/8.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/8.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/8.png",
+    "stem": "8",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_image/9.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/ref_mask/9.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_image/9.png",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/tar_mask/9.png",
+    "stem": "9",
+    "category": "clothes",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_image/1.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_mask/1.jpg",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_image/1.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_mask/1.png",
+    "stem": "1",
+    "category": "pure_color",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_image/10.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_mask/10.jpg",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_image/10.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_mask/10.png",
+    "stem": "10",
+    "category": "pure_color",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_image/2.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_mask/2.jpg",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_image/2.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_mask/2.png",
+    "stem": "2",
+    "category": "pure_color",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_image/3.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_mask/3.jpg",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_image/3.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_mask/3.png",
+    "stem": "3",
+    "category": "pure_color",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_image/4.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_mask/4.jpg",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_image/4.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_mask/4.png",
+    "stem": "4",
+    "category": "pure_color",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_image/5.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_mask/5.jpg",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_image/5.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_mask/5.png",
+    "stem": "5",
+    "category": "pure_color",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_image/6.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_mask/6.jpg",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_image/6.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_mask/6.png",
+    "stem": "6",
+    "category": "pure_color",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_image/7.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_mask/7.jpg",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_image/7.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_mask/7.png",
+    "stem": "7",
+    "category": "pure_color",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_image/8.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_mask/8.jpg",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_image/8.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_mask/8.png",
+    "stem": "8",
+    "category": "pure_color",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_image/9.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/ref_mask/9.jpg",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_image/9.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/clothes/pure_color/tar_mask/9.png",
+    "stem": "9",
+    "category": "pure_color",
+    "prompt": ""
+  }
+]

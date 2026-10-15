@@ -13,7 +13,7 @@
 # limitations under the License.
 # follow from https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/transformers/transformer_qwenimage.py
 
-import functools
+from collections import OrderedDict
 import math
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -215,7 +215,7 @@ class QwenEmbedRope(nn.Module):
             ],
             dim=1,
         )
-        self.rope_cache = {}
+        self.rope_cache = OrderedDict()
 
         # DO NOT USING REGISTER BUFFER HERE, IT WILL CAUSE COMPLEX NUMBERS LOSE ITS IMAGINARY PART
         self.scale_rope = scale_rope
@@ -231,14 +231,20 @@ class QwenEmbedRope(nn.Module):
         freqs = torch.polar(torch.ones_like(freqs), freqs)
         return freqs
 
+    @torch.inference_mode(False)
+    @torch.no_grad()
     def forward(self, video_fhw, txt_seq_lens, device):
         """
         Args: video_fhw: [frame, height, width] a list of 3 integers representing the shape of the video Args:
         txt_length: [bs] a list of 1 integers representing the length of the text
         """
+        # These cached constants survive validation and are reused by training.
+        # Always create ordinary tensors, even inside an inference-mode caller;
+        # autograd must save the rotary constants to differentiate the input.
         if self.pos_freqs.device != device:
             self.pos_freqs = self.pos_freqs.to(device)
             self.neg_freqs = self.neg_freqs.to(device)
+            self.rope_cache.clear()
 
         if isinstance(video_fhw, list):
             video_fhw = video_fhw[0]
@@ -249,11 +255,14 @@ class QwenEmbedRope(nn.Module):
         max_vid_index = 0
         for idx, fhw in enumerate(video_fhw):
             frame, height, width = fhw
-            rope_key = f"{idx}_{height}_{width}"
+            rope_key = (idx, frame, height, width)
 
             if not torch.compiler.is_compiling():
                 if rope_key not in self.rope_cache:
                     self.rope_cache[rope_key] = self._compute_video_freqs(frame, height, width, idx)
+                    if len(self.rope_cache) > 64:
+                        self.rope_cache.popitem(last=False)
+                self.rope_cache.move_to_end(rope_key)
                 video_freq = self.rope_cache[rope_key]
             else:
                 video_freq = self._compute_video_freqs(frame, height, width, idx)
@@ -271,7 +280,6 @@ class QwenEmbedRope(nn.Module):
 
         return vid_freqs, txt_freqs
 
-    @functools.lru_cache(maxsize=None)
     def _compute_video_freqs(self, frame, height, width, idx=0):
         seq_lens = frame * height * width
         freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -394,11 +402,13 @@ class QwenDoubleStreamAttnProcessor2_0:
 @maybe_allow_in_graph
 class QwenImageTransformerBlock(nn.Module):
     def __init__(
-        self, dim: int, num_attention_heads: int, attention_head_dim: int, qk_norm: str = "rms_norm", eps: float = 1e-6
+        self, dim: int, num_attention_heads: int, attention_head_dim: int, qk_norm: str = "rms_norm", eps: float = 1e-6,
+        zero_cond_t: bool = False,
     ):
         super().__init__()
 
         self.dim = dim
+        self.zero_cond_t = zero_cond_t
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
 
@@ -434,10 +444,25 @@ class QwenImageTransformerBlock(nn.Module):
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_mlp = FeedForward(dim=dim, dim_out=dim, activation_fn="gelu-approximate")
 
-    def _modulate(self, x, mod_params):
+    def _modulate(self, x, mod_params, target_token_count=None):
         """Apply modulation to input tensor"""
+        if target_token_count is not None:
+            noisy, clean = mod_params.chunk(2, dim=0)
+            target, target_gate = self._modulate(x[:, :target_token_count], noisy)
+            condition, condition_gate = self._modulate(x[:, target_token_count:], clean)
+            # The target is always a shared prefix in this trainer. Slicing
+            # avoids materializing a per-token modulation index or [B,N,D]
+            # gate/shift/scale tensors on every block and diffusion step.
+            return torch.cat((target, condition), dim=1), (target_gate, condition_gate, target_token_count)
         shift, scale, gate = mod_params.chunk(3, dim=-1)
         return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1), gate.unsqueeze(1)
+
+    @staticmethod
+    def _gate(values, gate):
+        if isinstance(gate, tuple):
+            target_gate, condition_gate, split = gate
+            return torch.cat((values[:, :split] * target_gate, values[:, split:] * condition_gate), dim=1)
+        return gate * values
 
     def forward(
         self,
@@ -447,9 +472,15 @@ class QwenImageTransformerBlock(nn.Module):
         temb: torch.Tensor,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        target_token_count: Optional[int] = None,
+        skip_text_output: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod(temb)  # [B, 6*dim]
+        if self.zero_cond_t:
+            if target_token_count is None:
+                raise ValueError("zero_cond_t requires the target image prefix length")
+            temb = temb[:hidden_states.shape[0]]
         txt_mod_params = self.txt_mod(temb)  # [B, 6*dim]
 
         # Split modulation parameters for norm1 and norm2
@@ -458,7 +489,7 @@ class QwenImageTransformerBlock(nn.Module):
 
         # Process image stream - norm1 + modulation
         img_normed = self.img_norm1(hidden_states)
-        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1)
+        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1, target_token_count)
 
         # Process text stream - norm1 + modulation
         txt_normed = self.txt_norm1(encoder_hidden_states)
@@ -483,20 +514,22 @@ class QwenImageTransformerBlock(nn.Module):
         img_attn_output, txt_attn_output = attn_output
 
         # Apply attention gates and add residual (like in Megatron)
-        hidden_states = hidden_states + img_gate1 * img_attn_output
-        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+        hidden_states = hidden_states + self._gate(img_attn_output, img_gate1)
 
         # Process image stream - norm2 + MLP
         img_normed2 = self.img_norm2(hidden_states)
-        img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
+        img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2, target_token_count)
         img_mlp_output = self.img_mlp(img_modulated2)
-        hidden_states = hidden_states + img_gate2 * img_mlp_output
+        hidden_states = hidden_states + self._gate(img_mlp_output, img_gate2)
 
-        # Process text stream - norm2 + MLP
-        txt_normed2 = self.txt_norm2(encoder_hidden_states)
-        txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
-        txt_mlp_output = self.txt_mlp(txt_modulated2)
-        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+        # The final block's text output has no consumer. Earlier blocks still
+        # update the text stream because subsequent image attention needs it.
+        if not skip_text_output:
+            encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+            txt_normed2 = self.txt_norm2(encoder_hidden_states)
+            txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
+            txt_mlp_output = self.txt_mlp(txt_modulated2)
+            encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
 
         # Clip to prevent overflow for fp16
         if encoder_hidden_states.dtype == torch.float16:
@@ -550,9 +583,11 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
         joint_attention_dim: int = 3584,
         guidance_embeds: bool = False,  # TODO: this should probably be removed
         axes_dims_rope: Tuple[int, int, int] = (16, 56, 56),
+        zero_cond_t: bool = False,
     ):
         super().__init__()
         self.out_channels = out_channels or in_channels
+        self.zero_cond_t = zero_cond_t
         self.inner_dim = num_attention_heads * attention_head_dim
 
         self.pos_embed = QwenEmbedRope(theta=10000, axes_dim=list(axes_dims_rope), scale_rope=True)
@@ -570,6 +605,7 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
                     dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
+                    zero_cond_t=zero_cond_t,
                 )
                 for _ in range(num_layers)
             ]
@@ -701,6 +737,7 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
         return_dict: bool = True,
         mask_geometry: Optional[torch.Tensor] = None,
         mask_geometry_tokens: Optional[torch.Tensor] = None,
+        output_token_count: Optional[int] = None,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         """
         The [`QwenTransformer2DModel`] forward method.
@@ -729,6 +766,9 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
                 Pre-tokenized geometry shaped ``[B,N_target,C]``. Inference may
                 cache this static tensor and reuse it across denoising and CFG
                 forwards. Mutually exclusive with ``mask_geometry``.
+            output_token_count (`int`, *optional*):
+                Read out only this target prefix; conditioning image tokens
+                still participate in every transformer block.
 
         Returns:
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
@@ -758,6 +798,15 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
         hidden_states = self.img_in(hidden_states)
 
         timestep = timestep.to(hidden_states.dtype)
+        target_token_count = None
+        if self.zero_cond_t:
+            if not img_shapes or len(img_shapes) != hidden_states.shape[0]:
+                raise ValueError("zero_cond_t requires img_shapes for every batch item")
+            counts = [math.prod(shapes[0]) for shapes in img_shapes]
+            if len(set(counts)) != 1 or any(sum(math.prod(s) for s in shapes) != hidden_states.shape[1] for shapes in img_shapes):
+                raise ValueError("zero_cond_t requires a shared target prefix and img_shapes matching the image sequence")
+            target_token_count = counts[0]
+            timestep = torch.cat((timestep, torch.zeros_like(timestep)))
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
 
@@ -773,6 +822,7 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
         image_rotary_emb = self.pos_embed(img_shapes, txt_seq_lens, device=hidden_states.device)
 
         for index_block, block in enumerate(self.transformer_blocks):
+            skip_text_output = index_block == len(self.transformer_blocks) - 1
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 encoder_hidden_states, hidden_states = self._gradient_checkpointing_func(
                     block,
@@ -781,6 +831,9 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
                     encoder_hidden_states_mask,
                     temb,
                     image_rotary_emb,
+                    attention_kwargs,
+                    target_token_count,
+                    skip_text_output,
                 )
 
             else:
@@ -791,10 +844,14 @@ class QwenImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, Fro
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                     joint_attention_kwargs=attention_kwargs,
+                    target_token_count=target_token_count,
+                    skip_text_output=skip_text_output,
                 )
 
         # Use only the image part (hidden_states) from the dual-stream blocks
-        hidden_states = self.norm_out(hidden_states, temb)
+        if output_token_count is not None:
+            hidden_states = hidden_states[:, :output_token_count]
+        hidden_states = self.norm_out(hidden_states, temb[:hidden_states.shape[0]] if self.zero_cond_t else temb)
         output = self.proj_out(hidden_states)
 
         if USE_PEFT_BACKEND:

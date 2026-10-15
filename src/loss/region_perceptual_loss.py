@@ -662,6 +662,8 @@ class RegionPerceptualLoss(nn.Module):
 
         # Require both sides to have a valid object mask.
         both_valid = pred_box_valid & ref_box_valid.to(device=pred_box_valid.device)
+        if not bool(both_valid.any()):
+            return pred_images.sum() * 0.0
         if sample_valid is None:
             sample_valid = both_valid
         else:
@@ -690,6 +692,11 @@ class RegionPerceptualLoss(nn.Module):
         target_range: str = "0-1",
         ref_range: str = "0-1",
         sample_weights: Optional[torch.Tensor] = None,
+        detail_weight: float = 0.0,
+        detail_num_patches: int = 4,
+        detail_patch_size: int = 256,
+        boundary_weight: float = 0.0,
+        interaction_radius_px: int = 0,
     ) -> Dict[str, torch.Tensor]:
         if pred_images.shape != target_images.shape:
             raise ValueError(
@@ -710,7 +717,9 @@ class RegionPerceptualLoss(nn.Module):
             )
 
         fg_mask = (mask >= self.mask_threshold).to(dtype=pred_images.dtype)
-        bg_mask = 1.0 - fg_mask
+        from src.loss.local_detail import foreground_detail_crops, interaction_masks
+
+        ring_mask, bg_mask = interaction_masks(fg_mask, interaction_radius_px)
         fg_area = fg_mask.reshape(fg_mask.shape[0], -1).sum(dim=1)
         bg_area = bg_mask.reshape(bg_mask.shape[0], -1).sum(dim=1)
         fg_valid = fg_area > 0
@@ -720,6 +729,31 @@ class RegionPerceptualLoss(nn.Module):
         fg_loss = zero
         bg_loss = zero
         ref_dino_loss = zero
+        detail_loss = zero
+        boundary_loss = zero
+
+        if float(detail_weight) > 0:
+            pred_lpips = _images_to_lpips_range(pred_images, input_range=pred_range)
+            target_lpips = _images_to_lpips_range(target_images, input_range=target_range)
+            pred_crops, target_crops, owners = foreground_detail_crops(
+                pred_lpips, target_lpips, fg_mask,
+                detail_patch_size, detail_num_patches, self.lpips_input_size,
+            )
+            if owners:
+                lpips = self._ensure_lpips(pred_images.device)
+                dtype = next(lpips.parameters()).dtype
+                distances = lpips(pred_crops.to(dtype), target_crops.to(dtype)).float().flatten(1).mean(1)
+                owner_ids = torch.tensor(owners, device=distances.device)
+                per_sample = distances.new_zeros(pred_images.shape[0]).index_add(0, owner_ids, distances)
+                counts = torch.bincount(owner_ids, minlength=pred_images.shape[0])
+                per_sample = per_sample / counts.clamp_min(1)
+                detail_loss = self._reduce_per_sample(per_sample, counts > 0, sample_weights, pred_images)
+
+        if float(boundary_weight) > 0:
+            boundary_loss = self._background_l1(
+                pred_images, target_images, ring_mask,
+                pred_range=pred_range, target_range=target_range, sample_weights=sample_weights,
+            )
 
         if float(fg_weight) != 0.0 and self.fg_metric == "lpips":
             if not bool(fg_valid.any().item()):
@@ -783,10 +817,14 @@ class RegionPerceptualLoss(nn.Module):
             float(fg_weight) * fg_loss
             + float(bg_weight) * bg_loss
             + float(ref_dino_weight) * ref_dino_loss
+            + float(detail_weight) * detail_loss
+            + float(boundary_weight) * boundary_loss
         )
         return {
             "total": total,
             "fg_lpips": fg_loss.detach(),
             "bg_l1": bg_loss.detach(),
             "ref_dino": ref_dino_loss.detach(),
+            "detail_lpips": detail_loss.detach(),
+            "boundary_l1": boundary_loss.detach(),
         }

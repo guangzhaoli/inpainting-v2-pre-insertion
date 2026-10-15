@@ -5,6 +5,9 @@ set -euo pipefail
 ulimit -c 0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -f /inspire/hdd/global_user/250041225002/uv_config/env.sh ]]; then
+    source /inspire/hdd/global_user/250041225002/uv_config/env.sh
+fi
 
 USER_CONFIG_ARG="${1:-}"
 MIXED_PRECISION="${MIXED_PRECISION:-bf16}"
@@ -80,7 +83,10 @@ if [[ -n "${RESUME}" ]]; then
     TRAIN_ARGS+=(--resume "${RESUME}")
 fi
 
-CMD=(accelerate launch "${LAUNCH_ARGS[@]}" "${TRAIN_ARGS[@]}")
+UV_BIN="${UV_BIN:-uv}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export HF_DATASETS_OFFLINE="${HF_DATASETS_OFFLINE:-1}"
+CMD=("${UV_BIN}" run --project "${SCRIPT_DIR}" --offline --no-sync accelerate launch "${LAUNCH_ARGS[@]}" "${TRAIN_ARGS[@]}")
 
 if [[ "${DRY_RUN}" == "1" ]]; then
     printf 'Resolved command:'

@@ -47,6 +47,7 @@ class _TrackedEmbeddings(dict):
 
 class _LoadedPredictionHarness:
     _tensor_batch_to_pil_images = staticmethod(BaseTrainer._tensor_batch_to_pil_images)
+    conditioning_context = BaseTrainer.conditioning_context
 
     def __init__(self):
         self.dit = torch.nn.Linear(1, 1)

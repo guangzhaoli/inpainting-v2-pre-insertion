@@ -85,6 +85,7 @@ def parse_args(argv=None):
     )
     parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42, help="Deterministic inference seed.")
+    parser.add_argument("--device", type=str, default=None, help="Override VAE, VL and DiT device, e.g. cuda:0.")
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="Generated image output path.")
@@ -393,6 +394,10 @@ def main():
     # validating a Student deployment config so moved/archived Teacher files
     # are not required for inference.
     config = load_config_from_yaml(str(args.config), for_inference=True)
+    if getattr(args, "device", None) is not None:
+        from src.data.config import DeviceConfig
+
+        config.predict.devices = DeviceConfig(vae=args.device, text_encoder=args.device, dit=args.device)
     latent_anchoring_config = apply_latent_anchoring_cli_overrides(config, args)
     validate_adaptive_crop_inference_args(config, args)
     validate_latent_anchoring_runtime(

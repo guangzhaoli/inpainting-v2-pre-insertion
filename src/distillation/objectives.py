@@ -101,7 +101,7 @@ def _masked_per_sample_mean(elementwise: Tensor, mask: Optional[Tensor]) -> Tens
     return numerator / denominator
 
 
-def _prepare_teacher_weight(teacher_weight: Optional[Tensor], per_sample: Tensor) -> Optional[Tensor]:
+def _prepare_teacher_weight(teacher_weight: Optional[Tensor], per_sample: Tensor, *, validate_values=True) -> Optional[Tensor]:
     if teacher_weight is None:
         return None
     if not isinstance(teacher_weight, Tensor):
@@ -112,6 +112,8 @@ def _prepare_teacher_weight(teacher_weight: Optional[Tensor], per_sample: Tensor
     if teacher_weight.device != per_sample.device:
         raise ValueError(f"teacher_weight must be on {per_sample.device}, got {teacher_weight.device}")
     weight = teacher_weight.detach().to(dtype=torch.float32)
+    if not validate_values:
+        return weight
     if not torch.isfinite(weight).all().item():
         raise ValueError("teacher_weight must contain only finite values")
     if (weight < 0).any().item():
@@ -121,13 +123,13 @@ def _prepare_teacher_weight(teacher_weight: Optional[Tensor], per_sample: Tensor
     return weight
 
 
-def _batch_mean(per_sample: Tensor, teacher_weight: Optional[Tensor]) -> Tensor:
-    weight = _prepare_teacher_weight(teacher_weight, per_sample)
+def _batch_mean(per_sample: Tensor, teacher_weight: Optional[Tensor], *, prevalidated=False) -> Tensor:
+    weight = _prepare_teacher_weight(teacher_weight, per_sample, validate_values=not prevalidated)
     if weight is None:
         return per_sample.mean()
-    # Normalization keeps the objective invariant to a common rescaling of all
-    # teacher confidence weights.
-    return (per_sample * weight).sum() / weight.sum()
+    # Absolute weights compose with DDP and gradient accumulation. Dividing by
+    # local sum(weight) cancels the teacher's influence at batch_size=1.
+    return (per_sample * weight).mean()
 
 
 def _resolve_mask(token_mask: Optional[Tensor], mask: Optional[Tensor]) -> Optional[Tensor]:
@@ -154,11 +156,12 @@ class VelocityMatchingObjective(nn.Module):
     A token mask of shape ``[B, L]`` is expanded over latent channels.  Any
     other non-negative mask that can broadcast to the prediction is accepted as
     well.  ``teacher_weight`` is a confidence weight per batch item; it affects
-    the final normalized batch reduction but not the returned ``per_sample``
+    the final batch mean as an absolute multiplier, not the returned ``per_sample``
     values.
     """
 
     prediction_space = "velocity"
+    supports_prevalidated_teacher_weight = True
 
     def __init__(self, coefficient: float = 0.5) -> None:
         super().__init__()
@@ -176,6 +179,7 @@ class VelocityMatchingObjective(nn.Module):
         teacher_weight: Optional[Tensor] = None,
         *,
         mask: Optional[Tensor] = None,
+        teacher_weight_prevalidated: bool = False,
     ) -> DistillationResult:
         _validate_prediction_pair(
             student_velocity,
@@ -187,8 +191,8 @@ class VelocityMatchingObjective(nn.Module):
         squared_error = (student_velocity.float() - teacher_velocity.detach().float()).square()
         per_sample_mse = _masked_per_sample_mean(squared_error, resolved_mask)
         per_sample = self.coefficient * per_sample_mse
-        loss = _batch_mean(per_sample, teacher_weight)
-        mse = _batch_mean(per_sample_mse, teacher_weight)
+        mse = _batch_mean(per_sample_mse, teacher_weight, prevalidated=teacher_weight_prevalidated)
+        loss = self.coefficient * mse
         return DistillationResult(
             loss=loss,
             per_sample=per_sample,
@@ -207,6 +211,7 @@ class TransitionMeanMatchingObjective(nn.Module):
     """
 
     prediction_space = "transition_mean"
+    supports_prevalidated_teacher_weight = True
     MODES = ("ode", "sde")
 
     def __init__(self, mode: str = "ode") -> None:
@@ -224,6 +229,7 @@ class TransitionMeanMatchingObjective(nn.Module):
         teacher_weight: Optional[Tensor] = None,
         *,
         mask: Optional[Tensor] = None,
+        teacher_weight_prevalidated: bool = False,
     ) -> DistillationResult:
         _validate_prediction_pair(
             student_mean,
@@ -253,8 +259,8 @@ class TransitionMeanMatchingObjective(nn.Module):
 
         per_sample_mse = _masked_per_sample_mean(squared_error, resolved_mask)
         per_sample = _masked_per_sample_mean(elementwise, resolved_mask)
-        loss = _batch_mean(per_sample, teacher_weight)
-        mse = _batch_mean(per_sample_mse, teacher_weight)
+        loss = _batch_mean(per_sample, teacher_weight, prevalidated=teacher_weight_prevalidated)
+        mse = _batch_mean(per_sample_mse, teacher_weight, prevalidated=teacher_weight_prevalidated)
         metrics.update({"loss": loss.detach(), "mse": mse.detach()})
         if self.mode == "sde":
             metrics["reverse_kl"] = loss.detach()

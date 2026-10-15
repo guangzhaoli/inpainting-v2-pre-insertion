@@ -1,6 +1,18 @@
-# Qwen Insert Anything Inpainting
+# InsertFuse — Qwen Insert Anything Inpainting
 
-This directory is the `main` baseline worktree at `inpainting-v2`. It keeps one maintained training and inference path:
+The integrated **Teacher v2** configs are in `configs/teacher_v2/`. See
+[`docs/teacher_v2.md`](docs/teacher_v2.md) for the combined precision, RNG,
+conditioning, identity/detail losses, validation and uv launch workflow.
+Use these configs for new runs; existing checkpoints retain their original configs.
+
+Teacher v2 and OPD now use pinned FlashAttention2 in both Qwen-VL and DiT.
+See [`docs/training_optimizations.md`](docs/training_optimizations.md) for CPU-only
+dependency preparation, checkpoint-derived OPD configs, batch-local encoding
+reuse, per-teacher conditioning, and elastic checkpoint recovery. Build new
+Teacher v2 OPD runs with `python -m scripts.build_opd_config`; the rank-256
+templates below remain descriptions of the older experts.
+
+This directory is the integrated InsertFuse worktree at `inpainting-v2-final-architecture`. It keeps one maintained training and inference path:
 
 - `QwenImageEditInsertAnythingTrainer`
 - `InsertAnythingDataset`
@@ -16,14 +28,14 @@ Current baseline configs enable `reference_cfg`. In this mode, `true_cfg_scale` 
 The project environment is managed by:
 
 ```bash
-./setup.sh
-conda activate qwen-inpainting-pre-insertion
+uv sync --offline --locked
 ```
 
-The pinned environment file is:
+The pinned environment files are:
 
 ```bash
-environment.yml
+pyproject.toml
+uv.lock
 ```
 
 ## Configs
@@ -89,13 +101,13 @@ Set `model.mask_control.enabled` to `true` to attach the placement mask as an ex
 Single-process entry:
 
 ```bash
-python -m src.main --config configs/default.yaml
+uv run --offline --no-sync python -m src.main --config configs/default.yaml
 ```
 
 Accelerate entry:
 
 ```bash
-accelerate launch -m src.main --config configs/default.yaml
+uv run --offline --no-sync accelerate launch -m src.main --config configs/default.yaml
 ```
 
 8-GPU example with an experiment config:

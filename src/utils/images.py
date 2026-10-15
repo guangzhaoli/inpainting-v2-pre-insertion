@@ -1,6 +1,6 @@
 import torch.nn.functional as F
 import torch
-from typing import Optional, Tuple, Union
+from typing import Tuple, Union
 import PIL
 from PIL import Image
 import numpy as np
@@ -123,7 +123,6 @@ def crop_to_mask_with_padding(
         squeeze_output = False
 
     B, C, H, W = image.shape
-    device = image.device
 
     # Find bounding box for each sample in batch
     cropped_images = []

@@ -4,11 +4,14 @@ Project-level instructions for Codex and other coding agents working in this rep
 
 ## Python Environment
 
-Use the project Conda environment for all Python commands:
+Use uv and the project `.venv` for Python commands:
 
 ```bash
-conda activate qwen-inpainting-pre-insertion
+uv run --offline --no-sync python ...
 ```
+
+Download missing packages only on a newly created Inspire CPU Notebook. Run
+`uv sync` there; GPU workers use `uv sync --offline --locked` or `uv run --no-sync`.
 
 ## Persistent Session Management
 

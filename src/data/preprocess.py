@@ -4,7 +4,6 @@ import PIL
 import torch
 import logging
 from src.data.config import ImageProcessorInitArgs
-from src.utils.images import calculate_best_resolution
 
 import math
 
@@ -155,6 +154,20 @@ def best_hw_given_area(
     return best[3], best[4]
 
 
+def aspect_preserving_size(width: int, height: int, pixels: int, align: int = 16):
+    """Approximate a pixel budget with only alignment-sized aspect distortion.
+
+    Unlike fixed_pixels, this does not factor an exact area. A small pixel
+    budget deviation is preferable to stretching reference subjects.
+    """
+    if min(width, height, pixels, align) <= 0:
+        raise ValueError("image dimensions, pixel budget and alignment must be positive")
+    scale = math.sqrt(pixels / (width * height))
+    new_w = max(align, round(width * scale / align) * align)
+    new_h = max(align, round(height * scale / align) * align)
+    return new_w, new_h
+
+
 class ImageProcessor:
     def __init__(self, processor_config: ImageProcessorInitArgs):
         self.processor_config = processor_config
@@ -206,11 +219,11 @@ class ImageProcessor:
             self.target_size = self.make_divisible(self.target_size)
         if self.controls_size is not None:
             self.controls_size = [self.make_divisible(size) for size in self.controls_size]
-        if self.target_pixels is not None:
+        if self.target_pixels is not None and self.processor_config.process_type != "aspect_pixels":
             self.target_pixels = best_area_near(self.target_pixels)['best_area']
             logging.info(f"target_pixels after best_hw_given_area {self.target_pixels}")
             # self.target_pixels = 32*32*(self.target_pixels//(32*32))
-        if self.controls_pixels is not None:
+        if self.controls_pixels is not None and self.processor_config.process_type != "aspect_pixels":
             self.controls_pixels = [best_area_near(pixel)['best_area'] for pixel in self.controls_pixels]
             # self.controls_pixels = [32*32*(size//(32*32)) for size in self.controls_pixels]
             logging.info(f"controls_pixels after best_hw_given_area {self.controls_pixels}")
@@ -346,6 +359,10 @@ class ImageProcessor:
             return self._padding(image, target_size, interpolation)
         elif self.processor_config.process_type == 'fixed_pixels':
             return self._fixed_pixels(image, target_pixels, interpolation)
+        elif self.processor_config.process_type == 'aspect_pixels':
+            h, w = image.shape[:2]
+            size = aspect_preserving_size(w, h, int(target_pixels), self.devisible_by)
+            return cv2.resize(image, size, interpolation=interpolation)
 
         else:
             # 默认使用居中裁剪

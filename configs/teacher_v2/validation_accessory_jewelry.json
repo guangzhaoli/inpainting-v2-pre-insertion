@@ -1,0 +1,92 @@
+[
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_image/1.png",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_mask/1.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_image/1.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_mask/1.png",
+    "stem": "1",
+    "category": "accessory",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_image/10.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_mask/10.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_image/10.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_mask/10.png",
+    "stem": "10",
+    "category": "accessory",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_image/2.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_mask/2.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_image/2.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_mask/2.png",
+    "stem": "2",
+    "category": "accessory",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_image/3.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_mask/3.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_image/3.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_mask/3.png",
+    "stem": "3",
+    "category": "accessory",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_image/4.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_mask/4.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_image/4.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_mask/4.png",
+    "stem": "4",
+    "category": "accessory",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_image/5.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_mask/5.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_image/5.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_mask/5.png",
+    "stem": "5",
+    "category": "accessory",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_image/6.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_mask/6.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_image/6.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_mask/6.png",
+    "stem": "6",
+    "category": "accessory",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_image/7.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_mask/7.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_image/7.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_mask/7.png",
+    "stem": "7",
+    "category": "accessory",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_image/8.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_mask/8.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_image/8.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_mask/8.png",
+    "stem": "8",
+    "category": "accessory",
+    "prompt": ""
+  },
+  {
+    "ref_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_image/9.jpg",
+    "ref_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/ref_mask/9.png",
+    "tar_image": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_image/9.jpg",
+    "tar_mask": "/inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/eval/testset_20260120/accessory/tar_mask/9.png",
+    "stem": "9",
+    "category": "accessory",
+    "prompt": ""
+  }
+]

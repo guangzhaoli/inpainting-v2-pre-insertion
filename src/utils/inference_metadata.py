@@ -225,6 +225,7 @@ def build_inference_config_metadata(config, config_path: Optional[Path] = None) 
         "trainer": str(_enum_value(getattr(config, "trainer", config.__class__.__name__))),
         "pretrained_model_name_or_path": str(config.model.pretrained_model_name_or_path),
         "quantize": bool(config.model.quantize),
+        "zero_cond_t": bool(getattr(config.model, "zero_cond_t", False)),
         "processor": _dump_model(config.data.init_args.processor.init_args),
         "adaptive_crop": _dump_model(config.data.init_args.adaptive_crop),
         "latent_anchoring": _dump_model(ensure_latent_anchoring_config(config)),
@@ -254,6 +255,7 @@ def _checkpoint_contract(config, adaptive_enabled_field: str) -> dict:
         "model": {
             "pretrained_model_name_or_path": str(config.model.pretrained_model_name_or_path),
             "quantize": bool(config.model.quantize),
+            "zero_cond_t": bool(getattr(config.model, "zero_cond_t", False)),
             "lora": {
                 "r": int(config.model.lora.r),
                 "lora_alpha": int(config.model.lora.lora_alpha),
@@ -365,6 +367,8 @@ def validate_resume_mask_control_compatibility(config, checkpoint_dir: Path) -> 
         )
 
     checkpoint_config = _load_checkpoint_train_config(train_config_path)
+    if bool(getattr(checkpoint_config.model, "zero_cond_t", False)) != bool(getattr(config.model, "zero_cond_t", False)):
+        raise ValueError("Resume checkpoint model.zero_cond_t mismatch; retain the checkpoint's condition timestep contract")
     checkpoint_contract = _effective_mask_control_contract(checkpoint_config)
     current_contract = _effective_mask_control_contract(config)
     mismatches = _flatten_contract_mismatches(

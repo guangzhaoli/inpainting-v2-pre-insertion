@@ -1,5 +1,11 @@
 # 多 Teacher On-Policy Distillation（OPD）
 
+Teacher v2 请使用 `uv run --offline --no-sync python -m scripts.build_opd_config`
+从实际 checkpoint 生成配置，不要仅替换旧 rank-256 模板里的路径。详见
+[`training_optimizations.md`](training_optimizations.md)。`teacher.weight` 现在是
+样本 loss 的绝对倍率，在每卡 batch size 1 和梯度累积下仍然生效；全 1 权重不变。
+默认轨迹驻留 GPU，条件编码和冻结 teacher 的几何 token 在 batch 内复用。
+
 这套实现把多个 task-specific Teacher 蒸馏到一个 Student LoRA，同时把会频繁变化的部分拆成配置和插件边界。当前可直接运行的路径是“同一 Qwen-Image-Edit 基座 + 多个兼容 LoRA Teacher”；异构完整模型 Teacher 也有独立 policy 后端契约，但需要对应 idea 分支提供具体 policy 类。
 
 ## 训练语义

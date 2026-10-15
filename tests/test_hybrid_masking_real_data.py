@@ -23,7 +23,7 @@ from src.utils.hybrid_masking import (
 )
 
 
-DEFAULT_DATA_ROOT = Path("/inspire/hdd/global_user/250041225002/project/qwen-inpainting/a2edit/data")
+DEFAULT_DATA_ROOT = Path(__file__).resolve().parents[2] / "a2edit/data"
 RUN_REAL_DATA_TESTS = os.environ.get("RUN_A2EDIT_REAL_DATA_TESTS") == "1"
 
 

@@ -150,6 +150,10 @@ class SharedLoRATeacherBackend:
                     f"Teacher {teacher.name!r} has no LoRA configuration; "
                     "use IndependentTeacherBackend for a full-model policy"
                 )
+            if teacher.name not in getattr(trainer, "_teacher_checkpoint_metadata", {}):
+                from src.distillation.checkpoints import validate_teacher_config
+
+                validate_teacher_config(trainer.config, teacher)
             adapter_name = teacher.lora.adapter_name
             if adapter_name == self._student_adapter:
                 raise ValueError(f"Teacher {teacher.name!r} reuses student adapter name {adapter_name!r}")
@@ -254,12 +258,17 @@ class SharedLoRATeacherBackend:
         teacher_name: str,
         trainer,
         condition: Mapping[str, Any],
+        token_cache=None,
     ) -> Dict[str, Any]:
         tokenizer = self._teacher_geometry_tokenizers.get(teacher_name)
         if tokenizer is None:
             return dict(condition)
 
         prepared = dict(condition)
+        if prepared.get("_geometry_teacher") == teacher_name:
+            return prepared
+        if token_cache is None:
+            token_cache = {}
         geometry = prepared.pop("mask_geometry", None)
         existing_tokens = prepared.get("mask_geometry_tokens")
         if geometry is not None and existing_tokens is not None:
@@ -293,11 +302,16 @@ class SharedLoRATeacherBackend:
                 target_size = (int(img_shapes[0][0][1]), int(img_shapes[0][0][2]))
             device = trainer._dit_device()
             tokenizer.to(device=device, dtype=trainer.weight_dtype)
-            with torch.no_grad():
-                prepared["mask_geometry_tokens"] = tokenizer(
-                    geometry.to(device=device, dtype=trainer.weight_dtype),
-                    target_size,
-                ).detach()
+            key = (id(geometry), tuple(target_size))
+            # Positive/null CFG share the exact same mask. Routing preserves
+            # aliases so each frozen companion is evaluated once per batch.
+            if key not in token_cache:
+                with torch.no_grad():
+                    token_cache[key] = tokenizer(
+                        geometry.to(device=device, dtype=trainer.weight_dtype), target_size,
+                    ).detach()
+            prepared["mask_geometry_tokens"] = token_cache[key]
+            prepared["_geometry_teacher"] = teacher_name
 
         null_condition = prepared.get("reference_cfg_embeddings")
         if isinstance(null_condition, Mapping):
@@ -305,8 +319,12 @@ class SharedLoRATeacherBackend:
                 teacher_name,
                 trainer,
                 null_condition,
+                token_cache,
             )
         return prepared
+
+    def prepare_condition(self, teacher, *, trainer, condition):
+        return self._tokenize_teacher_geometry(teacher.name, trainer, condition)
 
     @contextmanager
     def teacher(self, teacher_name: str) -> Iterator[None]:
@@ -348,6 +366,19 @@ class SharedLoRATeacherBackend:
                 condition,
                 guidance,
             )
+
+    def predict_velocities(
+        self, teacher, *, trainer, states, timesteps, condition, batch,
+        guidance, shared_predictor,
+    ):
+        """Evaluate selected rollout states with one adapter activation."""
+        del batch
+        condition = self._tokenize_teacher_geometry(teacher.name, trainer, condition)
+        with self.teacher(teacher.name):
+            return [
+                shared_predictor(trainer, state, timestep, condition, guidance)
+                for state, timestep in zip(states, timesteps)
+            ]
 
     def assert_frozen(self) -> None:
         """Fail fast if a teacher adapter was accidentally made trainable."""

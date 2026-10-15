@@ -714,7 +714,7 @@ class HybridMaskingTrainerRoutingTest(unittest.TestCase):
             context_guard_enabled=True,
             mask_loss=False,
         )
-        trainer.accelerator = SimpleNamespace(gather=lambda value: value)
+        trainer.accelerator = SimpleNamespace(gather=lambda value: value, device=torch.device("cpu"))
         config = trainer._hybrid_masking_cfg()
         gt_mask = torch.zeros(1, 10, 10)
         gt_mask[:, :2, :2] = 1

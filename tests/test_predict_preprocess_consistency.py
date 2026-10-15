@@ -70,6 +70,11 @@ class PredictPreprocessConsistencyTest(unittest.TestCase):
 
     def test_predict_matches_training_preprocessor_for_every_supported_geometry_mode(self):
         cases = {
+            "aspect_pixels": {
+                "process_type": "aspect_pixels",
+                "target_pixels": 256 * 256,
+                "controls_pixels": [256 * 256],
+            },
             "fixed_pixels": {
                 "process_type": "fixed_pixels",
                 "target_pixels": 256 * 256,

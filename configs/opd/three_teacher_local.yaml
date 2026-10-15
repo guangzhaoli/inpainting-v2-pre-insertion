@@ -108,7 +108,7 @@ distillation:
   rollout:
     num_inference_steps: 10
     timestep_fraction: 1.0
-    store_device: cpu
+    store_device: cuda
     seed: 42
   # Qwen OPD uses an unguided student and guided teachers, so guidance is
   # internalized into the deployed student rather than required at inference.

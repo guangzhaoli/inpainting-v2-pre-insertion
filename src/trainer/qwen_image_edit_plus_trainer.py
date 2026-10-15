@@ -49,19 +49,21 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
             torch_dtype=self.weight_dtype,
             transformer=None,
             vae=None,
+            text_encoder=None,
         )
-        pipe.to("cpu")
-        logging.info(f"excution device: {pipe._execution_device}")
 
         self.vae = load_vae(self.config.model.pretrained_model_name_or_path, weight_dtype=self.weight_dtype)
         self.text_encoder = load_qwenvl(
-            self.config.model.pretrained_model_name_or_path, weight_dtype=self.weight_dtype
+            self.config.model.pretrained_model_name_or_path, weight_dtype=self.weight_dtype,
+            attn_implementation=self.config.model.attention_backend,
         )
         logging.info(f"text_encoder device: {self.text_encoder.device}")
 
         self.dit = load_transformer(
             self.config.model.pretrained_model_name_or_path,
             weight_dtype=self.weight_dtype,
+            attention_backend=self.config.model.attention_backend,
+            zero_cond_t=self.config.model.zero_cond_t,
         )
 
         from transformers.models.qwen2.tokenization_qwen2 import Qwen2Tokenizer
@@ -130,6 +132,20 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
         return padded, attention_mask
 
     def prepare_embeddings(self, batch, stage="fit"):
+        # This cache lives for one OPD batch only. Keys use the original tensor
+        # identities, retained by the batch/cache, and the actual prompt/images.
+        cache = batch.pop("_opd_encoding_cache", None)
+        if cache is not None and stage != "opd":
+            raise ValueError("frozen condition reuse is only supported for OPD")
+
+        def cached(key, compute):
+            if cache is None:
+                return compute()
+            if key not in cache:
+                with torch.no_grad():
+                    cache[key] = compute()
+            return cache[key]
+
         if "image" in batch:
             batch["image"] = self.preprocess_image_for_vae_encoder(
                 batch["image"], input_range="0-1"
@@ -139,21 +155,27 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
 
         batch_size = batch["image"].shape[0] if "image" in batch else batch["control"].shape[0]
         condition_images_per_sample = [[] for _ in range(batch_size)]
+        image_cache_keys = []
+        control_cache_keys = {}
         vae_only_control_keys = self._normalize_control_keys(batch.get("vae_only_control_keys"))
         if "control" not in batch:
             raise ValueError("prepare_embeddings requires main control image under key 'control'")
 
         if "control" in batch:
             control_image = batch["control"]
-            prompt_control = self.preprocess_image_for_text_encoder(
-                control_image,
-                best_resolution=384 * 384,
-                input_range="0-1",
+            control_cache_keys["control"] = id(control_image)
+            image_cache_keys.append(id(control_image))
+            prompt_control = cached(
+                ("vl_pixels", id(control_image)),
+                lambda: self.preprocess_image_for_text_encoder(
+                    control_image, best_resolution=384 * 384, input_range="0-1"
+                ),
             )
             for batch_index in range(batch_size):
                 condition_images_per_sample[batch_index].append(prompt_control[batch_index])
-            batch["control"] = self.preprocess_image_for_vae_encoder(
-                batch["control"], input_range="0-1"
+            batch["control"] = cached(
+                ("vae_pixels", id(control_image)),
+                lambda: self.preprocess_image_for_vae_encoder(control_image, input_range="0-1"),
             )
             batch["width_control"] = batch["control"].shape[4]
             batch["height_control"] = batch["control"].shape[3]
@@ -170,34 +192,39 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
                     f"n_controls={num_additional_controls} requires missing key '{additional_control_key}'"
                 )
             additional_control_image = batch[additional_control_key]
+            control_cache_keys[additional_control_key] = id(additional_control_image)
             if additional_control_key not in vae_only_control_keys:
-                prompt_control = self.preprocess_image_for_text_encoder(
-                    additional_control_image,
-                    best_resolution=384 * 384,
-                    input_range="0-1",
+                image_cache_keys.append(id(additional_control_image))
+                prompt_control = cached(
+                    ("vl_pixels", id(additional_control_image)),
+                    lambda: self.preprocess_image_for_text_encoder(
+                        additional_control_image, best_resolution=384 * 384, input_range="0-1"
+                    ),
                 )
                 for batch_index in range(batch_size):
                     condition_images_per_sample[batch_index].append(prompt_control[batch_index])
-            batch[additional_control_key] = self.preprocess_image_for_vae_encoder(
-                batch[additional_control_key], input_range="0-1"
+            batch[additional_control_key] = cached(
+                ("vae_pixels", id(additional_control_image)),
+                lambda: self.preprocess_image_for_vae_encoder(additional_control_image, input_range="0-1"),
             )
             batch[f"width_control_{control_index + 1}"] = batch[additional_control_key].shape[4]
             batch[f"height_control_{control_index + 1}"] = batch[additional_control_key].shape[3]
 
         condition_images = [img for sample_imgs in condition_images_per_sample for img in sample_imgs]
-        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
-            prompt=batch["prompt"],
-            image=condition_images,
-        )
+        def encode_text(prompt):
+            prompts = (prompt,) if isinstance(prompt, str) else tuple(prompt)
+            return cached(
+                ("vl_embeddings", prompts, tuple(image_cache_keys)),
+                lambda: self.encode_prompt(prompt=prompt, image=condition_images),
+            )
+
+        prompt_embeds, prompt_embeds_mask = encode_text(batch["prompt"])
 
         batch["prompt_embeds_mask"] = prompt_embeds_mask
         batch["prompt_embeds"] = prompt_embeds
 
         if "negative_prompt" in batch and batch["true_cfg_scale"] > 1:
-            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
-                prompt=batch["negative_prompt"],
-                image=condition_images,
-            )
+            negative_prompt_embeds, negative_prompt_embeds_mask = encode_text(batch["negative_prompt"])
             batch["negative_prompt_embeds_mask"] = negative_prompt_embeds_mask
             batch["negative_prompt_embeds"] = negative_prompt_embeds
 
@@ -215,11 +242,9 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
         if "control" in batch:
             control = batch["control"]
             batch_size = control.shape[0]
-            control_latents = self.encode_image_latents(
-                control,
-                batch_size,
-                self.num_channels_latents,
-                self.weight_dtype,
+            control_latents = cached(
+                ("vae_latents", control_cache_keys["control"]),
+                lambda: self.encode_image_latents(control, batch_size, self.num_channels_latents, self.weight_dtype),
             )
             batch["control_latents"] = [control_latents]
 
@@ -227,11 +252,9 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
             control_key = f"control_{control_index}"
             control = batch[control_key]
             batch_size = control.shape[0]
-            control_latents = self.encode_image_latents(
-                control,
-                batch_size,
-                self.num_channels_latents,
-                self.weight_dtype,
+            control_latents = cached(
+                ("vae_latents", control_cache_keys[control_key]),
+                lambda: self.encode_image_latents(control, batch_size, self.num_channels_latents, self.weight_dtype),
             )
             batch["control_latents"].append(control_latents)
 
@@ -265,7 +288,6 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
         prompt: Union[str, List[str]],
         image: Optional[torch.Tensor] = None,
     ):
-        device = self.text_encoder.device
         num_images_per_prompt = 1
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
@@ -277,7 +299,8 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
                 new_images.append(PIL.Image.fromarray(image_array))
             image = new_images
 
-        with torch.no_grad():
+        with self.conditioning_context(), torch.no_grad():
+            device = self.text_encoder.device
             prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(
                 prompt,
                 image,

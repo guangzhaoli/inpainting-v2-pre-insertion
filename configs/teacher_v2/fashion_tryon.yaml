@@ -1,0 +1,203 @@
+# Integrated Teacher v2. Regenerate paths with scripts/build_optimized_teacher_configs.py.
+trainer: QwenImageEditInsertAnything
+model:
+  pretrained_model_name_or_path: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/pretrained_weights/Qwen-Image-Edit-2511
+  quantize: false
+  mask_control:
+    enabled: true
+    encoding: geometry_tokenizer
+    sigma_px: 16.0
+    mask_threshold: 0.5
+    tokenizer_hidden_channels: 32
+  reference_cfg:
+    enabled: true
+    train_dropout_rate: 0.1
+    force_empty_prompt: true
+    mask_aware: true
+    delta_clip_enabled: true
+    delta_clip_max_ratio: 1.0
+  lora:
+    r: 128
+    lora_alpha: 128
+    target_modules:
+    - to_q
+    - to_k
+    - to_v
+    - to_out.0
+    - add_q_proj
+    - add_k_proj
+    - add_v_proj
+    - to_add_out
+    - img_mlp.net.0.proj
+    - img_mlp.net.2
+    init_lora_weights: gaussian
+    adapter_name: insertfuse_teacher_v2_fashion_tryon_r128
+    pretrained_weight: null
+  attention_backend: flash_attention_2
+  zero_cond_t: true
+data:
+  class_path: src.data.insert_anything_dataset.InsertAnythingDataset
+  init_args:
+    dataset_path: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/data
+    manifest_path: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/inpainting-v2-final-architecture/manifests/insert_anything_teacher_fashion_tryon.csv
+    categories:
+    - clothes
+    - dress
+    - TopRef_BodyMask
+    - BottomRef_BodyMask
+    - TopRef_body_man
+    - pure_color
+    require_prompt: false
+    adaptive_crop:
+      train_enabled: true
+      predict_enabled: true
+      policy: bbox_area_linear
+      trigger_bbox_area_ratio: 0.2
+      min_crop_area_ratio: 0.125
+      context_margin_ratio: 0.35
+      mask_threshold: 0.5
+      min_crop_side: 16
+      aspect_mode: target
+      blend_mode: strict_mask
+    hybrid_masking:
+      enabled: true
+      strategy: maskmix_v2
+      person_categories:
+      - person
+      mask_threshold: 0.5
+      bbox_expand_ratio: 1.1
+      curve_jitter_px: 40
+      dilation_kernel_size: 7
+      dilation_iterations: 2
+      reference_resolution: 768
+      scale_pixel_parameters: true
+      ensure_gt_coverage: true
+      maskmix_v2:
+        mode_weights:
+          exact: 0.2
+          random_morphology: 0.2
+          augmented_box: 0.3
+          asymmetric_box: 0.3
+        asymmetric_box:
+          margin_ratio_min: 0.0
+          margin_ratio_max: 0.25
+        augmented_box:
+          jitter_object_scale_min: 0.05
+          jitter_object_scale_max: 0.2
+          jitter_min_px: 2
+          jitter_max_px: 64
+        morphology:
+          radius_object_scale_min: 0.02
+          radius_object_scale_max: 0.12
+          radius_min_px: 1
+          radius_max_px: 32
+          anisotropy_min: 1.5
+          anisotropy_max: 3.0
+          kernel_weights:
+            ellipse: 0.4
+            rectangle: 0.2
+            horizontal_ellipse: 0.2
+            vertical_ellipse: 0.2
+      context_guard:
+        enabled: true
+        max_condition_area_ratio: 0.8
+        overflow_policy: fallback_to_gt
+      interaction_dilation_px: 32
+    processor:
+      class_path: src.data.preprocess.ImageProcessor
+      init_args:
+        process_type: aspect_pixels
+        target_pixels: 1048576
+        controls_pixels:
+        - 1048576
+        - 1048576
+        resize_mode: bicubic
+    category_balanced_sampling: true
+    face_identity_supervision: false
+  batch_size: 1
+  num_workers: 8
+  shuffle: true
+  drop_last: true
+logging:
+  output_dir: logs/teacher_v2
+  tracker_project_name: insertfuse_teacher_v2_fashion_tryon
+  report_to: tensorboard
+  sampling:
+    enable: true
+    validation_steps: 1000
+    num_samples: 16
+    seed: 42
+    num_inference_steps: 40
+    true_cfg_scale: 2.5
+    guidance_scale: 1.0
+    output_dir: validation
+    panel_size: 320
+    save_composite: true
+    validation_data: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/inpainting-v2-final-architecture/configs/teacher_v2/validation_fashion_tryon.json
+    fixed_seed_across_steps: true
+optimizer:
+  class_path: torch.optim.AdamW
+  init_args:
+    lr: 5.0e-05
+    betas:
+    - 0.9
+    - 0.999
+    weight_decay: 0.01
+    eps: 1.0e-08
+lr_scheduler:
+  scheduler_type: cosine
+  warmup_steps: 500
+train:
+  memory_policy: auto
+  gradient_accumulation_steps: 1
+  max_train_steps: 100000000
+  num_epochs: 5
+  checkpointing_steps: 1000
+  checkpoints_total_limit: 20
+  max_grad_norm: 1.0
+  mixed_precision: bf16
+  gradient_checkpointing: true
+  trainable_precision: float32
+  rank_specific_rng: true
+  seed: 42
+loss:
+  mask_loss: true
+  forground_weight: 3.0
+  background_weight: 1.0
+  mask_loss_mode: region_balanced
+  region_perceptual: true
+  latent_mse_weight: 1.0
+  fg_lpips_weight: 0.5
+  bg_l1_weight: 0.5
+  fg_metric: lpips
+  lpips_net: vgg
+  lpips_linear_path: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/pretrained_weights/lpips/linear/vgg.pth
+  lpips_torch_home: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/pretrained_weights/torch
+  lpips_trunk_path: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/pretrained_weights/torch/hub/checkpoints/vgg16-397923af.pth
+  lpips_input_size: 256
+  lpips_bbox_pad_ratio: 0.1
+  mask_threshold: 0.5
+  region_sigma_power: 2.0
+  region_max_sigma: 0.5
+  ref_dino_weight: 0.2
+  dino_model_name: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/pretrained_weights/metrics_offline/dinov2-small
+  dino_input_size: 224
+  dino_bbox_pad_ratio: 0.1
+  dino_backend: transformers
+  face_dino_weight: 0.0
+  detail_lpips_weight: 0.25
+  detail_num_patches: 4
+  detail_patch_size: 256
+  boundary_l1_weight: 0.25
+  interaction_radius_px: 32
+predict:
+  devices:
+    vae: cpu
+    text_encoder: cpu
+    dit: cpu
+  latent_anchoring:
+    mode: expanded_soft
+    mask_threshold: 0.5
+    interaction_dilation_px: 32
+    transition_width_px: 16
+resume: null

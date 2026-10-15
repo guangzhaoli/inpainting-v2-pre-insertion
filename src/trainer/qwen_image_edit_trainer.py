@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F  # NOQA
 import PIL
-import gc
 import numpy as np
 from contextlib import contextmanager
 from typing import Optional, Union, List, Tuple
@@ -13,7 +12,6 @@ from diffusers.training_utils import (
 )
 from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import (
     QwenImageEditPipeline,
-    calculate_dimensions,
     retrieve_latents,
     randn_tensor,
 )
@@ -24,7 +22,6 @@ from src.utils.tools import infer_image_tensor
 from src.utils.latent_anchoring import latent_anchoring_enabled, normalize_latent_anchoring_mode
 from src.utils.images import (
     calculate_best_resolution,
-    image_adjust_best_resolution,
     make_image_devisible,
     make_image_shape_devisible,
     resize_mask_bhw,
@@ -455,9 +452,8 @@ class QwenImageEditTrainer(BaseTrainer):
             torch_dtype=self.weight_dtype,
             transformer=None,
             vae=None,
+            text_encoder=None,
         )
-        pipe.to("cpu")
-        logging.info(f"excution device: {pipe._execution_device}")
 
         # Separate individual components
 
@@ -465,7 +461,10 @@ class QwenImageEditTrainer(BaseTrainer):
 
         self.vae = load_vae("Qwen/Qwen-Image-Edit", weight_dtype=self.weight_dtype)  # use original one
         # same to model constructed from vae self.vae = pipe.vae
-        self.text_encoder = load_qwenvl("Qwen/Qwen-Image-Edit", weight_dtype=self.weight_dtype)  # use original one
+        self.text_encoder = load_qwenvl(
+            "Qwen/Qwen-Image-Edit", weight_dtype=self.weight_dtype,
+            attn_implementation=self.config.model.attention_backend,
+        )
         logging.info(f"text_encoder device: {self.text_encoder.device}")
         # self.dit = pipe.transformer this is same as the following, verified
         from src.models.load_model import load_transformer
@@ -473,6 +472,8 @@ class QwenImageEditTrainer(BaseTrainer):
         self.dit = load_transformer(
             self.config.model.pretrained_model_name_or_path,  # could use quantized version
             weight_dtype=self.weight_dtype,
+            attention_backend=self.config.model.attention_backend,
+            zero_cond_t=self.config.model.zero_cond_t,
         )
         # load_transformer is same as pipe.transformer
 
@@ -675,8 +676,11 @@ class QwenImageEditTrainer(BaseTrainer):
 
         if stage == "fit":
             # Training mode: need all encoders
+            self.resolve_memory_policy()
             self.vae.to(self.accelerator.device)
-            self.text_encoder.to(self.accelerator.device)
+            offload = getattr(getattr(self.config, "train", None), "offload_text_encoder", False)
+            encoder_device = "cpu" if offload else self.accelerator.device
+            self.text_encoder.to(encoder_device)
             # self.dit.to(self.accelerator.device)
             # Region-perceptual loss decodes pred_x0 through the VAE and backprops
             # through the decoder into DiT. Keeping decoder on CPU and only moving it
@@ -917,22 +921,52 @@ class QwenImageEditTrainer(BaseTrainer):
             edit_mask = None
 
         with torch.no_grad():
-            noise = torch.randn_like(image_latents, device=device, dtype=self.weight_dtype)
+            # Analysis callers may provide stateless randomness through private
+            # embedding keys.  Ordinary training never sets them and therefore
+            # preserves the original RNG path exactly.  The override lets
+            # category-gradient diagnostics match noise seeds and timesteps
+            # across semantically different samples without coupling them to
+            # variable-shape VAE/text-encoder RNG consumption.
+            analysis_noise_seed = embeddings.get("_analysis_noise_seed")
+            if analysis_noise_seed is None:
+                noise = torch.randn_like(image_latents, device=device, dtype=self.weight_dtype)
+            else:
+                noise_generator = torch.Generator(device=device)
+                noise_generator.manual_seed(int(analysis_noise_seed))
+                noise = torch.randn(
+                    image_latents.shape,
+                    generator=noise_generator,
+                    device=device,
+                    dtype=self.weight_dtype,
+                )
 
             # Sample timesteps
-            u = compute_density_for_timestep_sampling(
-                weighting_scheme="none",
-                batch_size=batch_size,
-                logit_mean=0.0,
-                logit_std=1.0,
-                mode_scale=1.29,
-            )
+            analysis_timestep_u = embeddings.get("_analysis_timestep_u")
+            if analysis_timestep_u is None:
+                u = compute_density_for_timestep_sampling(
+                    weighting_scheme="none",
+                    batch_size=batch_size,
+                    logit_mean=0.0,
+                    logit_std=1.0,
+                    mode_scale=1.29,
+                )
+            else:
+                u = torch.as_tensor(analysis_timestep_u, dtype=torch.float32).reshape(-1)
+                if u.numel() == 1:
+                    u = u.expand(batch_size)
+                if u.numel() != batch_size:
+                    raise ValueError(
+                        "_analysis_timestep_u must be scalar or have one value per sample, "
+                        f"got {u.numel()} values for batch_size={batch_size}"
+                    )
+                if not bool(torch.isfinite(u).all()) or bool(torch.any((u < 0) | (u >= 1))):
+                    raise ValueError("_analysis_timestep_u values must be finite and in [0, 1)")
             max_timestep_index = self.scheduler.config.num_train_timesteps - 1
             indices = (u * self.scheduler.config.num_train_timesteps).long().clamp(min=0, max=max_timestep_index)
-            schedule_timesteps, _ = self._get_cached_scheduler_training_tensors(device, image_latents.dtype)
-            timesteps = schedule_timesteps[indices.to(device=device)]
-
-            sigmas = self._get_sigmas(timesteps, n_dim=image_latents.ndim, dtype=image_latents.dtype)
+            schedule_timesteps, schedule_sigmas = self._get_cached_scheduler_training_tensors(device, image_latents.dtype)
+            indices = indices.to(device=device)
+            timesteps = schedule_timesteps[indices]
+            sigmas = schedule_sigmas[indices].reshape(batch_size, *((1,) * (image_latents.ndim - 1)))
             noisy_model_input = (1.0 - sigmas) * image_latents + sigmas * noise
             packed_input = torch.cat([noisy_model_input, control_latents], dim=1)
             txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
@@ -946,6 +980,7 @@ class QwenImageEditTrainer(BaseTrainer):
             img_shapes=img_shapes,
             txt_seq_lens=txt_seq_lens,
             mask_geometry=mask_geometry,
+            output_token_count=image_latents.size(1),
             return_dict=False,
         )[0]
         model_pred = model_pred[:, : image_latents.size(1)]
@@ -977,7 +1012,19 @@ class QwenImageEditTrainer(BaseTrainer):
         # region-loss batches fail deterministically instead of only when a
         # later low-noise sample happens to activate the pixel-space path.
         ref_dino_weight = float(getattr(self.config.loss, "ref_dino_weight", 0.0))
-        if ref_dino_weight > 0.0 and (
+        face_dino_weight = float(getattr(self.config.loss, "face_dino_weight", 0.0))
+        face_valid_fraction = latent_mse.detach().float().new_zeros(())
+        if "target_face_mask" in embeddings and "reference_face_mask" in embeddings:
+            face_valid_fraction = (
+                embeddings["target_face_mask"].flatten(1).gt(0).any(1)
+                & embeddings["reference_face_mask"].flatten(1).gt(0).any(1)
+            ).float().mean().to(device=device)
+        if not embeddings.get("reference_present_for_loss", True):
+            ref_dino_weight = 0.0
+            face_dino_weight = 0.0
+        if face_dino_weight > 0 and any(k not in embeddings for k in ("target_face_mask", "reference_face_mask")):
+            raise ValueError("face identity loss requires prepared target/reference face masks")
+        if (ref_dino_weight > 0.0 or face_dino_weight > 0.0) and (
             "ref_image_for_loss" not in embeddings or "ref_mask_for_loss" not in embeddings
         ):
             raise ValueError(
@@ -1008,6 +1055,10 @@ class QwenImageEditTrainer(BaseTrainer):
                 "train/region_fg_lpips": zero_metric.clone(),
                 "train/region_bg_l1": zero_metric.clone(),
                 "train/region_ref_dino": zero_metric.clone(),
+                "train/region_detail_lpips": zero_metric.clone(),
+                "train/region_boundary_l1": zero_metric.clone(),
+                "train/region_face_dino": zero_metric.clone(),
+                "train/face_pair_valid_fraction": face_valid_fraction,
                 "train/region_w_t_mean": sample_weights.detach().float().mean().reshape(()),
                 "train/region_w_t_max": sample_weights.detach().float().max().reshape(()),
                 "train/sigma_mean": sigmas.detach().float().reshape(sigmas.shape[0], -1)[:, 0].mean().reshape(()),
@@ -1058,7 +1109,7 @@ class QwenImageEditTrainer(BaseTrainer):
 
         ref_images = None
         ref_mask = None
-        if ref_dino_weight > 0.0:
+        if ref_dino_weight > 0.0 or face_dino_weight > 0.0:
             ref_images = self._move_tensor(
                 embeddings["ref_image_for_loss"], device=device, dtype=torch.float32
             )
@@ -1082,8 +1133,21 @@ class QwenImageEditTrainer(BaseTrainer):
             target_range=target_range,
             ref_range="0-1",
             sample_weights=sample_weights,
+            detail_weight=float(getattr(self.config.loss, "detail_lpips_weight", 0.0)),
+            detail_num_patches=int(getattr(self.config.loss, "detail_num_patches", 4)),
+            detail_patch_size=int(getattr(self.config.loss, "detail_patch_size", 256)),
+            boundary_weight=float(getattr(self.config.loss, "boundary_l1_weight", 0.0)),
+            interaction_radius_px=int(getattr(self.config.loss, "interaction_radius_px", 0)),
         )
         region_total = region_out["total"]
+        face_loss = region_total.new_zeros(())
+        if face_dino_weight > 0:
+            face_loss = self.region_perceptual_criterion._reference_dino_identity(
+                pred_images, self._move_tensor(embeddings["target_face_mask"], device=device, dtype=torch.float32),
+                ref_images, self._move_tensor(embeddings["reference_face_mask"], device=device, dtype=torch.float32),
+                pred_range="-1-1", ref_range="0-1", sample_valid=None, sample_weights=sample_weights,
+            )
+            region_total = region_total + face_dino_weight * face_loss
         total = latent_w * latent_mse + region_total
 
         # TensorBoard metrics only (no text spam). Progress bar still shows total loss only.
@@ -1095,6 +1159,10 @@ class QwenImageEditTrainer(BaseTrainer):
             "train/region_fg_lpips": region_out["fg_lpips"].detach().float().reshape(()),
             "train/region_bg_l1": region_out["bg_l1"].detach().float().reshape(()),
             "train/region_ref_dino": region_out["ref_dino"].detach().float().reshape(()),
+            "train/region_detail_lpips": region_out.get("detail_lpips", region_total.new_zeros(())).detach().float().reshape(()),
+            "train/region_boundary_l1": region_out.get("boundary_l1", region_total.new_zeros(())).detach().float().reshape(()),
+            "train/region_face_dino": face_loss.detach().float().reshape(()),
+            "train/face_pair_valid_fraction": face_valid_fraction,
             "train/region_w_t_mean": sample_weights.detach().float().mean().reshape(()),
             "train/region_w_t_max": sample_weights.detach().float().max().reshape(()),
             "train/sigma_mean": sigmas.detach().float().reshape(sigmas.shape[0], -1)[:, 0].mean().reshape(()),
@@ -1177,7 +1245,6 @@ class QwenImageEditTrainer(BaseTrainer):
                 Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
                 provided, text embeddings will be generated from `prompt` input argument.
         """
-        device = self.text_encoder.device
         num_images_per_prompt = 1  # 固定为1，支持单图像生成
         prompt = [prompt] if isinstance(prompt, str) else prompt
         batch_size = len(prompt)
@@ -1192,7 +1259,8 @@ class QwenImageEditTrainer(BaseTrainer):
                 new_images.append(img)
             image = new_images
 
-        with torch.inference_mode():
+        with self.conditioning_context(), torch.inference_mode():
+            device = self.text_encoder.device
             prompt_embeds, prompt_embeds_mask = self._get_qwen_prompt_embeds(prompt, image, device)
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
@@ -1654,6 +1722,7 @@ class QwenImageEditTrainer(BaseTrainer):
                             txt_seq_lens=txt_seq_lens,
                             mask_geometry_tokens=mask_geometry_tokens,
                             attention_kwargs=self.attention_kwargs,
+                            output_token_count=latents.size(1),
                             return_dict=False,
                         )[0]
                         noise_pred = noise_pred[:, : latents.size(1)]
@@ -1676,6 +1745,7 @@ class QwenImageEditTrainer(BaseTrainer):
                                 txt_seq_lens=reference_cfg_txt_seq_lens,
                                 mask_geometry_tokens=reference_cfg_mask_geometry_tokens,
                                 attention_kwargs=self.attention_kwargs,
+                                output_token_count=latents.size(1),
                                 return_dict=False,
                             )[0]
                             reference_cfg_noise_pred = reference_cfg_noise_pred[:, : latents.size(1)]
@@ -1707,6 +1777,7 @@ class QwenImageEditTrainer(BaseTrainer):
                                 txt_seq_lens=negative_txt_seq_lens,
                                 mask_geometry_tokens=mask_geometry_tokens,
                                 attention_kwargs=self.attention_kwargs,
+                                output_token_count=latents.size(1),
                                 return_dict=False,
                             )[0]
                             neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
@@ -1727,6 +1798,11 @@ class QwenImageEditTrainer(BaseTrainer):
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
                 generated_next = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                # Flow scheduler arithmetic can promote BF16 latents to FP32.
+                # The anchoring tensors are prepared in model dtype, so restore
+                # the latent stream dtype before mixing the source trajectory.
+                if generated_next.dtype != latents_dtype:
+                    generated_next = generated_next.to(latents_dtype)
                 if do_latent_anchoring:
                     latents = self._apply_post_step_latent_anchoring(
                         generated_next=generated_next,
@@ -1740,8 +1816,7 @@ class QwenImageEditTrainer(BaseTrainer):
                     latents = generated_next
 
                 if latents.dtype != latents_dtype:
-                    if torch.backends.mps.is_available():
-                        latents = latents.to(latents_dtype)
+                    latents = latents.to(latents_dtype)
         self._current_timestep = None
         return latents
 
@@ -1792,5 +1867,16 @@ class QwenImageEditTrainer(BaseTrainer):
         )
         latents = latents / latents_std + latents_mean
         # VAE weights are frozen but the forward still propagates grads to inputs.
-        images = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
+        if getattr(getattr(getattr(self, "config", None), "train", None), "checkpoint_vae_decode", False) and latents.requires_grad:
+            from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
+
+            # Qwen VAE clears its temporal caches at decode entry/exit. Complete
+            # recomputation so checkpoint early-stop cannot leave partial caches.
+            with set_checkpoint_early_stop(False):
+                images = checkpoint(
+                    lambda z: self.vae.decode(z, return_dict=False)[0][:, :, 0],
+                    latents, use_reentrant=False,
+                )
+        else:
+            images = self.vae.decode(latents, return_dict=False)[0][:, :, 0]
         return images

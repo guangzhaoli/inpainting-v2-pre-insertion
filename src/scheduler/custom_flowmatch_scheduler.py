@@ -1,4 +1,3 @@
-import math
 from typing import Union
 from torch.distributions import LogNormal
 from diffusers import FlowMatchEulerDiscreteScheduler

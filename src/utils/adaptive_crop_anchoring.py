@@ -12,7 +12,6 @@ from PIL import Image
 
 from src.utils.adaptive_crop import (
     AdaptiveCropPlan,
-    _binary_mask,
     build_adaptive_crop_plan,
     crop_pil_mask,
 )

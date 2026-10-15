@@ -95,9 +95,9 @@ def test_velocity_matching_supports_token_mask_broadcast_and_teacher_weight():
     )
 
     # sample losses: 0.5 * mean([1, 9]) = 2.5 and
-    # 0.5 * mean([36, 64]) = 25; batch reduction is confidence weighted.
+    # 0.5 * mean([36, 64]) = 25; weights are absolute, then averaged over samples.
     assert torch.allclose(result.per_sample, torch.tensor([2.5, 25.0]))
-    assert torch.allclose(result.loss, torch.tensor((2.5 + 3 * 25.0) / 4.0))
+    assert torch.allclose(result.loss, torch.tensor((2.5 + 3 * 25.0) / 2.0))
 
     broadcast_mask = torch.ones(2, 1, 1)
     full = VelocityMatchingObjective()(student, teacher, mask=broadcast_mask)

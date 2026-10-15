@@ -24,10 +24,10 @@ from src.utils.visualization import (
     stack_rows,
 )
 from src.utils.adaptive_crop import (
-    build_adaptive_crop_plan,
     crop_pil_pair,
     restore_pil_output,
 )
+from src.utils.adaptive_crop_anchoring import prepare_adaptive_crop_for_inference
 from src.utils.inference_metadata import (
     build_effective_inference_metadata,
     build_inference_config_metadata,
@@ -148,21 +148,15 @@ class InsertAnythingValidationSampler:
             )
 
     def _validation_latent_anchoring_metadata(self) -> Dict[str, Any]:
-        """Describe the configured standalone mode and validation's forced A mode."""
+        """Validation and deployment use the same primary-output contract."""
 
         configured = ensure_latent_anchoring_config(self.config)
-        effective = type(configured).model_validate(
-            {
-                **configured.model_dump(mode="python"),
-                "mode": "legacy",
-            }
-        )
         configured_metadata = latent_anchoring_metadata(configured)
         return {
             "configured": configured_metadata,
-            "effective": latent_anchoring_metadata(effective),
-            "forced_legacy_for_validation": True,
-            "configured_mode_overridden": configured_metadata["mode"] != "legacy",
+            "effective": configured_metadata,
+            "forced_legacy_for_validation": False,
+            "configured_mode_overridden": False,
         }
 
     def _build_source(self, train_dataloader):
@@ -231,10 +225,19 @@ class InsertAnythingValidationSampler:
 
         saved_records = []
         row_paths = []
+        rank = int(getattr(accelerator, "process_index", 0))
+        world = int(getattr(accelerator, "num_processes", 1))
+        # DDP forward counts must remain identical. Pad the final round with
+        # duplicate work, but save each real sample exactly once.
+        rounds = (len(self.sample_indices) + world - 1) // world
         with _preserve_rng_state():
-            for order, sample_index in enumerate(self.sample_indices):
+            for round_index in range(rounds):
+                order = round_index * world + rank
+                is_real_sample = order < len(self.sample_indices)
+                actual_order = order if is_real_sample else 0
+                sample_index = self.sample_indices[actual_order]
                 sample = self.source.get_sample(sample_index)
-                sample_seed = self._seed_sample(global_step, order)
+                sample_seed = self._seed_sample(global_step, actual_order)
                 validate_inference_mode_inputs(
                     self.config,
                     prompt=sample.prompt,
@@ -249,14 +252,21 @@ class InsertAnythingValidationSampler:
                     )
                 adaptive_crop_config = self.config.data.init_args.adaptive_crop
                 crop_plan = None
+                anchoring = ensure_latent_anchoring_config(self.config)
+                anchored = anchoring.mode.value != "legacy"
+                edge_feather_px = 0
                 predict_source = source
                 predict_source_mask = source_mask
                 if adaptive_crop_config.predict_enabled:
-                    crop_plan = build_adaptive_crop_plan(
+                    crop_plan, crop_compatibility = prepare_adaptive_crop_for_inference(
                         image_size=source.size,
                         mask=source_mask,
-                        config=adaptive_crop_config,
+                        adaptive_crop_config=adaptive_crop_config,
+                        config=self.config,
+                        processor_config=self.config.data.init_args.processor,
                     )
+                    if anchored and crop_plan.applied:
+                        edge_feather_px = int(crop_compatibility.get("feather_width_px", 8))
                     predict_source, predict_source_mask = crop_pil_pair(
                         source,
                         source_mask,
@@ -272,10 +282,7 @@ class InsertAnythingValidationSampler:
                     guidance_scale=float(self.sampling_config.guidance_scale),
                     negative_prompt=self.sampling_config.negative_prompt,
                     weight_dtype=trainer.weight_dtype,
-                    # This rollout implements A/B/C/D only for standalone inference outputs.
-                    # Keep training-time validation on legacy A until its saver supports
-                    # anchored-primary output semantics and mask artifacts.
-                    latent_anchoring_mode="legacy",
+                    latent_anchoring_mode=anchoring.mode.value,
                 )
                 local_generated = ensure_rgb(generated_images[0])
                 if crop_plan is not None:
@@ -295,7 +302,18 @@ class InsertAnythingValidationSampler:
                         adaptive_crop_config.mask_threshold,
                     )
 
-                if accelerator.is_main_process:
+                primary = final_composite
+                if anchored:
+                    primary = raw_restored
+                    if edge_feather_px:
+                        primary, _ = restore_pil_output(
+                            original_source=source, original_mask=source_mask,
+                            local_output=local_generated, plan=crop_plan,
+                            blend_mode=adaptive_crop_config.blend_mode,
+                            edge_feather_px=edge_feather_px,
+                        )
+
+                if is_real_sample:
                     record, row_path = self._save_sample_outputs(
                         output_dir=output_dir,
                         order=order,
@@ -303,6 +321,7 @@ class InsertAnythingValidationSampler:
                         sample_seed=sample_seed,
                         raw_restored=raw_restored,
                         final_composite=final_composite,
+                        primary_output=primary,
                         crop_plan=crop_plan,
                         cropped_source=predict_source if crop_plan is not None else None,
                         cropped_mask=predict_source_mask if crop_plan is not None else None,
@@ -312,13 +331,38 @@ class InsertAnythingValidationSampler:
                             trainer,
                         ),
                     )
+                    from src.utils.teacher_validation import teacher_validation_metrics
+
+                    context_width = predict_source.width
+                    radius = int(getattr(self.config.loss, "interaction_radius_px", 0)) if hasattr(self.config, "loss") else 0
+                    record["metrics"] = teacher_validation_metrics(
+                        sample, raw_restored,
+                        criterion=getattr(trainer, "region_perceptual_criterion", None),
+                        device=getattr(accelerator, "device", "cpu"),
+                        exclusion_radius=radius * context_width / local_generated.width,
+                    )
                     saved_records.append(record)
                     row_paths.append(row_path)
 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
+        if world > 1:
+            from accelerate.utils import gather_object
+
+            saved_records = gather_object(saved_records)
+            saved_records.sort(key=lambda record: record["order"])
+            row_paths = [Path(record["paths"]["row"]) for record in saved_records]
         if accelerator.is_main_process:
+            metric_names = {key for record in saved_records for key in record.get("metrics", {})}
+            metrics = {
+                name: float(np.mean([r["metrics"][name] for r in saved_records if name in r.get("metrics", {})]))
+                for name in metric_names
+            }
+            with (output_dir / "metrics.json").open("w") as stream:
+                json.dump({"step": global_step, "samples": len(saved_records), "metrics": metrics}, stream, indent=2)
+            if hasattr(accelerator, "log"):
+                accelerator.log({f"validation/{key}": value for key, value in metrics.items()}, step=global_step)
             all_rows_path = output_dir / "all_rows.png"
             grid_path = output_dir / "grid.png"
             sheet = stack_rows(row_paths, all_rows_path)
@@ -337,7 +381,8 @@ class InsertAnythingValidationSampler:
         return base_dir / f"step-{global_step:08d}"
 
     def _seed_sample(self, global_step: int, order: int) -> int:
-        seed = int(self.sampling_config.seed) + int(global_step) * 1_000_003 + order
+        step_component = 0 if self.sampling_config.fixed_seed_across_steps else int(global_step) * 1_000_003
+        seed = int(self.sampling_config.seed) + step_component + order
         random.seed(seed)
         np.random.seed(seed % (2**32))
         torch.manual_seed(seed)
@@ -358,6 +403,7 @@ class InsertAnythingValidationSampler:
         cropped_mask: Optional[Image.Image] = None,
         local_generated: Optional[Image.Image] = None,
         guidance_embeds_enabled: Optional[bool] = None,
+        primary_output: Optional[Image.Image] = None,
     ):
         prefix = f"{order:03d}-idx{sample.index:06d}-{_safe_name(sample.category)}-{_safe_name(sample.stem)}"
         source = ensure_rgb(sample.tar_image)
@@ -365,7 +411,7 @@ class InsertAnythingValidationSampler:
         reference = ensure_rgb(sample.ref_image)
         reference_mask = ensure_mask(sample.ref_mask)
         raw_output = ensure_rgb(raw_restored)
-        output = ensure_rgb(final_composite)
+        output = ensure_rgb(primary_output if primary_output is not None else final_composite)
         if raw_output.size != source.size or output.size != source.size:
             raise ValueError("validation restored and final outputs must match the original source size")
         if local_generated is None:
@@ -394,6 +440,7 @@ class InsertAnythingValidationSampler:
         paths["final_composite"] = paths["output"]
         if self.sampling_config.save_composite:
             paths["composite"] = output_dir / f"{prefix}_composite.png"
+            paths["final_composite"] = paths["composite"]
         if crop_plan is not None:
             paths["crop_source"] = output_dir / f"{prefix}_crop_source.png"
             paths["crop_mask"] = output_dir / f"{prefix}_crop_mask.png"
@@ -410,7 +457,7 @@ class InsertAnythingValidationSampler:
         save_mask(output_mask, paths["output_mask"])
         make_mask_overlay(raw_output, output_mask).save(paths["output_mask_overlay"])
         if self.sampling_config.save_composite:
-            output.save(paths["composite"])
+            ensure_rgb(final_composite).save(paths["composite"])
         if crop_plan is not None:
             if cropped_source is None or cropped_mask is None:
                 raise ValueError("adaptive crop validation outputs require crop source and mask")
@@ -475,7 +522,8 @@ class InsertAnythingValidationSampler:
             "num_samples": int(self.sampling_config.num_samples),
             "seed": {
                 "base": int(self.sampling_config.seed),
-                "formula": "base + global_step * 1000003 + sample_order",
+                "formula": ("base + sample_order" if self.sampling_config.fixed_seed_across_steps
+                            else "base + global_step * 1000003 + sample_order"),
             },
             "config": build_inference_config_metadata(self.config),
             "checkpoint": {
@@ -493,7 +541,7 @@ class InsertAnythingValidationSampler:
             "adaptive_crop": self.config.data.init_args.adaptive_crop.model_dump(mode="json"),
             "latent_anchoring": self._validation_latent_anchoring_metadata(),
             "output_semantics": {
-                "output": "Final strict-mask composite in original source coordinates.",
+                "output": "Configured primary result in original source coordinates; composite is the strict-mask comparison.",
                 "output_local": "Direct model output in processor coordinates.",
                 "output_restored_raw": "Model output mapped to original source coordinates before mask compositing.",
             },

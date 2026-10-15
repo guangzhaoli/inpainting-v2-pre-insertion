@@ -192,9 +192,12 @@ class BaseTrainer(ABC):
         )
         # Never write False back: SIGINT may arrive after the local flag was
         # copied into interrupt_flag but before this collective completes.
-        if bool(interrupt_flag.item()):
+        globally_interrupted = bool(interrupt_flag.item())
+        if globally_interrupted:
             self.training_interrupted = True
-        return bool(self.training_interrupted)
+        # A late local signal stays latched for the next collective. Only this
+        # collective's result may decide whether ranks exit the batch together.
+        return globally_interrupted
 
     def log_model_info(self):
         """Log model information."""
@@ -331,12 +334,12 @@ class BaseTrainer(ABC):
             gc.collect()
 
             self.dit, optimizer, train_dataloader = self.accelerator.prepare(
-                self.dit, self.optimizer, train_dataloader
+                self.dit, self.optimizer, train_dataloader, device_placement=[True, True, False]
             )
         else:
             self.dit = self.dit.to(self.accelerator.device)
             self.dit, optimizer, train_dataloader = self.accelerator.prepare(
-                self.dit, self.optimizer, train_dataloader
+                self.dit, self.optimizer, train_dataloader, device_placement=[True, True, False]
             )
         self.optimizer = optimizer
 
@@ -389,6 +392,35 @@ class BaseTrainer(ABC):
             if grad_norm is not None:
                 return float(grad_norm)
         return None
+
+    @contextmanager
+    def conditioning_context(self):
+        """Keep the frozen text encoder resident only during its own forward."""
+        offload = getattr(getattr(getattr(self, "config", None), "train", None), "offload_text_encoder", False)
+        # Standalone prediction uses predict.devices; training and its in-memory
+        # validation use the Accelerator's placement policy.
+        offload = offload and getattr(self, "accelerator", None) is not None
+        if offload:
+            with torch.inference_mode(False):
+                self.text_encoder.to(self.accelerator.device)
+        try:
+            yield
+        finally:
+            if offload:
+                with torch.inference_mode(False):
+                    self.text_encoder.to("cpu")
+
+    def resolve_memory_policy(self):
+        """Use the validated H100 memory path; avoid transfers/recompute on H200."""
+        train = getattr(self.config, "train", None)
+        if getattr(train, "memory_policy", "configured") != "auto" or self.accelerator.device.type != "cuda":
+            return
+        total_gib = torch.cuda.get_device_properties(self.accelerator.device).total_memory / 2**30
+        constrained = total_gib <= 96
+        train.offload_text_encoder = constrained
+        train.checkpoint_vae_decode = constrained and bool(getattr(self.config.loss, "region_perceptual", False))
+        logging.info("Training memory policy: %.1f GiB, text offload=%s, VAE checkpoint=%s",
+                     total_gib, train.offload_text_encoder, train.checkpoint_vae_decode)
 
     def training_step(self, batch: dict) -> torch.Tensor:
         """Training step, batch from dataloader"""
@@ -449,6 +481,11 @@ class BaseTrainer(ABC):
 
     def train_epoch(self, epoch, train_dataloader):
         self._set_dataloader_epoch(train_dataloader, epoch)
+        self._epoch_sample_offset = (
+            getattr(self, "_resume_sample_offset", 0)
+            if epoch == self.start_epoch else 0
+        )
+        self._epoch_completed = False
         skip_batches = self.resume_batch_in_epoch if epoch == self.start_epoch else 0
         self.batch_in_epoch = skip_batches
         accumulated_loss_sum = None
@@ -456,6 +493,7 @@ class BaseTrainer(ABC):
         accumulated_metric_sums = None
         accumulated_metric_count = None
         optimizer_step_start_time = None
+        accumulated_microbatches = 0
         if skip_batches > 0:
             logging.info(f"Resuming epoch {epoch}, skipping {skip_batches} already-consumed batches.")
 
@@ -481,6 +519,7 @@ class BaseTrainer(ABC):
             with self.accelerator.accumulate(self.dit):
                 self._step_loss_metrics = None
                 loss = self.backward_training_step(batch)
+                accumulated_microbatches += 1
                 loss_for_logging = loss.detach().float()
                 if loss_for_logging.ndim != 0:
                     loss_for_logging = loss_for_logging.mean()
@@ -515,6 +554,15 @@ class BaseTrainer(ABC):
                     batch_size=self.batch_size * self.accelerator.num_processes,
                     num_tokens=None,
                 )
+                if self.accelerator.sync_gradients:
+                    accumulation_steps = self.config.train.gradient_accumulation_steps
+                    if accumulated_microbatches < accumulation_steps:
+                        # Accelerate divides every backward by the configured
+                        # window, including a shorter final window. Restore the
+                        # actual mean before clipping and updating the optimizer.
+                        gradients = [p.grad for p in self._trainable_params if p.grad is not None]
+                        torch._foreach_mul_(gradients, accumulation_steps / accumulated_microbatches)
+                    accumulated_microbatches = 0
                 grad_norm = self.clip_gradients()
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -523,25 +571,26 @@ class BaseTrainer(ABC):
                 optimizer_step_start_time = None
                 self.lr_scheduler.step()
                 self.batch_in_epoch = batch_idx + 1
-                gathered_loss_sum = self.accelerator.gather(accumulated_loss_sum).sum()
-                gathered_loss_count = self.accelerator.gather(accumulated_loss_count).sum()
-                if gathered_loss_count.item() <= 0:
+                self._epoch_completed = self.batch_in_epoch == len(train_dataloader)
+                metric_keys = tuple(sorted(accumulated_metric_sums or {}))
+                values = [accumulated_loss_sum, accumulated_loss_count]
+                if metric_keys:
+                    values += [accumulated_metric_count]
+                    values += [accumulated_metric_sums[key] for key in metric_keys]
+                totals = self.accelerator.reduce(torch.stack(values), reduction="sum").cpu().tolist()
+                if totals[1] <= 0:
                     raise RuntimeError("Accumulated loss count must be positive before logging.")
-                self.train_loss = (gathered_loss_sum / gathered_loss_count).item()
+                self.train_loss = totals[0] / totals[1]
                 accumulated_loss_sum = None
                 accumulated_loss_count = None
                 self.running_loss = 0.9 * self.running_loss + 0.1 * self.train_loss
 
                 # Average optional loss breakdowns across micro-batches and ranks.
                 self.train_loss_metrics = {}
-                if accumulated_metric_sums is not None and accumulated_metric_count is not None:
-                    gathered_metric_count = self.accelerator.gather(accumulated_metric_count).sum()
-                    if gathered_metric_count.item() > 0:
-                        for key, metric_sum in accumulated_metric_sums.items():
-                            gathered_metric_sum = self.accelerator.gather(metric_sum).sum()
-                            self.train_loss_metrics[key] = (
-                                gathered_metric_sum / gathered_metric_count
-                            ).item()
+                if metric_keys and totals[2] > 0:
+                    self.train_loss_metrics = {
+                        key: value / totals[2] for key, value in zip(metric_keys, totals[3:])
+                    }
                 accumulated_metric_sums = None
                 accumulated_metric_count = None
 
@@ -657,6 +706,7 @@ class BaseTrainer(ABC):
         """Load global_step/epoch metadata for resume."""
         if self.config.resume is not None:
             st = self._load_train_state(self.config.resume)
+            self._resume_state = st
             self.global_step = st["global_step"]
             self.start_epoch = st["epoch"]
             self.resume_batch_in_epoch = st.get("batch_in_epoch", 0)
@@ -664,17 +714,75 @@ class BaseTrainer(ABC):
             self.global_step = 0
             self.start_epoch = 0
             self.resume_batch_in_epoch = 0
+        self.batch_in_epoch = self.resume_batch_in_epoch
+
+    def prepare_resume_dataloader(self, train_dataloader):
+        if train_dataloader.generator is None:
+            train_dataloader.generator = torch.Generator().manual_seed(self.config.train.seed)
+        self._sampler_num_samples = len(train_dataloader.sampler)
+        self._resume_sample_offset = 0
+        self._epoch_sample_offset = 0
+        state = getattr(self, "_resume_state", {})
+        old_world = int(state.get("num_processes", self.accelerator.num_processes))
+        saved_config = None
+        if state and ("data_batch_size" not in state or "effective_max_train_steps" not in state):
+            from src.utils.inference_metadata import find_checkpoint_train_config
+            import yaml
+
+            saved_config = yaml.safe_load(find_checkpoint_train_config(Path(self.config.resume)).read_text())
+        saved_batch = (saved_config or {}).get("data", {}).get("batch_size", self.config.data.batch_size)
+        old_batch = int(state.get("data_batch_size", saved_batch))
+        if old_batch != self.config.data.batch_size:
+            raise ValueError("Exact resume requires unchanged data.batch_size")
+        if state.get("sampler_num_samples", self._sampler_num_samples) != self._sampler_num_samples:
+            raise ValueError("Resume dataset/sampler length changed; cannot map the saved global sample cursor")
+        elastic = old_world != self.accelerator.num_processes
+        if state and ("global_samples_in_epoch" in state or elastic):
+            from src.data.resume import resume_dataloader
+
+            cursor = int(state.get("global_samples_in_epoch", self.resume_batch_in_epoch * old_world * old_batch))
+            if cursor >= self._sampler_num_samples:
+                self.start_epoch += 1
+                cursor = 0
+            self._resume_sample_offset = cursor
+            self._epoch_sample_offset = cursor
+            self.resume_batch_in_epoch = 0
+            self.batch_in_epoch = 0
+            drop_last = False if elastic else bool(state.get("dataloader_drop_last", train_dataloader.drop_last))
+            train_dataloader = resume_dataloader(train_dataloader, self.start_epoch, cursor, drop_last=drop_last)
+        self._dataloader_drop_last = train_dataloader.drop_last
+        global_batch = self.config.data.batch_size * self.accelerator.num_processes
+        self._full_epoch_num_batches = (
+            self._sampler_num_samples // global_batch if train_dataloader.drop_last
+            else math.ceil(self._sampler_num_samples / global_batch)
+        )
+        if elastic and "effective_max_train_steps" not in state:
+            # Legacy checkpoints have a local batch cursor. Reconstruct their
+            # original optimizer-step budget; expansion must not shorten it.
+            saved_train = saved_config.get("train", {})
+            old_accum = int(saved_train.get("gradient_accumulation_steps", 4))
+            old_epochs = int(saved_train.get("num_epochs", 3))
+            old_batches = self._sampler_num_samples // (old_world * old_batch)
+            state["effective_max_train_steps"] = min(
+                int(saved_train.get("max_train_steps", 1000)),
+                old_epochs * math.ceil(old_batches / old_accum),
+            )
+        return train_dataloader
 
     def compute_training_schedule(self, train_dataloader):
         """Compute the effective training length using both step and epoch limits."""
-        num_batches = max(1, len(train_dataloader))
+        num_batches = max(1, getattr(self, "_full_epoch_num_batches", len(train_dataloader)))
         self.num_update_steps_per_epoch = max(
             1,
             math.ceil(num_batches / self.config.train.gradient_accumulation_steps),
         )
         epoch_limited_steps = self.config.train.num_epochs * self.num_update_steps_per_epoch
-        self.effective_max_train_steps = min(self.config.train.max_train_steps, epoch_limited_steps)
-        self.num_epochs = self.config.train.num_epochs
+        saved_budget = int(getattr(self, "_resume_state", {}).get("effective_max_train_steps", 0))
+        self.effective_max_train_steps = min(self.config.train.max_train_steps, max(epoch_limited_steps, saved_budget))
+        remaining = max(0, self.effective_max_train_steps - self.global_step)
+        first_epoch_steps = math.ceil(len(train_dataloader) / self.config.train.gradient_accumulation_steps)
+        extra_epochs = math.ceil(max(0, remaining - first_epoch_steps) / self.num_update_steps_per_epoch)
+        self.num_epochs = max(self.config.train.num_epochs, self.start_epoch + 1 + extra_epochs) if remaining else self.start_epoch
         remaining_steps = max(0, self.effective_max_train_steps - self.global_step)
         logging.info(
             "Training schedule: %s batches/epoch, %s optimizer steps/epoch, epoch_limited_steps=%s, "
@@ -717,11 +825,15 @@ class BaseTrainer(ABC):
         """Main training loop implementation."""
         self.setup_signal_handlers()
         self.setup_accelerator()
-        self.load_model()
+        if getattr(getattr(self.config, "distillation", None), "enabled", False):
+            from src.distillation.checkpoints import preflight_teacher_checkpoints
+
+            self._teacher_checkpoint_metadata = preflight_teacher_checkpoints(self.config)
         if self.config.resume is not None:
             self._validate_lora_resume_checkpoint(self.config.resume)
             self.config.model.lora.pretrained_weight = self._resolve_resume_lora_weight(self.config.resume)
             logging.info(f"Loaded checkpoint from {self.config.model.lora.pretrained_weight}")
+        self.load_model()
         if self.config.model.quantize:
             self.dit = self.quantize_model(
                 self.dit,
@@ -736,14 +848,23 @@ class BaseTrainer(ABC):
             self.setup_training_strategy()
 
         self.setup_model_device_train_mode(stage="fit")
+        from src.utils.seed import prepare_trainable_precision
+
+        prepare_trainable_precision(self.dit, self.config.train.trainable_precision)
         self.load_resume_progress()
         self.configure_optimizers()
         self.setup_criterion()
         self.setup_validation(train_dataloader)
 
+        train_dataloader = self.prepare_resume_dataloader(train_dataloader)
         train_dataloader = self.accelerator_prepare(train_dataloader)
         self.compute_training_schedule(train_dataloader)
         self.configure_lr_scheduler()
+        if self.config.train.rank_specific_rng:
+            from src.utils.seed import seed_training_rank
+
+            rank_seed = seed_training_rank(self.config.train.seed, self.accelerator.process_index)
+            logger.info("Training rank %s RNG seed: %s", self.accelerator.process_index, rank_seed)
         self.restore_training_state()
         logging.info("***** Running training *****")
         print_model_summary_table(self.dit)
@@ -751,6 +872,13 @@ class BaseTrainer(ABC):
         self.fps_logger.start()
         self.save_train_config()
         self.setup_progressbar()
+        sampling = getattr(self.config.logging, "sampling", None)
+        if getattr(self, "validation_sampler", None) is not None and getattr(sampling, "validate_on_start", False):
+            self.fps_logger.pause()
+            try:
+                self.validation_sampler.run_validation_loop(global_step=self.global_step, trainer=self)
+            finally:
+                self.fps_logger.resume()
         current_epoch = self.start_epoch
         for epoch in range(self.start_epoch, self.num_epochs):
             current_epoch = epoch
@@ -783,7 +911,8 @@ class BaseTrainer(ABC):
             from src.loss.region_perceptual_loss import RegionPerceptualLoss
 
             # Load DINO only when the identity term is actually used (weight > 0).
-            enable_ref_dino = float(getattr(self.config.loss, "ref_dino_weight", 0.0)) > 0.0
+            enable_ref_dino = (float(getattr(self.config.loss, "ref_dino_weight", 0.0)) > 0.0
+                               or float(getattr(self.config.loss, "face_dino_weight", 0.0)) > 0.0)
             self.region_perceptual_criterion = RegionPerceptualLoss(
                 fg_metric=self.config.loss.fg_metric,
                 lpips_net=self.config.loss.lpips_net,
@@ -1053,6 +1182,21 @@ class BaseTrainer(ABC):
                 "train_config": "train_config.yaml",
                 "artifacts": self._build_checkpoint_artifact_manifest(save_path),
             }
+            if hasattr(self, "_sampler_num_samples"):
+                completed = getattr(self, "_epoch_completed", False)
+                state_info.update(
+                    epoch=epoch + 1 if completed else epoch,
+                    batch_in_epoch=0 if completed else self.batch_in_epoch,
+                    global_samples_in_epoch=0 if completed else min(
+                        self._sampler_num_samples,
+                        getattr(self, "_epoch_sample_offset", 0)
+                        + self.batch_in_epoch * self.config.data.batch_size * self.accelerator.num_processes,
+                    ),
+                    sampler_num_samples=self._sampler_num_samples,
+                    data_batch_size=self.config.data.batch_size,
+                    dataloader_drop_last=self._dataloader_drop_last,
+                    effective_max_train_steps=self.effective_max_train_steps,
+                )
             if is_last:
                 git_info = get_git_info()
                 state_info.update(git_info)
@@ -1099,6 +1243,13 @@ class BaseTrainer(ABC):
     def _load_random_state(self, checkpoint_dir: str):
         random_state_path = self._random_state_path(checkpoint_dir)
         if not os.path.exists(random_state_path):
+            if self.accelerator.process_index >= getattr(self, "_resume_saved_world_size", self.accelerator.num_processes):
+                from src.utils.seed import seed_training_rank
+
+                seed = (self.config.train.seed + 104729 * self.global_step) % (2**32)
+                seed_training_rank(seed, self.accelerator.process_index)
+                logging.info("Initialized checkpoint RNG for new rank %s at optimizer step %s", self.accelerator.process_index, self.global_step)
+                return
             raise FileNotFoundError(f"Missing random state file for this rank: {random_state_path}")
 
         state = self._torch_load(random_state_path, map_location="cpu")
@@ -1129,6 +1280,7 @@ class BaseTrainer(ABC):
                 checkpoint_dir,
             )
         saved_num_processes = train_state.get("num_processes")
+        self._resume_saved_world_size = int(saved_num_processes or self.accelerator.num_processes)
         if (
             saved_num_processes is not None
             and self.accelerator is not None
@@ -1136,7 +1288,7 @@ class BaseTrainer(ABC):
         ):
             logging.warning(
                 "Resuming LoRA-only checkpoint with a different process count: saved=%s current=%s. "
-                "This is allowed, but data order and RNG continuity may differ.",
+                "Resharding from the global sample cursor; new ranks receive deterministic RNG streams.",
                 saved_num_processes,
                 self.accelerator.num_processes,
             )
@@ -1144,8 +1296,9 @@ class BaseTrainer(ABC):
         required_files = [
             OPTIMIZER_FILE_NAME,
             SCHEDULER_FILE_NAME,
-            os.path.basename(self._random_state_path(checkpoint_dir)),
         ]
+        if self.accelerator.process_index < self._resume_saved_world_size:
+            required_files.append(os.path.basename(self._random_state_path(checkpoint_dir)))
         missing = [name for name in required_files if not os.path.exists(os.path.join(checkpoint_dir, name))]
         if missing:
             raise FileNotFoundError(f"Resume checkpoint {checkpoint_dir} is missing required files: {missing}")

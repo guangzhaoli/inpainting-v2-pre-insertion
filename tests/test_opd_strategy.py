@@ -224,8 +224,8 @@ def test_opd_strategy_routes_mixed_batch_and_micro_backpropagates():
     assert trainer.opd_batch_prepared
     assert strategy.backend.routed_batches == [
         ("teacher_animal", ("cat",)),
-        ("teacher_object", ("object",)),
         ("teacher_animal", ("cat",)),
+        ("teacher_object", ("object",)),
         ("teacher_object", ("object",)),
     ]
     assert trainer.accelerator.no_sync_models == [trainer.dit]

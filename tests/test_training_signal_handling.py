@@ -67,7 +67,7 @@ class TrainingSignalHandlingTest(unittest.TestCase):
         ):
             interrupted = BaseTrainer._sync_training_interrupted(trainer)
 
-        self.assertTrue(interrupted)
+        self.assertFalse(interrupted)
         self.assertTrue(trainer.training_interrupted)
 
     def test_train_epoch_does_not_checkpoint_inside_interrupt_branch(self):
@@ -95,6 +95,7 @@ class _FitHarness:
     def __init__(self):
         self.config = SimpleNamespace(
             resume=None,
+            train=SimpleNamespace(trainable_precision="model", rank_specific_rng=False, seed=42),
             model=SimpleNamespace(quantize=False),
             logging=SimpleNamespace(output_dir="unused"),
         )
@@ -122,6 +123,7 @@ class _FitHarness:
     setup_criterion = MagicMock()
     setup_validation = MagicMock()
     accelerator_prepare = MagicMock(side_effect=lambda dataloader: dataloader)
+    prepare_resume_dataloader = MagicMock(side_effect=lambda dataloader: dataloader)
     compute_training_schedule = MagicMock()
     configure_lr_scheduler = MagicMock()
     restore_training_state = MagicMock()

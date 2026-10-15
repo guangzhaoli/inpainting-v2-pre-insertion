@@ -530,6 +530,9 @@ class InsertAnythingDataset(Dataset):
         }
 
         adaptive_crop_config = self.data_config.adaptive_crop
+        profile = getattr(self.data_config, "category_conditioning", {}).get(data["category"])
+        if profile is not None and profile.adaptive_crop is not None:
+            adaptive_crop_config = profile.adaptive_crop
         if adaptive_crop_config.train_enabled:
             tar_height, tar_width = data["tar_image"].shape[:2]
             crop_plan = build_adaptive_crop_plan(
@@ -564,6 +567,11 @@ class InsertAnythingDataset(Dataset):
         data["tar_mask"] = processed["mask"]
         data["ref_image"] = processed["controls"][0]
         data["ref_mask"] = processed["control_masks"][0]
+        if self.data_config.face_identity_supervision:
+            from src.data.face_regions import face_region_mask
+
+            data["target_face_mask"] = face_region_mask(data["tar_image"], data["tar_mask"])
+            data["reference_face_mask"] = face_region_mask(data["ref_image"], data["ref_mask"])
         return self._convert_to_tensors(data)
 
     def _convert_to_tensors(self, data):

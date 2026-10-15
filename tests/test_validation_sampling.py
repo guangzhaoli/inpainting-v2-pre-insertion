@@ -216,13 +216,13 @@ class ValidationSamplingTest(unittest.TestCase):
             self.assertEqual(metadata["requested_sampling"]["true_cfg_scale"], 2.5)
             self.assertEqual(metadata["panel_size"], 320)
             self.assertEqual(metadata["latent_anchoring"]["configured"]["variant"], "D")
-            self.assertEqual(metadata["latent_anchoring"]["effective"]["variant"], "A")
-            self.assertTrue(metadata["latent_anchoring"]["forced_legacy_for_validation"])
-            self.assertTrue(metadata["latent_anchoring"]["configured_mode_overridden"])
+            self.assertEqual(metadata["latent_anchoring"]["effective"]["variant"], "D")
+            self.assertFalse(metadata["latent_anchoring"]["forced_legacy_for_validation"])
+            self.assertFalse(metadata["latent_anchoring"]["configured_mode_overridden"])
             self.assertEqual(len(metadata["samples"]), 1)
             self.assertEqual(
                 metadata["samples"][0]["latent_anchoring"]["effective"]["mode"],
-                "legacy",
+                "expanded_soft",
             )
             sample_paths = metadata["samples"][0]["paths"]
             self.assertIn("row", sample_paths)
@@ -235,7 +235,7 @@ class ValidationSamplingTest(unittest.TestCase):
             self.assertEqual(len(trainer.calls), 1)
             self.assertEqual(trainer.calls[0]["num_inference_steps"], 3)
             self.assertEqual(trainer.calls[0]["true_cfg_scale"], 2.5)
-            self.assertEqual(trainer.calls[0]["latent_anchoring_mode"], "legacy")
+            self.assertEqual(trainer.calls[0]["latent_anchoring_mode"], "expanded_soft")
 
     def test_validation_loop_restores_adaptive_crop_outputs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
