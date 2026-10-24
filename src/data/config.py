@@ -1149,6 +1149,73 @@ class HybridMaskingConfig(BaseModel):
         return self
 
 
+class LightingRangeConfig(BaseModel):
+    """One global grade (see src/data/lighting_augmentation.py).
+
+    Light colour moves along the Planckian locus by a Laplace(0, wb_mired_scale)
+    shift in mired, truncated at wb_mired_max; 100 mired is about 21° of light
+    colour. The default scale gives a median of ~4.4° and a p90 of ~15°, the
+    eval-set gap between reference and target photos.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    wb_mired_scale: float = Field(default=30.0, ge=0)
+    wb_mired_max: float = Field(default=150.0, ge=0)
+    tint_max: float = Field(default=0.03, ge=0, lt=1)
+    exposure_ev_std: float = Field(default=1.0, ge=0)
+    exposure_ev_max: float = Field(default=2.0, ge=0)
+    gamma_max: float = Field(default=0.1, ge=0, lt=1)
+    saturation_max: float = Field(default=0.1, ge=0, lt=1)
+
+
+class LightingAugmentationConfig(BaseModel):
+    """Break the "output lighting = reference lighting" shortcut of same-exposure pairs.
+
+    Each sample re-lights the reference object (``reference_prob``), grades the
+    whole target including GT (``scene_prob``), or keeps the pair. Edge spill,
+    camera degradation and reference geometry are drawn independently. Identity
+    losses keep comparing against the unaugmented reference.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    reference_prob: float = 0.5
+    scene_prob: float = 0.25
+    reference: LightingRangeConfig = Field(default_factory=LightingRangeConfig)
+    scene: LightingRangeConfig = Field(default_factory=LightingRangeConfig)
+    # Low-frequency shading inside the reference branch, as a log-gain amplitude.
+    shading_prob: float = 0.5
+    shading_strength: float = Field(default=0.3, ge=0, le=1)
+    edge_prob: float = 0.5
+    camera_reference_prob: float = 0.3
+    camera_scene_prob: float = 0.2
+    geometry_prob: float = 0.0
+    geometry_rotation_deg: float = Field(default=8.0, ge=0, le=45)
+    geometry_scale: float = Field(default=0.15, ge=0, lt=1)
+    geometry_perspective: float = Field(default=0.05, ge=0, le=0.25)
+
+    @field_validator(
+        "reference_prob",
+        "scene_prob",
+        "shading_prob",
+        "edge_prob",
+        "camera_reference_prob",
+        "camera_scene_prob",
+        "geometry_prob",
+    )
+    @classmethod
+    def _check_probability(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0 or value > 1:
+            raise ValueError("lighting_augmentation probabilities must be finite and in [0, 1]")
+        return value
+
+    @model_validator(mode="after")
+    def _check_branch_probabilities(self):
+        if self.reference_prob + self.scene_prob > 1.0 + 1e-6:
+            raise ValueError("lighting_augmentation.reference_prob + scene_prob must be <= 1")
+        return self
+
+
 class CategoryConditioningConfig(BaseModel):
     """Preserve domain-specific teacher augmentations in a joint OPD dataset."""
 
@@ -1169,6 +1236,7 @@ class DatasetInitArgs(BaseModel):
     processor: ImageProcessorConfig = Field(default_factory=ImageProcessorConfig)
     adaptive_crop: AdaptiveCropConfig = Field(default_factory=AdaptiveCropConfig)
     hybrid_masking: HybridMaskingConfig = Field(default_factory=HybridMaskingConfig)
+    lighting_augmentation: LightingAugmentationConfig = Field(default_factory=LightingAugmentationConfig)
     category_balanced_sampling: bool = False
     face_identity_supervision: bool = False
     category_conditioning: Dict[str, CategoryConditioningConfig] = Field(default_factory=dict)

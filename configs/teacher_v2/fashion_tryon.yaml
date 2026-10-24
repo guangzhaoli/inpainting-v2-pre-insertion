@@ -39,7 +39,7 @@ data:
   class_path: src.data.insert_anything_dataset.InsertAnythingDataset
   init_args:
     dataset_path: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/data
-    manifest_path: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/inpainting-v2-final-architecture/manifests/insert_anything_teacher_fashion_tryon.csv
+    manifest_path: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/inpainting-v2-lighting-augmentation/manifests/insert_anything_teacher_fashion_tryon.csv
     categories:
     - clothes
     - dress
@@ -116,6 +116,14 @@ data:
         resize_mode: bicubic
     category_balanced_sampling: true
     face_identity_supervision: false
+    lighting_augmentation:
+      enabled: true
+      reference_prob: 0.15
+      scene_prob: 0.4
+      edge_prob: 0.2
+      reference:
+        wb_mired_scale: 15.0
+        exposure_ev_std: 0.5
   batch_size: 1
   num_workers: 8
   shuffle: true
@@ -135,7 +143,7 @@ logging:
     output_dir: validation
     panel_size: 320
     save_composite: true
-    validation_data: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/inpainting-v2-final-architecture/configs/teacher_v2/validation_fashion_tryon.json
+    validation_data: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/inpainting-v2-lighting-augmentation/configs/teacher_v2/validation_fashion_tryon.json
     fixed_seed_across_steps: true
 optimizer:
   class_path: torch.optim.AdamW

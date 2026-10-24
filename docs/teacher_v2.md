@@ -32,6 +32,17 @@ The v2 rank, processor and conditioning contracts intentionally differ from v1.
   background. The condition hole additionally includes a 16 px (accessory) or
   32 px (other domains) interaction margin; the context guard falls back to
   GT plus that margin. GT remains the supervision mask.
+- Lighting augmentation (`data.init_args.lighting_augmentation`) breaks the
+  "output lighting = reference lighting" shortcut of same-exposure pairs. Each
+  sample re-lights the reference object (Planckian white balance, exposure,
+  tone, optional low-frequency shading; white background untouched), grades
+  the whole target including GT, or stays as is: 50/25/25 for animal, general
+  object and human, 15/40/45 with half-width reference ranges for fashion and
+  accessory, where colour is the product. Edge spill, camera degradation and
+  (human only) small reference warps are drawn independently. Default ranges
+  match the eval-set reference/target gap (light colour ~5° median, ~15° p90).
+  Reference DINO and face DINO compare against the unaugmented reference; OPD
+  configs disable the augmentation.
 - Pixel supervision includes foreground LPIPS (0.5), distant-background L1
   (0.5), local detail LPIPS (0.25), boundary-band L1 (0.25), and reference DINO
   (0.2). Existing low-noise weighting/gating remains in place. Four detail crops

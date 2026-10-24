@@ -39,6 +39,21 @@ LOOSE_GEOMETRY = {
 }
 # Hair masks wrap the face; a loose region would hide the face the GT keeps.
 HAIR_MODE_WEIGHTS = dict(random_morphology=0.50, augmented_box=0.25, asymmetric_box=0.25)
+# Lighting augmentation. Pairs share one exposure, so teachers copy 0.8-0.97 of
+# a reference lighting change. The reference branch teaches "ignore the
+# reference's light" at some colour-identity cost; the scene branch grades the
+# whole target and teaches "follow the scene" at none. Where colour is the
+# identity (skin, garments, jewellery) the reference branch is narrower or rarer.
+LIGHTING = {
+    "animal": dict(reference_prob=0.5, scene_prob=0.25, edge_prob=0.5),
+    "general_object": dict(reference_prob=0.5, scene_prob=0.25, edge_prob=0.3),
+    "human": dict(reference_prob=0.5, scene_prob=0.25, edge_prob=0.5, geometry_prob=0.5,
+                  reference=dict(wb_mired_scale=21.0, tint_max=0.015)),
+    "fashion_tryon": dict(reference_prob=0.15, scene_prob=0.4, edge_prob=0.2,
+                          reference=dict(wb_mired_scale=15.0, exposure_ev_std=0.5)),
+    "accessory_jewelry": dict(reference_prob=0.15, scene_prob=0.4, edge_prob=0.2, shading_prob=0.25,
+                              reference=dict(wb_mired_scale=15.0, exposure_ev_std=0.5)),
+}
 
 
 def mode_weights(weights):
@@ -115,6 +130,7 @@ def main():
             hair = copy.deepcopy(hybrid)
             hair["maskmix_v2"]["mode_weights"] = mode_weights(HAIR_MODE_WEIGHTS)
             data["category_conditioning"] = {"person_hair": {"hybrid_masking": hair}}
+        data["lighting_augmentation"] = dict(enabled=True, **LIGHTING[domain])
         cfg["train"].update(trainable_precision="float32", rank_specific_rng=True, seed=42, memory_policy="auto")
         cfg["optimizer"]["init_args"]["lr"] = 5e-5
         loss = cfg["loss"]

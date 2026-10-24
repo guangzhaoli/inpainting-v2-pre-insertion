@@ -29,6 +29,12 @@ import torch
 from torch.utils.data import Dataset
 
 from src.data.config import DatasetInitArgs
+from src.data.lighting_augmentation import (
+    augment_reference,
+    augment_scene,
+    jitter_mask_edge,
+    sample_lighting_plan,
+)
 from src.utils.adaptive_crop import build_adaptive_crop_plan, crop_numpy_pair
 from src.utils.hybrid_masking import (
     MASKMIX_LOOSE_MODES,
@@ -608,13 +614,20 @@ class InsertAnythingDataset(Dataset):
                 crop_plan,
             )
 
-        data["ref_image"], data["ref_mask"] = extract_foreground_from_image_and_mask(
-            data["ref_image"],
-            data["ref_mask"],
-            padding_ratio=0.15,
-            min_size=64,
-            align_to=16,
-        )
+        def cut_out(image, mask):
+            return extract_foreground_from_image_and_mask(image, mask, padding_ratio=0.15, min_size=64, align_to=16)
+
+        # Lighting augmentation is drawn once per sample: the edge jitter acts
+        # before the reference is cut out, everything else on processed pixels.
+        lighting_cfg = self.data_config.lighting_augmentation
+        lighting = clean_reference = None
+        if lighting_cfg.enabled:
+            lighting_rng = np.random.default_rng(int(torch.randint(0, 2**62, ()).item()))
+            lighting = sample_lighting_plan(lighting_cfg, lighting_rng)
+            if lighting.edge:
+                clean_reference = cut_out(data["ref_image"], data["ref_mask"])
+                data["ref_mask"] = jitter_mask_edge(data["ref_mask"], lighting_rng)
+        data["ref_image"], data["ref_mask"] = cut_out(data["ref_image"], data["ref_mask"])
 
         processed = self.preprocessor.preprocess(
             {
@@ -660,11 +673,39 @@ class InsertAnythingDataset(Dataset):
                 "guard_shrinks": placement.guard_shrinks,
                 "guard_exhausted": placement.guard_exhausted,
             }
+        if lighting is not None:
+            # Identity losses and face boxes keep the reference as photographed.
+            if clean_reference is None:
+                data["ref_image_clean"], data["ref_mask_clean"] = data["ref_image"], data["ref_mask"]
+            else:
+                clean = self.preprocessor.preprocess(
+                    {"controls": [clean_reference[0]], "control_masks": [clean_reference[1]]}
+                )
+                data["ref_image_clean"], data["ref_mask_clean"] = clean["controls"][0], clean["control_masks"][0]
         if self.data_config.face_identity_supervision:
             from src.data.face_regions import face_region_mask
 
             data["target_face_mask"] = face_region_mask(data["tar_image"], data["tar_mask"])
-            data["reference_face_mask"] = face_region_mask(data["ref_image"], data["ref_mask"])
+            data["reference_face_mask"] = face_region_mask(
+                data.get("ref_image_clean", data["ref_image"]), data.get("ref_mask_clean", data["ref_mask"])
+            )
+        if lighting is not None:
+            if lighting.changes_reference:
+                image, mask = augment_reference(
+                    np.ascontiguousarray(data["ref_image"].permute(1, 2, 0).numpy()),
+                    data["ref_mask"].numpy(),
+                    lighting,
+                    lighting_cfg,
+                    lighting_rng,
+                )
+                data["ref_image"] = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
+                data["ref_mask"] = torch.from_numpy(mask)
+            if lighting.changes_scene:
+                image = augment_scene(
+                    np.ascontiguousarray(data["tar_image"].permute(1, 2, 0).numpy()), lighting, lighting_rng
+                )
+                data["tar_image"] = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
+            data["lighting_metadata"] = lighting.metadata()
         return self._convert_to_tensors(data)
 
     def _convert_to_tensors(self, data):

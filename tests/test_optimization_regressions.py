@@ -162,6 +162,8 @@ def test_checkpoint_builder_preserves_teacher_specific_conditioning(tmp_path):
     # The human teacher's own person_hair profile (no loose families) survives.
     assert profiles["person"].hybrid_masking.maskmix_v2.mode_weights.loose_blob > 0
     assert profiles["person_hair"].hybrid_masking.maskmix_v2.mode_weights.loose_blob == 0
+    # Teachers train with lighting augmentation; OPD keeps the pairs as photographed.
+    assert not cfg.data.init_args.lighting_augmentation.enabled
     cfg.distillation.teachers[0].lora.r = 256
     with pytest.raises(ValueError, match="lora.r"):
         preflight_teacher_checkpoints(cfg)

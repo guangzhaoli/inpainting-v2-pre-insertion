@@ -1137,10 +1137,12 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
                 # Keep the unmodified pixel tensors alongside their VAE controls.
                 # Region losses use the GT mask/image, never the sampled MaskMix
                 # condition mask.  Reference tensors are consumed only when the
-                # optional identity weight is non-zero.
+                # optional identity weight is non-zero, and are the reference
+                # before lighting augmentation, so identity never pulls the
+                # output toward an augmented light.
                 parent_batch["target_image_for_loss"] = tar_image
-                parent_batch["ref_image_for_loss"] = ref_image
-                parent_batch["ref_mask_for_loss"] = ref_mask
+                parent_batch["ref_image_for_loss"] = batch.get("ref_image_clean", ref_image)
+                parent_batch["ref_mask_for_loss"] = batch.get("ref_mask_clean", ref_mask)
 
         if stage == "opd":
             # The GT image supplies the source canvas but must never be encoded

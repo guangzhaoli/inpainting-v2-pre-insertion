@@ -39,7 +39,7 @@ data:
   class_path: src.data.insert_anything_dataset.InsertAnythingDataset
   init_args:
     dataset_path: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/a2edit/data
-    manifest_path: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/inpainting-v2-final-architecture/manifests/insert_anything_teacher_human.csv
+    manifest_path: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/inpainting-v2-lighting-augmentation/manifests/insert_anything_teacher_human.csv
     categories:
     - person
     - person_hair
@@ -170,6 +170,15 @@ data:
             scale_min: 1.2
             scale_max: 2.0
             bottom_align_prob: 0.7
+    lighting_augmentation:
+      enabled: true
+      reference_prob: 0.5
+      scene_prob: 0.25
+      edge_prob: 0.5
+      geometry_prob: 0.5
+      reference:
+        wb_mired_scale: 21.0
+        tint_max: 0.015
   batch_size: 1
   num_workers: 8
   shuffle: true
@@ -189,7 +198,7 @@ logging:
     output_dir: validation
     panel_size: 320
     save_composite: true
-    validation_data: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/inpainting-v2-final-architecture/configs/teacher_v2/validation_human.json
+    validation_data: /inspire/hdd3/project/agent-driven-world-model/250041225002/qwen-inpainting/inpainting-v2-lighting-augmentation/configs/teacher_v2/validation_human.json
     fixed_seed_across_steps: true
 optimizer:
   class_path: torch.optim.AdamW

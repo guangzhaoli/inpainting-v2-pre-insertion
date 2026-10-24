@@ -97,6 +97,9 @@ def build_config(checkpoints, *, manifest=None, student_checkpoint=None):
     data.update(
         categories=categories,
         category_conditioning=profiles,
+        # Lighting augmentation is a teacher-training choice; OPD keeps the
+        # pairs as photographed.
+        lighting_augmentation=dict(enabled=False),
         face_identity_supervision=False,
         category_balanced_sampling=False,
         manifest_path=str(Path(manifest).resolve())
