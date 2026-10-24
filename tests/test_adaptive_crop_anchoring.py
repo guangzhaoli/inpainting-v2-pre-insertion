@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -21,6 +22,7 @@ from src.data.config import (
 from src.utils.adaptive_crop import build_adaptive_crop_plan, restore_pil_output
 from src.utils.adaptive_crop_anchoring import (
     build_crop_edge_alpha,
+    change_gated_paste_back,
     ensure_crop_plan_for_latent_anchoring,
     estimate_model_geometry,
     evaluate_crop_candidate,
@@ -330,6 +332,56 @@ class AdaptiveCropAnchoringHelperTest(unittest.TestCase):
         outside[y1:y2, x1:x2] = False
         self.assertTrue(np.all(restored_arr[outside] == source_arr[outside]))
         self.assertEqual(composite.size, source.size)
+
+    def test_change_gated_paste_back_keeps_changes_and_restores_background(self):
+        # 200x160 source, 100x80 model output (2 source px per model px); M_core x 70-129, y 60-99. With 8 model px
+        # dilation and a 6 model px band, M_free reaches 16 px beyond M_core and the band 12 px beyond M_free.
+        rng = np.random.default_rng(0)
+        source = rng.integers(40, 216, size=(160, 200, 3), dtype=np.uint8)
+        output = np.clip(source.astype(np.int16) + rng.integers(-3, 4, size=source.shape), 0, 255).astype(np.uint8)
+        output[60:100, 70:130] = (0, 200, 0)
+        output[70:90, 130:175] = (output[70:90, 130:175] * 0.6).astype(np.uint8)  # shadow leaving M_free
+        mask = np.zeros((160, 200), dtype=np.uint8)
+        mask[60:100, 70:130] = 255
+        ys, xs = np.mgrid[:160, :200]
+        to_core = np.hypot(np.maximum(np.maximum(70 - xs, xs - 129), 0), np.maximum(np.maximum(60 - ys, ys - 99), 0))
+
+        def paste(out, mode="expanded_soft", crop_plan=None, local_size=(100, 80)):
+            settings = LatentAnchoringConfig(
+                mode=mode, interaction_dilation_px=8, transition_width_px=6, paste_back="change_gated"
+            )
+            fused = change_gated_paste_back(
+                Image.fromarray(source), Image.fromarray(mask, mode="L"), Image.fromarray(out),
+                local_size=local_size, crop_plan=crop_plan, settings=settings,
+            )
+            return np.asarray(fused).astype(np.int16)
+
+        fused = paste(output)
+        src, out = source.astype(np.int16), output.astype(np.int16)
+        self.assertTrue(np.array_equal(fused[to_core >= 30], src[to_core >= 30]))
+        self.assertTrue(np.array_equal(fused[to_core == 0], out[to_core == 0]))
+        # Redrawn background across the left M_free boundary returns to the source.
+        left = (slice(60, 100), slice(50, 58))
+        self.assertLessEqual(int(np.abs(fused[left] - src[left]).max()), 1)
+        # The shadow 5 px outside M_free keeps the outer cosine weight 0.5 * (1 + cos(pi * 2.5 / 6)) ~ 0.63.
+        spot = (slice(74, 87), 150)
+        kept = (fused[spot] - src[spot]).sum() / (out[spot] - src[spot]).sum()
+        self.assertAlmostEqual(kept, 0.5 * (1 + np.cos(np.pi * 2.5 / 6)), delta=0.05)
+
+        # Mode core: M_free is M_core, so the shadow beyond its band is cut.
+        self.assertTrue(np.array_equal(paste(output, mode="core")[spot], src[spot]))
+
+        # An interior crop edge through the band fades the weight to 0 there.
+        plan = build_adaptive_crop_plan(
+            (200, 160), Image.fromarray(mask, mode="L"),
+            AdaptiveCropConfig(predict_enabled=True, trigger_bbox_area_ratio=0.10, min_crop_area_ratio=0.25),
+        )
+        plan = replace(plan, applied=True, crop_box=(0, 0, 150, 160))
+        cropped = output.copy()
+        cropped[:, 150:] = source[:, 150:]
+        fused = paste(cropped, crop_plan=plan, local_size=(75, 80))
+        self.assertTrue(np.array_equal(fused[:, 149:], src[:, 149:]))
+        self.assertTrue(np.array_equal(fused[to_core == 0], out[to_core == 0]))
 
     def test_metadata_capability_field(self):
         metadata = latent_anchoring_metadata(LatentAnchoringConfig(mode="core"))

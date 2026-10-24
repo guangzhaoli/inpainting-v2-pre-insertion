@@ -300,8 +300,8 @@ class QwenImageEditOPDStrategy:
     def _module_device(trainer) -> torch.device:
         return trainer._dit_device()
 
+    @staticmethod
     def _predict_raw_velocity(
-        self,
         trainer,
         state: torch.Tensor,
         timestep: torch.Tensor,
@@ -315,7 +315,7 @@ class QwenImageEditOPDStrategy:
                 condition=condition,
             )
 
-        device = self._module_device(trainer)
+        device = QwenImageEditOPDStrategy._module_device(trainer)
         state = state.to(device=device, dtype=trainer.weight_dtype)
         batch_size = state.shape[0]
 
@@ -340,7 +340,7 @@ class QwenImageEditOPDStrategy:
             timestep = timestep.expand(batch_size)
         elif timestep.shape != (batch_size,):
             raise ValueError(f"OPD timestep must be scalar or [B], got {tuple(timestep.shape)}")
-        timestep = timestep.to(dtype=state.dtype)
+        timestep = timestep.to(dtype=torch.float32 if "_flow_map_end" in condition else state.dtype)
 
         dit_config = trainer._dit_config()
         if dit_config.guidance_embeds:
@@ -377,13 +377,17 @@ class QwenImageEditOPDStrategy:
 
         prediction = trainer.dit(
             hidden_states=hidden_states,
-            timestep=timestep / 1000,
+            # Flow maps already use sigma units. A multiply/divide by 1000
+            # can round t below r on legal diagonal samples (t == r).
+            timestep=timestep if "_flow_map_end" in condition else timestep / 1000,
             guidance=guidance,
             encoder_hidden_states_mask=prompt_mask,
             encoder_hidden_states=prompt_embeds,
             img_shapes=img_shapes,
             txt_seq_lens=txt_seq_lens,
             output_token_count=state.shape[1],
+            **({"end_timestep": condition["_flow_map_end"].to(device=device, dtype=torch.float32)}
+               if "_flow_map_end" in condition else {}),
             **geometry_kwargs,
             return_dict=False,
         )[0]

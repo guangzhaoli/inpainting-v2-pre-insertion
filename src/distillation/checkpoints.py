@@ -43,6 +43,8 @@ def validate_teacher_config(config, teacher):
     raw = read_teacher_config(teacher.lora.pretrained_weight)
     model = raw["model"]
     mismatches = []
+    if getattr(config.distillation, "meanflow", None) is not None and model.get("flow_map", {}).get("enabled", False):
+        mismatches.append("MeanFlow/DMD target score teacher must use the original single-time model")
     if bool(model.get("zero_cond_t", False)) != config.model.zero_cond_t:
         mismatches.append("model.zero_cond_t")
     if _base_identity(model["pretrained_model_name_or_path"]) != _base_identity(

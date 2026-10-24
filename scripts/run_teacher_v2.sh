@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DOMAIN="${1:?Usage: run_teacher_v2.sh accessory_jewelry|animal|fashion_tryon|general_object|human}"
+DOMAIN="${1:?Usage: run_teacher_v2.sh accessory_jewelry|animal|animal_sigma_split|fashion_tryon|general_object|human}"
 case "${DOMAIN}" in
-  accessory_jewelry|animal|fashion_tryon|general_object|human) ;;
+  accessory_jewelry|animal|animal_sigma_split|fashion_tryon|general_object|human) ;;
   *) echo "Unknown teacher domain: ${DOMAIN}" >&2; exit 2 ;;
 esac
 export CONFIG_FILE="${ROOT}/configs/teacher_v2/${DOMAIN}.yaml"

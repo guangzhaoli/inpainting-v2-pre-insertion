@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Teacher 训练追踪 · InsertFuse</title>
+  <link rel="stylesheet" href="/dashboard.css">
+  <script defer src="/dashboard.js"></script>
+</head>
+<body>
+  <header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true">I</span>InsertFuse<span class="divider"></span><span class="brand-caption">Teacher v2</span></div><div class="live-indicator"><i></i><span id="live-label">连接训练数据</span></div></header>
+  <main>
+    <div class="page-heading"><div><h1>Teacher 训练追踪</h1><p id="run-description">独立训练 · 每类 8 张 GPU · 1500 step</p></div><div class="heading-actions"><span id="updated" class="subtle"></span><button id="auto-refresh" class="quiet active" aria-pressed="true">自动刷新 · 15s</button><button id="refresh" class="icon-button" aria-label="立即刷新" title="立即刷新">↻</button><button id="source-button" class="quiet">数据说明</button></div></div>
+    <div id="connection-error" class="notice" role="status" hidden></div>
+    <section id="job-cards" class="job-cards" aria-label="三个训练任务"><div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div></section>
+
+    <section class="panel curve-panel" aria-labelledby="curve-title">
+      <div class="panel-heading"><div><h2 id="curve-title">训练曲线</h2><p id="chart-description">按已完成的 optimizer step 对齐</p></div><div class="controls"><label>指标<select id="metric" aria-label="曲线指标"></select></label><label>平滑<select id="smooth" aria-label="曲线平滑窗口"><option value="1">原始值</option><option value="10">10 步均值</option><option value="20" selected>20 步均值</option><option value="50">50 步均值</option></select></label><a id="export" class="quiet link-button" href="/api/export">导出原始数据 ↓</a></div></div>
+      <div class="chart-toolbar"><div id="series-controls" class="series-controls"></div><span id="chart-unit" class="subtle"></span></div>
+      <div id="chart-container" class="chart-container" tabindex="0" role="img" aria-label="训练曲线，可用左右方向键查看数值"><svg id="chart" viewBox="0 0 1200 290" preserveAspectRatio="none"></svg><div id="chart-tooltip" class="chart-tooltip" hidden></div><div id="chart-empty" class="empty-chart" hidden></div></div>
+      <div class="chart-footer"><span>细线为原始值，粗线为所选窗口均值；虚线标记评估 step。</span><span id="chart-range"></span></div>
+    </section>
+
+    <section class="panel eval-panel" aria-labelledby="eval-title">
+      <div class="panel-heading"><div><h2 id="eval-title">Eval 案例对比</h2><p>同一固定样本，观察不同 checkpoint 的生成变化</p></div><div id="eval-tabs" class="tabs" role="tablist" aria-label="评估类别"></div></div>
+      <div id="eval-empty" class="eval-empty" hidden></div>
+      <div id="eval-content" hidden>
+        <div class="eval-toolbar"><div class="controls"><label>当前 checkpoint<select id="eval-step" aria-label="当前评估 step"></select></label><label>对比 checkpoint<select id="compare-step" aria-label="对比评估 step"></select></label><label>结果类型<select id="output-role" aria-label="结果图片类型"><option value="output">融合输出</option><option value="output_restored_raw">原始生成</option><option value="composite">严格掩码合成</option></select></label></div><div id="eval-summary" class="eval-summary"></div></div>
+        <div class="case-workspace">
+          <aside class="case-sidebar"><div class="case-sidebar-heading"><strong>固定案例 <span id="case-count"></span></strong><label class="sr-only" for="case-category">案例子类别</label><select id="case-category" aria-label="案例子类别"></select></div><label class="sr-only" for="case-search">搜索案例</label><input id="case-search" type="search" placeholder="搜索 case 编号…" autocomplete="off"><div id="case-list" class="case-list" aria-label="选择案例"></div></aside>
+          <div class="case-detail"><div class="case-heading"><div><h3 id="case-name"></h3><span id="case-meta" class="subtle"></span></div><div class="case-navigation"><button id="previous-case" aria-label="上一个案例">←</button><span id="case-position"></span><button id="next-case" aria-label="下一个案例">→</button></div></div><div id="case-images" class="case-images"></div><div id="case-metrics" class="case-metrics"></div><div class="case-footnote"><span>点击图片查看大图</span><span id="output-explanation"></span></div></div>
+        </div>
+        <details class="eval-history"><summary>各 checkpoint 的评估指标 <span id="history-count"></span></summary><div class="table-wrap"><table><thead><tr><th>Step</th><th>案例数</th><th>参考 DINO cosine ↑</th><th>原始背景 MAE</th><th>生成时间</th></tr></thead><tbody id="history-rows"></tbody></table></div><p class="method-note">DINO cosine 衡量参考身份一致性；背景 MAE 衡量原始生成对背景的改动幅度，两者不能单独代表生成质量。不同类别的案例集合不同。</p></details>
+      </div>
+    </section>
+    <footer><span>Inspire 任务状态 · TensorBoard 训练标量 · 固定样本评估</span><span id="footer-status">训练继续在后台运行</span></footer>
+  </main>
+  <dialog id="image-dialog" class="image-dialog"><div class="dialog-toolbar"><strong id="image-caption"></strong><a id="original-image" target="_blank" rel="noopener">打开原图 ↗</a><button id="close-image" aria-label="关闭大图">✕</button></div><img id="large-image" alt="评估图片大图"></dialog>
+  <dialog id="source-dialog" class="source-dialog"><div class="dialog-toolbar"><h2>数据与计算口径</h2><button id="close-source" aria-label="关闭数据说明">✕</button></div><div id="source-content"></div></dialog>
+</body>
+</html>

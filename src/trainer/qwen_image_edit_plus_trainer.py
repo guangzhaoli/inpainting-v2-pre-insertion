@@ -164,15 +164,16 @@ class QwenImageEditPlusTrainer(QwenImageEditTrainer):
         if "control" in batch:
             control_image = batch["control"]
             control_cache_keys["control"] = id(control_image)
-            image_cache_keys.append(id(control_image))
-            prompt_control = cached(
-                ("vl_pixels", id(control_image)),
-                lambda: self.preprocess_image_for_text_encoder(
-                    control_image, best_resolution=384 * 384, input_range="0-1"
-                ),
-            )
-            for batch_index in range(batch_size):
-                condition_images_per_sample[batch_index].append(prompt_control[batch_index])
+            if "control" not in vae_only_control_keys:
+                image_cache_keys.append(id(control_image))
+                prompt_control = cached(
+                    ("vl_pixels", id(control_image)),
+                    lambda: self.preprocess_image_for_text_encoder(
+                        control_image, best_resolution=384 * 384, input_range="0-1"
+                    ),
+                )
+                for batch_index in range(batch_size):
+                    condition_images_per_sample[batch_index].append(prompt_control[batch_index])
             batch["control"] = cached(
                 ("vae_pixels", id(control_image)),
                 lambda: self.preprocess_image_for_vae_encoder(control_image, input_range="0-1"),

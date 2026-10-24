@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
+import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +12,8 @@ import torch
 from PIL import Image
 
 from infer import (
+    apply_flow_map_defaults,
+    record_sampling_overrides,
     load_rgb_image,
     resolve_lora_path,
     save_latent_anchoring_masks,
@@ -16,6 +21,7 @@ from infer import (
     validate_adaptive_crop_inference_args,
     validate_configured_inference,
 )
+from src.models.complementary_canvas import complementary_canvas_enabled
 from src.utils.latent_anchoring import (
     add_latent_anchoring_cli_args,
     apply_latent_anchoring_cli_overrides,
@@ -24,6 +30,7 @@ from src.utils.latent_anchoring import (
     normalize_latent_anchoring_mode,
     validate_latent_anchoring_runtime,
 )
+from src.utils.sigma_split import add_sigma_handoff_cli_args, apply_sigma_handoff_cli_overrides
 from src.utils.visualization import (
     binarize_mask,
     build_strict_mask_composite,
@@ -40,6 +47,7 @@ from src.utils.adaptive_crop import (
 )
 from src.utils.adaptive_crop_anchoring import (
     DEFAULT_CROP_EDGE_FEATHER_PX,
+    change_gated_paste_back,
     prepare_adaptive_crop_for_inference,
 )
 from src.utils.inference_metadata import (
@@ -59,6 +67,43 @@ DEFAULT_TESTSET_ROOT = Path(
 )
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "output" / "testset_adaptive_crop"
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+BENCHMARK_MANIFEST_NAMES = ("paperinsert_900.jsonl", "anyinsertion_official.jsonl")
+RELEASE_AUTHORITATIVE_PATHS = {
+    "paperinsert_900.jsonl": (
+        "manifests/paperinsert_900.jsonl",
+        "manifests/paperinsert_900.csv",
+        "manifests/object.jsonl",
+        "manifests/person.jsonl",
+        "manifests/garment.jsonl",
+        "reports/sources.json",
+    ),
+    "anyinsertion_official.jsonl": (
+        "manifests/anyinsertion_official.jsonl",
+        "manifests/anyinsertion_clean67_for_current_model.jsonl",
+        "manifests/anyinsertion_clean67_case_ids.txt",
+        "manifests/anyinsertion_current_model_overlap_excluded33.json",
+        "reports/conversion.json",
+    ),
+}
+CANONICAL_MANIFEST_PATH_FIELDS = ("src_image", "src_mask", "tar_image", "tar_mask")
+PROMOTED_BENCHMARK_FIELDS = (
+    "major",
+    "minor",
+    "leaf_label",
+    "protocol",
+    "pair_kind",
+    "case_type",
+    "gt_available",
+    "same_identity",
+    "identity_id",
+    "identity_scope",
+    "identity_evidence_status",
+    "reference_derived_from_target",
+    "difficulty",
+    "showcase_candidate",
+    "paper_ok",
+    "manual_qc_status",
+)
 
 
 def parse_args(argv=None):
@@ -76,7 +121,21 @@ def parse_args(argv=None):
         help="Allow a missing or incompatible checkpoint train_config.yaml. Unsafe unless intentional.",
     )
     parser.add_argument("--testset-root", type=Path, default=DEFAULT_TESTSET_ROOT)
-    parser.add_argument("--category", type=str, default="accessory")
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help=(
+            "Optional benchmark subset JSONL. Relative paths are resolved under "
+            "--testset-root; absolute paths must also remain inside it."
+        ),
+    )
+    parser.add_argument(
+        "--category",
+        type=str,
+        default="accessory",
+        help="Category leaf under --testset-root (supports nested paths like pets/cats).",
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--prompt", type=str, default="")
     parser.add_argument("--negative-prompt", type=str, default=None)
@@ -87,9 +146,28 @@ def parse_args(argv=None):
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None, help="Optional sample limit for smoke tests.")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default=None, help="Override all model devices, e.g. cuda:0.")
     parser.add_argument("--panel-size", type=int, default=320, help="Image area size for per-sample row previews.")
+    parser.add_argument(
+        "--rank",
+        type=int,
+        default=None,
+        help="Data-parallel rank. Defaults to env RANK (0 if unset).",
+    )
+    parser.add_argument(
+        "--world-size",
+        type=int,
+        default=None,
+        help="Data-parallel world size. Defaults to env WORLD_SIZE (1 if unset).",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip samples whose sample_dir/output.png already exists; allow non-empty --output-dir.",
+    )
     add_latent_anchoring_cli_args(parser)
-    return parser.parse_args(argv)
+    add_sigma_handoff_cli_args(parser)
+    return record_sampling_overrides(parser.parse_args(argv), argv)
 
 
 def natural_key(path: Path):
@@ -117,21 +195,537 @@ def find_stem_file(directory: Path, stem: str) -> Path | None:
     return None
 
 
-def discover_samples(testset_root: Path, category: str, limit: int | None):
+def _validate_safe_component(value: str, label: str) -> None:
+    if not value or value in {".", ".."} or "/" in value or "\\" in value:
+        raise ValueError(f"Benchmark manifest {label} must be one safe path component: {value!r}")
+
+
+def _validate_category_path(category: str) -> None:
+    """Allow nested category paths like pets/cats while rejecting escapes."""
+    if not category or category in {".", ".."}:
+        raise ValueError(f"Invalid category path: {category!r}")
+    parts = Path(category).parts
+    if not parts:
+        raise ValueError(f"Invalid category path: {category!r}")
+    for part in parts:
+        if part in {".", ".."} or "/" in part or "\\" in part:
+            raise ValueError(
+                f"Benchmark category path component must be a safe name: {category!r}"
+            )
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_normalized_release_path(value: str, label: str) -> str:
+    relative_path = Path(value)
+    if (
+        not value
+        or "\x00" in value
+        or relative_path.is_absolute()
+        or ".." in relative_path.parts
+        or "\\" in value
+        or relative_path.as_posix() != value
+    ):
+        raise ValueError(f"{label} must be a normalized safe POSIX relative path: {value!r}")
+    return value
+
+
+def _require_contained_path_without_symlinks(
+    testset_root: Path,
+    path: Path,
+    label: str,
+    *,
+    kind: str,
+) -> Path:
+    """Return a lexical path below root after rejecting every symlink component."""
+
+    root = testset_root.resolve(strict=True)
+    candidate = path if path.is_absolute() else root / path
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            f"{label} must remain inside testset root {root}: {candidate}"
+        ) from exc
+
+    current = root
+    for component in relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise ValueError(f"{label} contains a symlink component: {current}")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except (FileNotFoundError, RuntimeError) as exc:
+        raise FileNotFoundError(f"{label} does not exist: {candidate}") from exc
+    if not _is_relative_to(resolved, root):
+        raise ValueError(
+            f"{label} must resolve inside testset root {root}: {candidate} -> {resolved}"
+        )
+    if kind == "file" and not resolved.is_file():
+        raise ValueError(f"{label} is not a regular file: {candidate}")
+    if kind == "directory" and not resolved.is_dir():
+        raise ValueError(f"{label} is not a directory: {candidate}")
+    if kind not in {"file", "directory"}:
+        raise ValueError(f"Unsupported contained-path kind: {kind!r}")
+    return candidate
+
+
+def _supported_primary_manifest_paths(testset_root: Path) -> list[Path]:
+    root = testset_root.resolve(strict=True)
+    manifest_root = root / "manifests"
+    if manifest_root.is_symlink():
+        raise ValueError(f"Benchmark manifest directory contains a symlink: {manifest_root}")
+    return [
+        manifest_root / name
+        for name in BENCHMARK_MANIFEST_NAMES
+        if (manifest_root / name).is_symlink() or (manifest_root / name).exists()
+    ]
+
+
+def resolve_benchmark_manifest_path(testset_root: Path, manifest: Path) -> Path:
+    """Resolve an explicitly selected manifest without root escapes or aliases."""
+
+    root = testset_root.resolve(strict=True)
+    if ".." in manifest.parts:
+        raise ValueError(f"Benchmark manifest path must not contain '..': {manifest}")
+    candidate = manifest if manifest.is_absolute() else root / manifest
+    return _require_contained_path_without_symlinks(
+        root,
+        candidate,
+        "Benchmark manifest",
+        kind="file",
+    )
+
+
+def _validate_manifest_record_paths(record: dict, manifest_path: Path, line_number: int) -> None:
+    major = str(record["major"])
+    case_id = str(record["case_id"])
+    _validate_safe_component(major, f"major at {manifest_path}:{line_number}")
+    _validate_safe_component(case_id, f"case_id at {manifest_path}:{line_number}")
+    canonical_directories = {
+        "src_image": "src_image",
+        "src_mask": "src_mask",
+        "tar_image": "tar_image",
+        "tar_mask": "tar_mask",
+    }
+    for field, directory in canonical_directories.items():
+        raw_path = record[field]
+        if not isinstance(raw_path, str) or not raw_path:
+            raise ValueError(
+                f"Benchmark manifest {manifest_path}:{line_number} field {field} "
+                "must be a non-empty relative path"
+            )
+        relative_path = Path(raw_path)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(
+                f"Benchmark manifest {manifest_path}:{line_number} field {field} "
+                f"must not be absolute or contain '..': {raw_path!r}"
+            )
+        if relative_path.as_posix() != raw_path:
+            raise ValueError(
+                f"Benchmark manifest {manifest_path}:{line_number} field {field} "
+                f"is not a normalized POSIX path: {raw_path!r}"
+            )
+        if (
+            len(relative_path.parts) != 3
+            or relative_path.parts[0] != major
+            or relative_path.parts[1] != directory
+            or relative_path.stem != case_id
+            or relative_path.suffix.lower() not in IMAGE_EXTS
+        ):
+            raise ValueError(
+                f"Benchmark manifest {manifest_path}:{line_number} field {field} does not "
+                f"match canonical {major}/{directory}/{case_id}.<image-ext>: {raw_path!r}"
+            )
+
+
+def load_benchmark_manifest_index(
+    testset_root: Path,
+    manifest: Path | None = None,
+) -> tuple[dict[tuple[str, str], dict], Path | None]:
+    if manifest is not None:
+        manifest_path = resolve_benchmark_manifest_path(testset_root, manifest)
+    else:
+        existing = _supported_primary_manifest_paths(testset_root)
+        if not existing:
+            return {}, None
+        if len(existing) > 1:
+            raise ValueError(f"Multiple primary benchmark manifests found: {existing}")
+        manifest_path = resolve_benchmark_manifest_path(testset_root, existing[0])
+
+    index: dict[tuple[str, str], dict] = {}
+    case_owners: dict[str, tuple[str, int]] = {}
+    path_owners: dict[str, tuple[str, int]] = {}
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Benchmark manifest {manifest_path}:{line_number} is invalid JSON: {exc}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"Benchmark manifest {manifest_path}:{line_number} must contain a JSON object"
+                )
+            missing = {"case_id", "major", "src_image", "src_mask", "tar_image", "tar_mask"}.difference(record)
+            if missing:
+                raise ValueError(
+                    f"Benchmark manifest {manifest_path}:{line_number} is missing {sorted(missing)}"
+                )
+            key = (str(record["major"]), str(record["case_id"]))
+            if key in index:
+                raise ValueError(f"Duplicate benchmark manifest key {key} in {manifest_path}")
+            for field in CANONICAL_MANIFEST_PATH_FIELDS:
+                raw_path = record[field]
+                if isinstance(raw_path, str) and raw_path in path_owners:
+                    owner_field, owner_line = path_owners[raw_path]
+                    raise ValueError(
+                        f"Duplicate benchmark path {raw_path!r} in {manifest_path}:{line_number} "
+                        f"field {field}; first used by {owner_field} on line {owner_line}"
+                    )
+            _validate_manifest_record_paths(record, manifest_path, line_number)
+            case_id = key[1]
+            if case_id in case_owners:
+                owner_major, owner_line = case_owners[case_id]
+                raise ValueError(
+                    f"Duplicate benchmark case_id {case_id!r} in {manifest_path}:{line_number}; "
+                    f"first used by major {owner_major!r} on line {owner_line}"
+                )
+            case_owners[case_id] = (key[0], line_number)
+            for field in CANONICAL_MANIFEST_PATH_FIELDS:
+                relative_path = str(record[field])
+                path_owners[relative_path] = (field, line_number)
+            index[key] = record
+    if manifest is not None:
+        validate_explicit_manifest_against_primary(
+            testset_root,
+            manifest_path,
+            index,
+        )
+    else:
+        _verify_supported_release_integrity(testset_root, manifest_path, index)
+    return index, manifest_path
+
+
+def validate_explicit_manifest_against_primary(
+    testset_root: Path,
+    explicit_path: Path,
+    explicit_index: dict[tuple[str, str], dict],
+) -> Path:
+    """Prove an explicit metric split is an unchanged, ordered primary subset."""
+
+    primary_paths = [
+        resolve_benchmark_manifest_path(testset_root, path)
+        for path in _supported_primary_manifest_paths(testset_root)
+    ]
+    if len(primary_paths) != 1:
+        raise ValueError(
+            "Explicit benchmark manifests require exactly one primary manifest; "
+            f"found {primary_paths}"
+        )
+    primary_path = primary_paths[0]
+    if explicit_path == primary_path:
+        _verify_supported_release_integrity(testset_root, primary_path, explicit_index)
+        return primary_path
+    primary_index, loaded_primary_path = load_benchmark_manifest_index(testset_root, None)
+    if loaded_primary_path != primary_path:
+        raise AssertionError("Primary benchmark manifest resolution changed during validation")
+    primary_positions = {key: position for position, key in enumerate(primary_index)}
+    explicit_positions: list[int] = []
+    for key, record in explicit_index.items():
+        if key not in primary_index:
+            raise ValueError(f"Explicit benchmark manifest contains non-primary case: {key}")
+        if record != primary_index[key]:
+            raise ValueError(f"Explicit benchmark manifest altered primary metadata: {key}")
+        explicit_positions.append(primary_positions[key])
+    if explicit_positions != sorted(explicit_positions):
+        raise ValueError("Explicit benchmark manifest must preserve primary row order")
+    return primary_path
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_supported_release_integrity(
+    testset_root: Path,
+    primary_manifest_path: Path,
+    manifest_index: dict[tuple[str, str], dict],
+) -> None:
+    """Verify the complete release inventory before any sample is discovered."""
+
+    root = testset_root.resolve(strict=True)
+    primary_name = primary_manifest_path.name
+    authoritative_paths = RELEASE_AUTHORITATIVE_PATHS.get(primary_name)
+    if authoritative_paths is None:
+        raise ValueError(f"Unsupported primary benchmark manifest: {primary_manifest_path}")
+    expected_primary_relative = f"manifests/{primary_name}"
+    try:
+        actual_primary_relative = primary_manifest_path.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            f"Primary benchmark manifest is outside testset root: {primary_manifest_path}"
+        ) from exc
+    if actual_primary_relative != expected_primary_relative:
+        raise ValueError(
+            "Primary benchmark manifest is not at its authoritative release path: "
+            f"actual={actual_primary_relative!r} expected={expected_primary_relative!r}"
+        )
+
+    expected_paths = set(authoritative_paths)
+    for record in manifest_index.values():
+        for field in CANONICAL_MANIFEST_PATH_FIELDS:
+            expected_paths.add(
+                _validate_normalized_release_path(
+                    str(record[field]),
+                    f"Benchmark manifest field {field}",
+                )
+            )
+
+    checksum_path = _require_contained_path_without_symlinks(
+        root,
+        root / "CHECKSUMS.sha256",
+        "Benchmark release checksum manifest",
+        kind="file",
+    )
+    errors: list[str] = []
+    recorded: dict[str, str] = {}
+    try:
+        checksum_lines = checksum_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"Cannot read benchmark release checksum manifest: {checksum_path}") from exc
+    if not checksum_lines:
+        errors.append("Checksum manifest is empty")
+    for line_number, line in enumerate(checksum_lines, start=1):
+        match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+        if match is None:
+            errors.append(f"Invalid checksum row {line_number}: {line!r}")
+            continue
+        digest, relative = match.groups()
+        try:
+            _validate_normalized_release_path(
+                relative,
+                f"Checksum row {line_number} path",
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        if relative in recorded:
+            errors.append(f"Duplicate checksum path at row {line_number}: {relative}")
+            continue
+        recorded[relative] = digest
+
+    recorded_paths = set(recorded)
+    if recorded_paths != expected_paths:
+        errors.append(
+            "Checksum path set mismatch: "
+            f"missing={sorted(expected_paths - recorded_paths)[:10]} "
+            f"extra={sorted(recorded_paths - expected_paths)[:10]}"
+        )
+    if errors:
+        raise ValueError(
+            "Benchmark release integrity verification failed before sample discovery:\n- "
+            + "\n- ".join(errors[:50])
+        )
+
+    missing_errors: list[str] = []
+    for relative in sorted(expected_paths):
+        candidate = root / relative
+        try:
+            regular_path = _require_contained_path_without_symlinks(
+                root,
+                candidate,
+                f"Checksummed release file {relative}",
+                kind="file",
+            )
+        except FileNotFoundError as exc:
+            missing_errors.append(str(exc))
+            continue
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        actual_digest = _sha256_file(regular_path)
+        if recorded[relative] != actual_digest:
+            errors.append(
+                f"Checksum mismatch {relative}: "
+                f"recorded={recorded[relative]} actual={actual_digest}"
+            )
+    if missing_errors:
+        raise FileNotFoundError(
+            "Benchmark release integrity verification found missing files before sample discovery:\n- "
+            + "\n- ".join(missing_errors[:50])
+        )
+    if errors:
+        raise ValueError(
+            "Benchmark release integrity verification failed before sample discovery:\n- "
+            + "\n- ".join(errors[:50])
+        )
+
+
+def _selected_manifest_sha256(samples: list[dict]) -> str:
+    digest = hashlib.sha256()
+    for sample in samples:
+        record = sample["benchmark_metadata"]
+        digest.update(
+            json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+                "utf-8"
+            )
+        )
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def benchmark_manifest_provenance(sample: dict) -> dict | None:
+    manifest_path = sample.get("benchmark_manifest")
+    if manifest_path is None:
+        return None
+    result = {
+        "path": str(Path(manifest_path).resolve()),
+        "sha256": str(sample["benchmark_manifest_sha256"]),
+        "selection_sha256": str(sample["benchmark_manifest_selection_sha256"]),
+        "selected_rows": int(sample["benchmark_manifest_selected_rows"]),
+        "mode": str(sample["benchmark_manifest_mode"]),
+    }
+    primary_path = sample.get("benchmark_primary_manifest")
+    if primary_path is not None:
+        result["primary_path"] = str(Path(primary_path).resolve())
+        result["primary_sha256"] = str(sample["benchmark_primary_manifest_sha256"])
+    return result
+
+
+def benchmark_output_fields(sample: dict) -> dict:
+    benchmark = sample.get("benchmark_metadata")
+    fields = {
+        "case_id": str(benchmark.get("case_id", sample["stem"])) if benchmark else sample["stem"],
+        # Programmatic callers such as infer_ref_sensitivity predate the
+        # canonical loader and pass the legacy four paths without this field.
+        "input_schema": sample.get("schema", "legacy_ref_tar"),
+    }
+    if benchmark:
+        fields["benchmark"] = dict(benchmark)
+        for key in PROMOTED_BENCHMARK_FIELDS:
+            if key in benchmark:
+                fields[key] = benchmark[key]
+    manifest_provenance = benchmark_manifest_provenance(sample)
+    if manifest_provenance is not None:
+        fields["benchmark_manifest"] = manifest_provenance
+    return fields
+
+
+def prepare_fresh_output_dir(output_dir: Path, *, allow_existing: bool = False) -> None:
+    if output_dir.exists() and any(output_dir.iterdir()) and not allow_existing:
+        raise FileExistsError(
+            f"Refusing to mix a new run with existing outputs in {output_dir}. "
+            "Choose a fresh --output-dir, or pass --skip-existing to resume."
+        )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _reject_canonical_role_symlinks(testset_root: Path, role_dirs: dict[str, Path]) -> None:
+    for role, directory in role_dirs.items():
+        _require_contained_path_without_symlinks(
+            testset_root,
+            directory,
+            f"Canonical {role} directory",
+            kind="directory",
+        )
+        for entry in directory.iterdir():
+            if entry.is_symlink():
+                raise ValueError(
+                    f"Canonical {role} file contains a symlink alias: {entry}"
+                )
+
+
+def discover_samples(
+    testset_root: Path,
+    category: str,
+    limit: int | None,
+    manifest: Path | None = None,
+):
+    _validate_category_path(category)
+    testset_root = testset_root.resolve(strict=True)
+    manifest_index, manifest_path = load_benchmark_manifest_index(testset_root, manifest)
+    explicit_manifest = manifest is not None
+    manifest_sha256 = _sha256_file(manifest_path) if manifest_path is not None else None
+    if explicit_manifest and manifest_path is not None:
+        primary_paths = [
+            resolve_benchmark_manifest_path(testset_root, path)
+            for path in _supported_primary_manifest_paths(testset_root)
+        ]
+        if len(primary_paths) != 1:
+            raise AssertionError(
+                "Explicit manifest validation completed without exactly one primary manifest"
+            )
+        primary_manifest_path = primary_paths[0]
+    else:
+        primary_manifest_path = manifest_path
+    primary_manifest_sha256 = (
+        _sha256_file(primary_manifest_path)
+        if primary_manifest_path is not None
+        else None
+    )
+
     category_dir = testset_root / category
-    ref_image_dir = category_dir / "ref_image"
-    ref_mask_dir = category_dir / "ref_mask"
-    src_image_dir = category_dir / "tar_image"
-    src_mask_dir = category_dir / "tar_mask"
+    canonical_dirs = {
+        "ref_image": category_dir / "src_image",
+        "ref_mask": category_dir / "src_mask",
+        "source": category_dir / "tar_image",
+        "source_mask": category_dir / "tar_mask",
+    }
+    legacy_dirs = {
+        "ref_image": category_dir / "ref_image",
+        "ref_mask": category_dir / "ref_mask",
+        "source": category_dir / "tar_image",
+        "source_mask": category_dir / "tar_mask",
+    }
+    if all(path.is_dir() for path in canonical_dirs.values()):
+        schema = "src_tar_v1"
+        selected_dirs = canonical_dirs
+        _reject_canonical_role_symlinks(testset_root, canonical_dirs)
+    elif all(path.is_dir() for path in legacy_dirs.values()):
+        schema = "legacy_ref_tar"
+        selected_dirs = legacy_dirs
+    else:
+        canonical_missing = [str(path) for path in canonical_dirs.values() if not path.is_dir()]
+        legacy_missing = [str(path) for path in legacy_dirs.values() if not path.is_dir()]
+        raise FileNotFoundError(
+            "Testset category must use either canonical "
+            "{src_image,src_mask,tar_image,tar_mask} or legacy "
+            "{ref_image,ref_mask,tar_image,tar_mask} directories. "
+            f"Canonical missing: {canonical_missing}; legacy missing: {legacy_missing}"
+        )
 
-    required_dirs = [ref_image_dir, ref_mask_dir, src_image_dir, src_mask_dir]
-    missing_dirs = [str(path) for path in required_dirs if not path.is_dir()]
-    if missing_dirs:
-        raise FileNotFoundError(f"Missing testset directories: {missing_dirs}")
-
+    ref_image_dir = selected_dirs["ref_image"]
+    ref_mask_dir = selected_dirs["ref_mask"]
+    src_image_dir = selected_dirs["source"]
+    src_mask_dir = selected_dirs["source_mask"]
     samples = []
+    discovered_stems: set[str] = set()
     for ref_image_path in image_files(ref_image_dir):
         stem = ref_image_path.stem
+        if stem in discovered_stems:
+            raise ValueError(
+                f"Duplicate canonical src_image stem {category}/{stem} under {ref_image_dir}"
+            )
+        discovered_stems.add(stem)
+        benchmark = manifest_index.get((category, stem)) if manifest_path is not None else None
+        if explicit_manifest and benchmark is None:
+            # An explicit manifest is an intentional subset selector. Canonical
+            # cases outside that selector do not participate in this run.
+            continue
         ref_mask_path = find_stem_file(ref_mask_dir, stem)
         src_image_path = find_stem_file(src_image_dir, stem)
         src_mask_path = find_stem_file(src_mask_dir, stem)
@@ -147,21 +741,80 @@ def discover_samples(testset_root: Path, category: str, limit: int | None):
         if missing:
             raise FileNotFoundError(f"Sample {stem} is missing: {missing}")
 
-        samples.append(
-            {
-                "stem": stem,
-                "ref_image": ref_image_path,
-                "ref_mask": ref_mask_path,
-                "source": src_image_path,
-                "source_mask": src_mask_path,
+        sample = {
+            "stem": stem,
+            "schema": schema,
+            "ref_image": ref_image_path,
+            "ref_mask": ref_mask_path,
+            "source": src_image_path,
+            "source_mask": src_mask_path,
+        }
+        if manifest_path is not None:
+            if benchmark is None:
+                raise ValueError(
+                    f"Canonical sample {category}/{stem} has no row in primary manifest {manifest_path}"
+                )
+            expected_paths = {
+                "ref_image": testset_root / str(benchmark["src_image"]),
+                "ref_mask": testset_root / str(benchmark["src_mask"]),
+                "source": testset_root / str(benchmark["tar_image"]),
+                "source_mask": testset_root / str(benchmark["tar_mask"]),
             }
-        )
-        if limit is not None and len(samples) >= limit:
-            break
+            for key, expected_path in expected_paths.items():
+                try:
+                    expected_regular = _require_contained_path_without_symlinks(
+                        testset_root,
+                        expected_path,
+                        f"Manifest-selected sample {category}/{stem} {key}",
+                        kind="file",
+                    )
+                except FileNotFoundError as exc:
+                    raise FileNotFoundError(
+                        f"Manifest-selected sample {category}/{stem} is missing {key}: "
+                        f"{expected_path}"
+                    ) from exc
+                if sample[key] != expected_regular:
+                    raise ValueError(
+                        f"Manifest/filesystem mismatch for {category}/{stem} {key}: "
+                        f"discovered={sample[key]} manifest={expected_path}"
+                    )
+            sample["benchmark_metadata"] = benchmark
+            sample["benchmark_manifest"] = manifest_path
+        samples.append(sample)
+
+    if manifest_path is not None:
+        expected_keys = {key for key in manifest_index if key[0] == category}
+        discovered_keys = {(category, str(sample["stem"])) for sample in samples}
+        missing_filesystem_cases = sorted(expected_keys.difference(discovered_keys))
+        if missing_filesystem_cases:
+            raise FileNotFoundError(
+                f"Primary manifest {manifest_path} has {len(missing_filesystem_cases)} "
+                f"{category} cases missing from canonical src_image discovery: "
+                f"{missing_filesystem_cases[:10]}"
+            )
+
+        # Manifest row order defines seed assignment and --limit semantics.
+        # Filesystem enumeration is used only for strict presence checking.
+        samples_by_key = {
+            (category, str(sample["stem"])): sample
+            for sample in samples
+        }
+        ordered_keys = [key for key in manifest_index if key[0] == category]
+        samples = [samples_by_key[key] for key in ordered_keys]
 
     if not samples:
         raise ValueError(f"No samples found for category {category} under {testset_root}")
-    return samples
+    selected_samples = samples[:limit] if limit is not None else samples
+    if manifest_path is not None:
+        selected_sha256 = _selected_manifest_sha256(selected_samples)
+        for sample in selected_samples:
+            sample["benchmark_manifest_sha256"] = manifest_sha256
+            sample["benchmark_manifest_selection_sha256"] = selected_sha256
+            sample["benchmark_manifest_selected_rows"] = len(selected_samples)
+            sample["benchmark_manifest_mode"] = "explicit_subset" if explicit_manifest else "primary"
+            sample["benchmark_primary_manifest"] = primary_manifest_path
+            sample["benchmark_primary_manifest_sha256"] = primary_manifest_sha256
+    return selected_samples
 
 
 def setup_trainer(args):
@@ -186,8 +839,14 @@ def setup_trainer(args):
     if args.height is not None and (args.height <= 0 or args.width <= 0):
         raise ValueError("--height and --width must be positive")
 
-    config = load_config_from_yaml(str(args.config))
+    config = load_config_from_yaml(str(args.config), for_inference=True)
+    apply_flow_map_defaults(config, args)
+    if getattr(args, "device", None) is not None:
+        from src.data.config import DeviceConfig
+
+        config.predict.devices = DeviceConfig(vae=args.device, text_encoder=args.device, dit=args.device)
     apply_latent_anchoring_cli_overrides(config, args)
+    apply_sigma_handoff_cli_overrides(config, args)
     validate_adaptive_crop_inference_args(config, args)
     validate_latent_anchoring_runtime(config, height=args.height, width=args.width)
     resolved_lora_path = resolve_lora_path(args.lora)
@@ -196,6 +855,7 @@ def setup_trainer(args):
     validation_args = SimpleNamespace(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
+        true_cfg_scale=args.true_cfg_scale,
         allow_base_model=False,
     )
     validate_configured_inference(config, validation_args, resolved_lora_path)
@@ -237,6 +897,9 @@ def run_sample(
     latent_anchoring_config = ensure_latent_anchoring_config(trainer.config)
     anchoring_metadata = latent_anchoring_metadata(latent_anchoring_config)
     anchoring_is_enabled = bool(anchoring_metadata["enabled"])
+    canvas_is_enabled = complementary_canvas_enabled(trainer.config)
+    # Both keep the source latent outside the edit region, so the raw output is primary.
+    latent_preserving = anchoring_is_enabled or canvas_is_enabled
     composite_mask_threshold = (
         float(latent_anchoring_config.mask_threshold)
         if anchoring_is_enabled
@@ -262,7 +925,12 @@ def run_sample(
             original_src_mask,
             crop_plan,
         )
-        if anchoring_is_enabled and crop_plan is not None and crop_plan.applied:
+        if (
+            latent_preserving
+            and crop_plan is not None
+            and crop_plan.applied
+            and latent_anchoring_config.paste_back == "crop_feather"
+        ):
             edge_feather_px = int(
                 crop_compatibility.get("feather_width_px", DEFAULT_CROP_EDGE_FEATHER_PX)
             )
@@ -320,7 +988,16 @@ def run_sample(
             raw_restored_output,
             composite_mask_threshold,
         )
-    primary_output = primary_restored_output if anchoring_is_enabled else strict_composite
+    if latent_anchoring_config.paste_back == "change_gated":
+        primary_restored_output = change_gated_paste_back(
+            original_src_image,
+            original_src_mask,
+            raw_restored_output,
+            local_size=local_output.size,
+            crop_plan=crop_plan,
+            settings=latent_anchoring_config,
+        )
+    primary_output = primary_restored_output if latent_preserving else strict_composite
     if (
         raw_restored_output.size != original_src_image.size
         or strict_composite.size != original_src_image.size
@@ -382,6 +1059,7 @@ def run_sample(
 
     metadata = {
         "stem": sample["stem"],
+        **benchmark_output_fields(sample),
         "seed": int(sample_seed),
         "config": build_inference_config_metadata(trainer.config, args.config),
         "checkpoint": {
@@ -402,7 +1080,13 @@ def run_sample(
             effective_height=local_output.height,
             effective_width=local_output.width,
         ),
-        "inputs": {key: str(value) for key, value in sample.items() if key != "stem"},
+        "inputs": {
+            "schema": str(sample.get("schema", "legacy_ref_tar")),
+            **{
+                key: str(sample[key])
+                for key in ("ref_image", "ref_mask", "source", "source_mask")
+            },
+        },
         "outputs": {
             "ref_image": str(sample_dir / "ref_image.png"),
             "ref_mask": str(sample_dir / "ref_mask.png"),
@@ -413,10 +1097,10 @@ def run_sample(
             "output": str(sample_dir / "output.png"),
             "primary_output": str(sample_dir / "output.png"),
             "final_composite": str(
-                sample_dir / ("composite.png" if anchoring_is_enabled else "output.png")
+                sample_dir / ("composite.png" if latent_preserving else "output.png")
             ),
             "strict_composite": str(
-                sample_dir / ("composite.png" if anchoring_is_enabled else "output.png")
+                sample_dir / ("composite.png" if latent_preserving else "output.png")
             ),
             "output_local": str(sample_dir / "output_local.png"),
             "output_restored_raw": str(sample_dir / "output_restored_raw.png"),
@@ -436,6 +1120,7 @@ def run_sample(
             "final_composite": list(strict_composite.size),
         },
         "latent_anchoring": anchoring_metadata,
+        "complementary_canvas": getattr(trainer, "_last_complementary_canvas", None) if canvas_is_enabled else None,
         "adaptive_crop": {
             "config": adaptive_crop_config.model_dump(mode="json"),
             "plan": crop_plan.to_dict() if crop_plan is not None else None,
@@ -446,6 +1131,9 @@ def run_sample(
                 "Primary latent-anchored result in original source coordinates "
                 "(crop-edge-safe when adaptive crop is applied)."
                 if anchoring_is_enabled
+                else "Primary complementary-canvas result (generated M_free tokens in the source latent) "
+                "in original source coordinates (crop-edge-safe when adaptive crop is applied)."
+                if canvas_is_enabled
                 else "Final strict-mask composite in original source coordinates."
             ),
             "output_local": "Direct model output in processor coordinates.",
@@ -453,6 +1141,9 @@ def run_sample(
                 "Latent-anchored model output hard-pasted into original source coordinates "
                 "before optional crop-edge feathering / strict RGB compositing."
                 if anchoring_is_enabled
+                else "Complementary-canvas model output hard-pasted into original source coordinates "
+                "before optional crop-edge feathering / strict RGB compositing."
+                if canvas_is_enabled
                 else "Model output mapped to original source coordinates before mask compositing."
             ),
             "strict_composite": "Compatibility M_core strict composite for A/B comparison.",
@@ -473,16 +1164,36 @@ def run_sample(
     return metadata, row_path
 
 
+def _resolve_parallelism(args) -> tuple[int, int]:
+    rank = args.rank if args.rank is not None else int(os.environ.get("RANK", "0"))
+    world_size = (
+        args.world_size
+        if args.world_size is not None
+        else int(os.environ.get("WORLD_SIZE", "1"))
+    )
+    if world_size <= 0:
+        raise ValueError("--world-size / WORLD_SIZE must be positive")
+    if not (0 <= rank < world_size):
+        raise ValueError(f"rank out of range: {rank}/{world_size}")
+    return rank, world_size
+
+
 def main():
     args = parse_args()
-    samples = discover_samples(args.testset_root, args.category, args.limit)
-    if args.seed + len(samples) - 1 >= 2**32:
+    rank, world_size = _resolve_parallelism(args)
+    all_samples = discover_samples(
+        args.testset_root, args.category, args.limit, manifest=args.manifest
+    )
+    # Keep global indices so per-sample seeds stay stable under sharding.
+    indexed = list(enumerate(all_samples))
+    shard = [(global_i, sample) for global_i, sample in indexed if global_i % world_size == rank]
+    if args.seed + max((len(all_samples) - 1), 0) >= 2**32:
         raise ValueError("per-sample seeds must remain in [0, 2**32)")
+    prepare_fresh_output_dir(args.output_dir, allow_existing=bool(args.skip_existing) or world_size > 1)
     trainer, config, resolved_lora_path, checkpoint_compatibility = setup_trainer(args)
     guidance_embeds_enabled = resolve_guidance_embeds_enabled(config, trainer)
     run_anchoring_metadata = latent_anchoring_metadata(config.predict.latent_anchoring)
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
     run_config = {
         "config": build_inference_config_metadata(config, args.config),
         "checkpoint": {
@@ -492,7 +1203,11 @@ def main():
         },
         "testset_root": str(args.testset_root),
         "category": args.category,
-        "num_samples": len(samples),
+        "num_samples_global": len(all_samples),
+        "num_samples_rank": len(shard),
+        "rank": rank,
+        "world_size": world_size,
+        "skip_existing": bool(args.skip_existing),
         "parameters": build_effective_inference_metadata(
             config,
             prompt=args.prompt,
@@ -525,16 +1240,42 @@ def main():
             "strict_composite": "Compatibility M_core strict composite for A/B comparison.",
         },
     }
-    with (args.output_dir / "run_config.json").open("w", encoding="utf-8") as f:
+    if all_samples:
+        manifest_provenance = benchmark_manifest_provenance(all_samples[0])
+        if manifest_provenance is not None:
+            run_config["benchmark_manifest"] = manifest_provenance
+    run_config_name = (
+        f"run_config_rank{rank:02d}.json" if world_size > 1 else "run_config.json"
+    )
+    with (args.output_dir / run_config_name).open("w", encoding="utf-8") as f:
         json.dump(run_config, f, indent=2, ensure_ascii=False)
 
-    manifest_path = args.output_dir / "manifest.jsonl"
+    manifest_path = (
+        args.output_dir / f"manifest_rank{rank:02d}.jsonl"
+        if world_size > 1
+        else args.output_dir / "manifest.jsonl"
+    )
     row_paths = []
-    with manifest_path.open("w", encoding="utf-8") as manifest:
-        for index, sample in enumerate(samples):
-            sample_seed = args.seed + index
-            sample_dir = args.output_dir / f"{index + 1:03d}_{sample['stem']}"
-            print(f"[{index + 1}/{len(samples)}] infer {sample['stem']} -> {sample_dir}", flush=True)
+    n_ok = 0
+    n_skip = 0
+    write_mode = "a" if args.skip_existing and manifest_path.exists() else "w"
+    with manifest_path.open(write_mode, encoding="utf-8") as manifest:
+        for local_i, (global_i, sample) in enumerate(shard):
+            sample_seed = args.seed + global_i
+            sample_dir = args.output_dir / f"{global_i + 1:03d}_{sample['stem']}"
+            if args.skip_existing and (sample_dir / "output.png").is_file():
+                n_skip += 1
+                print(
+                    f"[rank{rank} {local_i + 1}/{len(shard)}] skip existing "
+                    f"{sample['stem']} -> {sample_dir}",
+                    flush=True,
+                )
+                continue
+            print(
+                f"[rank{rank} {local_i + 1}/{len(shard)} global {global_i + 1}/{len(all_samples)}] "
+                f"infer {sample['stem']} -> {sample_dir}",
+                flush=True,
+            )
             metadata, row_path = run_sample(
                 trainer,
                 sample,
@@ -547,11 +1288,20 @@ def main():
             manifest.write(json.dumps(metadata, ensure_ascii=False) + "\n")
             manifest.flush()
             row_paths.append(row_path)
+            n_ok += 1
 
-    stack_rows(row_paths, args.output_dir / "all_rows.png")
-    print(f"Done. Results saved to {args.output_dir}", flush=True)
+    if row_paths:
+        overview_name = (
+            f"all_rows_rank{rank:02d}.png" if world_size > 1 else "all_rows.png"
+        )
+        stack_rows(row_paths, args.output_dir / overview_name)
+        print(f"Overview saved to {args.output_dir / overview_name}", flush=True)
+    print(
+        f"Done rank={rank}/{world_size}. ok={n_ok} skip={n_skip} "
+        f"assigned={len(shard)} global={len(all_samples)} out={args.output_dir}",
+        flush=True,
+    )
     print(f"Manifest saved to {manifest_path}", flush=True)
-    print(f"Overview saved to {args.output_dir / 'all_rows.png'}", flush=True)
 
 
 if __name__ == "__main__":

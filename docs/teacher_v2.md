@@ -19,9 +19,19 @@ The v2 rank, processor and conditioning contracts intentionally differ from v1.
   that initialization. The epoch sampler retains a separate deterministic seed.
 - `aspect_pixels` uses an approximate 1 MP budget and rounds each dimension to
   multiples of 16. Legacy `fixed_pixels` remains unchanged for old checkpoints.
-- Exact/morphology/augmented-box/asymmetric-box mask probabilities are
-  20/20/30/30. The condition hole additionally includes a 16 px (accessory) or
-  32 px (other domains) interaction margin. GT remains the supervision mask.
+- Condition masks never use `exact`, so no hole traces the GT outline.
+  Morphology/augmented-box/asymmetric-box/loose-blob/oversized-box
+  probabilities are 10/15/15/35/25 (animal), 20/20/20/25/15 (general object
+  and human `person`), 30/25/25/15/5 (accessory), and 40/30/30/0/0 (fashion and
+  human `person_hair`, via `category_conditioning`; a loose region around
+  hair or a garment would also hide the face). Morphology radii are 6–20% of
+  the object scale (8–96 px at 768), wider than the interaction band; box
+  sides keep a 5–30% margin. Loose families reuse the `loose_placement`
+  geometry with `enabled: false` (no σ-split): the dataset draws them before
+  adaptive crop and plans the crop on them, so part of the hole is real
+  background. The condition hole additionally includes a 16 px (accessory) or
+  32 px (other domains) interaction margin; the context guard falls back to
+  GT plus that margin. GT remains the supervision mask.
 - Pixel supervision includes foreground LPIPS (0.5), distant-background L1
   (0.5), local detail LPIPS (0.25), boundary-band L1 (0.25), and reference DINO
   (0.2). Existing low-noise weighting/gating remains in place. Four detail crops

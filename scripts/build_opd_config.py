@@ -40,10 +40,12 @@ def build_config(checkpoints, *, manifest=None, student_checkpoint=None):
             if category in profiles:
                 raise ValueError(f"overlapping teacher category: {category}")
             categories.append(category)
+            # A teacher's own per-category profile (e.g. human person_hair) wins.
+            own = (data.get("category_conditioning") or {}).get(category) or {}
             profiles[category] = {
-                key: copy.deepcopy(data[key])
+                key: copy.deepcopy(own[key] if own.get(key) is not None else data[key])
                 for key in ("adaptive_crop", "hybrid_masking")
-                if key in data
+                if own.get(key) is not None or key in data
             }
         reference = raw["model"].get("reference_cfg", {})
         if not reference.get("enabled"):

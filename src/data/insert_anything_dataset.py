@@ -16,7 +16,9 @@ Directory structure:
 import csv
 import json
 import logging
+import math
 import os
+import random
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -28,6 +30,14 @@ from torch.utils.data import Dataset
 
 from src.data.config import DatasetInitArgs
 from src.utils.adaptive_crop import build_adaptive_crop_plan, crop_numpy_pair
+from src.utils.hybrid_masking import (
+    MASKMIX_LOOSE_MODES,
+    build_loose_placement_mask,
+    build_maskmix_v2_mask_for_mode,
+    maskmix_has_loose_modes,
+    sample_maskmix_v2_mode,
+    sample_tight_mode,
+)
 from src.utils.images import extract_foreground_from_image_and_mask
 
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
@@ -518,6 +528,18 @@ class InsertAnythingDataset(Dataset):
                 )
             raise
 
+    def _loose_coverage_radius_px(self, height: int, width: int, hybrid_config) -> int:
+        """Full-resolution radius that still spans the trainer's interaction band.
+
+        The band is defined in processed pixels. A crop is only ever upscaled
+        more than the full frame, so the full-frame scale is a safe bound.
+        """
+
+        processed = self.preprocessor.preprocess({"mask": np.zeros((height, width), dtype=np.uint8)})["mask"]
+        scale = math.sqrt(processed.numel() / float(height * width))
+        band_px = hybrid_config.interaction_dilation_px + hybrid_config.loose_placement.coverage_margin_px
+        return int(math.ceil(band_px / scale))
+
     def _load_and_process_sample(self, sample_info: Dict[str, Any], sample_metadata: Dict[str, Any]):
         data = {
             "ref_image": self._read_image(sample_info["ref_image"]),
@@ -530,16 +552,56 @@ class InsertAnythingDataset(Dataset):
         }
 
         adaptive_crop_config = self.data_config.adaptive_crop
+        hybrid_config = self.data_config.hybrid_masking
         profile = getattr(self.data_config, "category_conditioning", {}).get(data["category"])
         if profile is not None and profile.adaptive_crop is not None:
             adaptive_crop_config = profile.adaptive_crop
+        if profile is not None and profile.hybrid_masking is not None:
+            hybrid_config = profile.hybrid_masking
+        tar_height, tar_width = data["tar_image"].shape[:2]
+        placement = None
+        sigma_split_masks = hybrid_config.enabled and hybrid_config.loose_placement.enabled
+        # MaskMix-v2 with loose families: one condition mask per sample, sampled
+        # here because a loose region must be drawn before the crop is planned.
+        condition_mode = None
+        if not sigma_split_masks and hybrid_config.enabled and maskmix_has_loose_modes(hybrid_config):
+            placement_rng = random.Random(int(torch.randint(0, 2**62, ()).item()))
+            condition_mode = sample_maskmix_v2_mode(data["category"], hybrid_config, placement_rng)
+        if sigma_split_masks or condition_mode in MASKMIX_LOOSE_MODES:
+            # Plan the crop on the loose placement region, as inference plans it
+            # on the user's placement mask.
+            if sigma_split_masks:
+                placement_rng = random.Random(int(torch.randint(0, 2**62, ()).item()))
+            placement = build_loose_placement_mask(
+                # Same >127 binarization as the crop and the processor.
+                data["tar_mask"].astype(np.float32) / 255.0,
+                hybrid_config,
+                placement_rng,
+                coverage_radius_px=self._loose_coverage_radius_px(tar_height, tar_width, hybrid_config),
+                canvas_fn=(
+                    (lambda candidate: build_adaptive_crop_plan(
+                        (tar_width, tar_height), candidate, adaptive_crop_config
+                    ).crop_box)
+                    if adaptive_crop_config.train_enabled
+                    else None
+                ),
+                max_area_ratio=(
+                    hybrid_config.context_guard.max_condition_area_ratio
+                    if hybrid_config.context_guard.enabled
+                    else None
+                ),
+                mode=condition_mode,
+            )
+            loose_mask = placement.mask * 255
         if adaptive_crop_config.train_enabled:
-            tar_height, tar_width = data["tar_image"].shape[:2]
             crop_plan = build_adaptive_crop_plan(
                 image_size=(tar_width, tar_height),
-                mask=data["tar_mask"],
+                mask=data["tar_mask"] if placement is None else placement.mask,
                 config=adaptive_crop_config,
             )
+            if placement is not None:
+                crop_x1, crop_y1, crop_x2, crop_y2 = crop_plan.crop_box
+                loose_mask = loose_mask[crop_y1:crop_y2, crop_x1:crop_x2]
             data["tar_image"], data["tar_mask"] = crop_numpy_pair(
                 data["tar_image"],
                 data["tar_mask"],
@@ -567,6 +629,37 @@ class InsertAnythingDataset(Dataset):
         data["tar_mask"] = processed["mask"]
         data["ref_image"] = processed["controls"][0]
         data["ref_mask"] = processed["control_masks"][0]
+        if placement is not None:
+            # Nearest-neighbour resizing samples both masks on the same grid, so
+            # the loose region still covers the processed GT plus its band.
+            data["tar_mask_cond"] = self.preprocessor.preprocess(
+                {"mask": np.ascontiguousarray(loose_mask)}
+            )["mask"]
+        if condition_mode is not None:
+            if placement is None:
+                # Tight families keep the trainer's contract: built on the processed GT.
+                tight_mask = build_maskmix_v2_mask_for_mode(
+                    data["tar_mask"].numpy(), condition_mode, hybrid_config, placement_rng
+                )
+                data["tar_mask_cond"] = torch.from_numpy(tight_mask.astype(np.float32))
+            data["condition_mask_mode"] = condition_mode
+        elif placement is not None:
+            tight_mode = sample_tight_mode(hybrid_config, placement_rng)
+            tight_mask = build_maskmix_v2_mask_for_mode(
+                data["tar_mask"].numpy(), tight_mode, hybrid_config, placement_rng
+            )
+            data["tar_mask_cond_tight"] = torch.from_numpy(tight_mask.astype(np.float32))
+            data["placement_metadata"] = {
+                "loose_mode": placement.mode,
+                "loose_shape": placement.shape,
+                "tight_mode": tight_mode,
+                "scale_h": placement.scale_h,
+                "scale_w": placement.scale_w,
+                "bottom_aligned": placement.bottom_aligned,
+                "coverage_growth": placement.coverage_growth,
+                "guard_shrinks": placement.guard_shrinks,
+                "guard_exhausted": placement.guard_exhausted,
+            }
         if self.data_config.face_identity_supervision:
             from src.data.face_regions import face_region_mask
 

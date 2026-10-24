@@ -161,7 +161,8 @@ def test_integrated_configs_enable_all_paths_with_local_assets():
     import yaml
     root = Path(__file__).resolve().parents[1]
     files = list((root / 'configs/teacher_v2').glob('*.yaml'))
-    assert len(files) == 5
+    assert sorted(p.stem for p in files) == [
+        'accessory_jewelry', 'animal', 'animal_sigma_split', 'fashion_tryon', 'general_object', 'human']
     for p in files:
         cfg = Config.model_validate(yaml.safe_load(p.read_text()))
         assert cfg.train.num_epochs == 5

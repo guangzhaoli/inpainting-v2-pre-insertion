@@ -1,5 +1,10 @@
 # InsertFuse — Qwen Insert Anything Inpainting
 
+MeanFlow initialization and conditional DMD post-training are available through
+scripts/build_meanflow_config.py and scripts/run_meanflow_dmd.sh. See
+[the runtime guide](docs/meanflow_dmd_runtime.md) for both stages, distributed
+launch, checkpoint/resume and flow-map inference.
+
 The integrated **Teacher v2** configs are in `configs/teacher_v2/`. See
 [`docs/teacher_v2.md`](docs/teacher_v2.md) for the combined precision, RNG,
 conditioning, identity/detail losses, validation and uv launch workflow.

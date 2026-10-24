@@ -4,6 +4,7 @@ Run with uv run scripts/build_optimized_teacher_configs.py. Existing baseline
 configs and checkpoint snapshots are not rewritten. No files are downloaded.
 """
 
+import copy
 import json
 from pathlib import Path
 
@@ -13,6 +14,36 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = ROOT.parent
 DEST = ROOT / "configs/teacher_v2"
 DOMAINS = ["accessory_jewelry", "animal", "fashion_tryon", "general_object", "human"]
+
+# MaskMix without `exact`: no hole traces the GT outline. Loose families
+# (loose_blob, oversized_box) are drawn in the dataset before the crop and
+# leave part of the hole to real background, so the object no longer has to
+# fill the mask. Fashion keeps tight families only: a loose region around a
+# garment would also hide the face and hands that the GT keeps.
+MASK_MODE_WEIGHTS = {
+    "animal": dict(random_morphology=0.10, augmented_box=0.15, asymmetric_box=0.15,
+                   loose_blob=0.35, oversized_box=0.25),
+    "general_object": dict(random_morphology=0.20, augmented_box=0.20, asymmetric_box=0.20,
+                           loose_blob=0.25, oversized_box=0.15),
+    "human": dict(random_morphology=0.20, augmented_box=0.20, asymmetric_box=0.20,
+                  loose_blob=0.25, oversized_box=0.15),
+    "accessory_jewelry": dict(random_morphology=0.30, augmented_box=0.25, asymmetric_box=0.25,
+                              loose_blob=0.15, oversized_box=0.05),
+    "fashion_tryon": dict(random_morphology=0.40, augmented_box=0.30, asymmetric_box=0.30),
+}
+LOOSE_GEOMETRY = {
+    "animal": dict(scale_min=1.2, scale_max=2.5, bottom_align_prob=0.7),
+    "general_object": dict(scale_min=1.2, scale_max=2.2, bottom_align_prob=0.5),
+    "human": dict(scale_min=1.2, scale_max=2.0, bottom_align_prob=0.7),
+    "accessory_jewelry": dict(scale_min=1.2, scale_max=2.0, bottom_align_prob=0.0),
+}
+# Hair masks wrap the face; a loose region would hide the face the GT keeps.
+HAIR_MODE_WEIGHTS = dict(random_morphology=0.50, augmented_box=0.25, asymmetric_box=0.25)
+
+
+def mode_weights(weights):
+    return {name: weights.get(name, 0.0) for name in
+            ("exact", "random_morphology", "augmented_box", "asymmetric_box", "loose_blob", "oversized_box")}
 
 
 def validation_rows(domain):
@@ -70,8 +101,20 @@ def main():
         radius = 16 if small else 32
         hybrid = data["hybrid_masking"]
         hybrid["interaction_dilation_px"] = radius
-        hybrid["maskmix_v2"]["mode_weights"] = dict(exact=0.2, random_morphology=0.2, augmented_box=0.3, asymmetric_box=0.3)
-        hybrid["maskmix_v2"]["asymmetric_box"]["margin_ratio_max"] = 0.25
+        hybrid["maskmix_v2"]["mode_weights"] = mode_weights(MASK_MODE_WEIGHTS[domain])
+        # Every box side keeps a margin, and morphology radii exceed the interaction
+        # band, so neither family reproduces the outline.
+        hybrid["maskmix_v2"]["asymmetric_box"].update(margin_ratio_min=0.05, margin_ratio_max=0.30)
+        hybrid["maskmix_v2"]["morphology"].update(
+            radius_object_scale_min=0.06, radius_object_scale_max=0.20, radius_min_px=8, radius_max_px=96
+        )
+        hybrid["context_guard"]["overflow_policy"] = "fallback_to_band"
+        if domain in LOOSE_GEOMETRY:
+            hybrid["loose_placement"] = dict(enabled=False, **LOOSE_GEOMETRY[domain])
+        if domain == "human":
+            hair = copy.deepcopy(hybrid)
+            hair["maskmix_v2"]["mode_weights"] = mode_weights(HAIR_MODE_WEIGHTS)
+            data["category_conditioning"] = {"person_hair": {"hybrid_masking": hair}}
         cfg["train"].update(trainable_precision="float32", rank_specific_rng=True, seed=42, memory_policy="auto")
         cfg["optimizer"]["init_args"]["lr"] = 5e-5
         loss = cfg["loss"]

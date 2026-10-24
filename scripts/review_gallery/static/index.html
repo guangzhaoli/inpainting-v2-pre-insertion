@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Insertion Review Gallery</title>
+  <style>
+    :root {
+      --bg: #0f1115; --panel: #171a21; --panel2: #1e2330; --border: #2a3142;
+      --text: #e8ecf4; --muted: #8b95a8; --accent: #5b8cff;
+      --keep: #2ecc71; --drop: #e74c3c; --maybe: #f1c40f; --chip: #252b3a;
+      --shadow: 0 8px 28px rgba(0,0,0,.35); --radius: 10px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --sans: "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font-family:var(--sans); overflow:hidden; }
+    button, select, input, textarea { font:inherit; color:inherit; }
+    button { background:var(--chip); border:1px solid var(--border); border-radius:8px; padding:6px 10px; cursor:pointer; }
+    button:hover { border-color:var(--accent); }
+    button.primary { background:#2a4a8a; border-color:var(--accent); }
+    button.keep { background:#1c3b2a; border-color:var(--keep); }
+    button.drop { background:#3b1c1c; border-color:var(--drop); }
+    button.maybe { background:#3b351c; border-color:var(--maybe); }
+    input, select, textarea { background:var(--panel2); border:1px solid var(--border); border-radius:8px; padding:6px 8px; outline:none; }
+    .app { display:grid; grid-template-columns:300px 1fr; grid-template-rows:52px 1fr; height:100vh; }
+    .top { grid-column:1/-1; display:flex; align-items:center; gap:10px; padding:0 12px; border-bottom:1px solid var(--border); background:var(--panel); }
+    .top .title { font-weight:700; margin-right:8px; }
+    .top .spacer { flex:1; }
+    .top .hint { color:var(--muted); font-size:12px; }
+    .kbd { font-family:var(--mono); font-size:11px; background:#0c0e13; border:1px solid var(--border); border-radius:4px; padding:1px 5px; color:var(--muted); }
+    .side { border-right:1px solid var(--border); background:var(--panel); display:flex; flex-direction:column; min-height:0; }
+    .side-head { padding:10px; border-bottom:1px solid var(--border); display:grid; gap:8px; }
+    .row { display:flex; gap:6px; align-items:center; }
+    .row > * { flex:1; min-width:0; }
+    .side-stats { color:var(--muted); font-size:12px; }
+    .list { flex:1; overflow:auto; padding:6px; }
+    .item { display:grid; grid-template-columns:10px 1fr auto; gap:8px; align-items:center; padding:8px; border-radius:8px; cursor:pointer; border:1px solid transparent; margin-bottom:2px; }
+    .item:hover { background:var(--panel2); }
+    .item.active { background:#24314d; border-color:#3b5fad; }
+    .dot { width:8px; height:8px; border-radius:50%; background:#444; }
+    .dot.keep { background:var(--keep); } .dot.drop { background:var(--drop); } .dot.maybe { background:var(--maybe); }
+    .item .cid { font-family:var(--mono); font-size:12px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .item .meta { color:var(--muted); font-size:11px; }
+    .item .nm { color:var(--muted); font-size:11px; font-family:var(--mono); }
+    .main { display:grid; grid-template-rows:auto 1fr auto; min-width:0; min-height:0; }
+    .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:8px 12px; border-bottom:1px solid var(--border); background:var(--panel); }
+    .case-title { font-family:var(--mono); font-size:13px; font-weight:600; }
+    .chips { display:flex; flex-wrap:wrap; gap:6px; }
+    .chip { display:inline-flex; align-items:center; gap:6px; background:var(--chip); border:1px solid var(--border); border-radius:999px; padding:4px 10px; font-size:12px; cursor:pointer; user-select:none; }
+    .chip.off { opacity:.45; }
+    .stage { overflow:auto; padding:12px; min-height:0; background:var(--bg); }
+    .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(240px,1fr)); gap:12px; align-content:start; }
+    .card { background:var(--panel); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; box-shadow:var(--shadow); min-width:0; }
+    .card.highlight { border-color:#5b8cff; }
+    .card .cap { display:flex; justify-content:space-between; gap:8px; padding:7px 10px; border-bottom:1px solid var(--border); background:var(--panel2); font-size:12px; color:var(--muted); }
+    .card .cap b { color:var(--text); }
+    .frame { position:relative; background:#0a0c10; aspect-ratio:1/1; display:flex; align-items:center; justify-content:center; overflow:hidden; }
+    .frame img { width:100%; height:100%; object-fit:contain; background:repeating-conic-gradient(#151821 0% 25%, #10131a 0% 50%) 50%/16px 16px; }
+    .frame .ph { color:var(--muted); font-size:12px; padding:12px; text-align:center; word-break:break-all; }
+    .bottom { border-top:1px solid var(--border); background:var(--panel); padding:8px 12px; display:grid; grid-template-columns:1fr 280px; gap:12px; }
+    .actions { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .actions .note { flex:1; min-width:180px; }
+    .help { color:var(--muted); font-size:11px; line-height:1.45; }
+    .toast { position:fixed; right:16px; bottom:16px; background:#1b2436; border:1px solid var(--border); padding:10px 14px; border-radius:10px; box-shadow:var(--shadow); opacity:0; transform:translateY(8px); transition:.2s; pointer-events:none; z-index:50; font-size:13px; max-width:60vw; }
+    .toast.show { opacity:1; transform:none; }
+    .empty { color:var(--muted); padding:40px; text-align:center; }
+    .star { color:var(--maybe); letter-spacing:1px; cursor:pointer; }
+    #dbg { color:#9ad; font-size:11px; font-family:var(--mono); max-width:40vw; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="top">
+      <div class="title">Insertion Review</div>
+      <select id="suite"></select>
+      <select id="major"><option value="">all majors</option></select>
+      <input id="q" placeholder="filter case_id…" style="width:180px" />
+      <select id="filterDecision">
+        <option value="">all decisions</option>
+        <option value="none">undecided</option>
+        <option value="keep">keep</option>
+        <option value="maybe">maybe</option>
+        <option value="drop">drop</option>
+      </select>
+      <button id="btnReload" title="Reload">↻</button>
+      <button id="btnPing" title="Test image">Test IMG</button>
+      <div class="spacer"></div>
+      <div id="dbg">boot…</div>
+      <div class="hint"><span class="kbd">J</span>/<span class="kbd">K</span> · <span class="kbd">1</span> keep · <span class="kbd">2</span> maybe · <span class="kbd">3</span> drop · <span class="kbd">S</span> save</div>
+    </div>
+    <aside class="side">
+      <div class="side-head">
+        <div class="side-stats" id="sideStats">loading…</div>
+        <div class="row">
+          <button id="btnExportKeep" class="primary">Export keep</button>
+          <button id="btnExportMaybe">Export maybe</button>
+        </div>
+      </div>
+      <div class="list" id="list"></div>
+    </aside>
+    <section class="main">
+      <div class="toolbar">
+        <div class="case-title" id="caseTitle">—</div>
+        <div class="spacer"></div>
+        <label class="chip"><input type="checkbox" id="chkOverlay" checked /> mask overlay</label>
+        <label class="chip">thumb <input type="range" id="thumbW" min="160" max="640" value="280" style="width:90px" /></label>
+        <div class="chips" id="methodChips"></div>
+      </div>
+      <div class="stage"><div class="grid" id="grid"><div class="empty">Select a case</div></div></div>
+      <div class="bottom">
+        <div class="actions">
+          <button class="keep" data-dec="keep">Keep <span class="kbd">1</span></button>
+          <button class="maybe" data-dec="maybe">Maybe <span class="kbd">2</span></button>
+          <button class="drop" data-dec="drop">Drop <span class="kbd">3</span></button>
+          <button data-dec="none">Clear</button>
+          <span class="star" id="stars">☆☆☆</span>
+          <input class="note" id="note" placeholder="note…" />
+          <button id="btnSave" class="primary">Save</button>
+          <button id="btnPrev">← Prev</button>
+          <button id="btnNext">Next →</button>
+        </div>
+        <div class="help">REF / masks / TAR⊕mask + methods. Decisions → <code>output/review_gallery_decisions/</code>. Double-click image = full size.</div>
+      </div>
+    </section>
+  </div>
+  <div class="toast" id="toast"></div>
+<script>
+(() => {
+  const state = {
+    meta: null, suite: 'paperinsert_900', items: [], filtered: [],
+    idx: 0, case: null, methodsOn: {}, thumbW: 280, overlay: true,
+  };
+  const $ = (id) => document.getElementById(id);
+  const dbg = (msg) => { $('dbg').textContent = msg; console.log('[gallery]', msg); };
+  const toast = (msg) => {
+    const el = $('toast'); el.textContent = msg; el.classList.add('show');
+    clearTimeout(toast._t); toast._t = setTimeout(() => el.classList.remove('show'), 2200);
+  };
+  const esc = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  // Support reverse-proxy prefixes: page at /foo/ or /foo/index.html
+  function rootPrefix() {
+    let p = location.pathname || '/';
+    if (p.endsWith('/index.html')) p = p.slice(0, -10);
+    if (p.endsWith('/')) p = p.slice(0, -1);
+    return p; // '' when at domain root
+  }
+  function u(path) {
+    // path always starts with /
+    return rootPrefix() + path;
+  }
+  function imgUrl(assetPath, w) {
+    if (!assetPath) return '';
+    const path = assetPath.startsWith('/') ? assetPath : ('/' + assetPath);
+    let full = u(path);
+    if (w) full += (full.includes('?') ? '&' : '?') + 'w=' + w;
+    return full;
+  }
+
+  async function api(path, opts) {
+    const url = path.startsWith('http') ? path : u(path);
+    const r = await fetch(url, opts);
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`${r.status} ${url}: ${t.slice(0, 200)}`);
+    }
+    const ct = r.headers.get('content-type') || '';
+    if (ct.includes('json')) return r.json();
+    return r;
+  }
+
+  function suiteMeta() { return state.meta?.suites?.find(s => s.id === state.suite); }
+
+  function renderMethodChips() {
+    const box = $('methodChips'); box.innerHTML = '';
+    const sm = suiteMeta(); if (!sm) return;
+    for (const m of sm.methods) {
+      const lab = document.createElement('label');
+      lab.className = 'chip' + (state.methodsOn[m] ? '' : ' off');
+      const cb = document.createElement('input');
+      cb.type = 'checkbox'; cb.checked = !!state.methodsOn[m];
+      cb.onchange = () => { state.methodsOn[m] = cb.checked; lab.classList.toggle('off', !cb.checked); renderGrid(); };
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(sm.method_labels?.[m] || m));
+      box.appendChild(lab);
+    }
+  }
+
+  function fillMajors() {
+    const sm = suiteMeta();
+    const sel = $('major');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">all majors</option>';
+    for (const m of (sm?.majors || [])) {
+      const o = document.createElement('option'); o.value = m; o.textContent = m; sel.appendChild(o);
+    }
+    if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  }
+
+  async function loadMeta() {
+    dbg('loading meta…');
+    state.meta = await api('/api/meta');
+    const sel = $('suite'); sel.innerHTML = '';
+    for (const s of state.meta.suites) {
+      const o = document.createElement('option');
+      o.value = s.id; o.textContent = `${s.id} (${s.n})`;
+      sel.appendChild(o);
+    }
+    if (state.meta.suites.length) {
+      state.suite = state.meta.suites[0].id;
+      sel.value = state.suite;
+      for (const m of state.meta.suites[0].methods) state.methodsOn[m] = true;
+    }
+    renderMethodChips();
+    dbg(`meta ok · root="${rootPrefix()||'/'}" · suites=${state.meta.suites.length}`);
+  }
+
+  function applyDecisionFilter() {
+    const fd = $('filterDecision').value;
+    state.filtered = state.items.filter(it => {
+      if (!fd) return true;
+      return (it.decision || 'none') === fd;
+    });
+    $('sideStats').textContent = `${state.filtered.length}/${state.items.length} · ${state.suite}`;
+  }
+
+  function renderList() {
+    const list = $('list');
+    const frag = document.createDocumentFragment();
+    // virtual-ish: still render all but lightweight nodes
+    state.filtered.forEach((it, i) => {
+      const el = document.createElement('div');
+      el.className = 'item' + (i === state.idx ? ' active' : '');
+      const dec = it.decision || 'none';
+      el.innerHTML = `<div class="dot ${dec}"></div><div><div class="cid">${esc(it.case_id)}</div><div class="meta">${esc(it.major||'')}</div></div><div class="nm">${it.n_methods}</div>`;
+      el.onclick = () => selectIndex(i);
+      frag.appendChild(el);
+    });
+    list.innerHTML = '';
+    list.appendChild(frag);
+    const active = list.querySelector('.item.active');
+    if (active) active.scrollIntoView({ block: 'nearest' });
+  }
+
+  async function loadCases() {
+    dbg(`loading cases ${state.suite}…`);
+    const url = new URL(u('/api/cases'), location.origin);
+    // when rootPrefix set, URL constructor with absolute path needs care
+    const qs = new URLSearchParams();
+    qs.set('suite', state.suite);
+    if ($('major').value) qs.set('major', $('major').value);
+    if ($('q').value.trim()) qs.set('q', $('q').value.trim());
+    const data = await api('/api/cases?' + qs.toString());
+    state.items = data.items || [];
+    applyDecisionFilter();
+    renderList();
+    dbg(`cases ${state.filtered.length}`);
+    if (state.filtered.length) {
+      const cur = state.case?.case_id;
+      let i = state.filtered.findIndex(x => x.case_id === cur);
+      if (i < 0) i = 0;
+      await selectIndex(i);
+    } else {
+      state.case = null;
+      $('grid').innerHTML = '<div class="empty">No cases</div>';
+    }
+  }
+
+  function renderStars(n) {
+    n = Math.max(0, Math.min(3, n|0));
+    $('stars').textContent = '★'.repeat(n) + '☆'.repeat(3-n);
+    $('stars').dataset.n = n;
+  }
+
+  function makeCard(title, src, {highlight=false, missing=false} = {}) {
+    const card = document.createElement('div');
+    card.className = 'card' + (highlight ? ' highlight' : '');
+    const frameId = 'f_' + Math.random().toString(36).slice(2,9);
+    card.innerHTML = `<div class="cap"><b>${esc(title)}</b><span class="st">…</span></div><div class="frame" id="${frameId}"><div class="ph">${missing?'missing':'loading…'}</div></div>`;
+    const frame = card.querySelector('.frame');
+    const st = card.querySelector('.st');
+    if (src && !missing) {
+      const img = document.createElement('img');
+      img.alt = title;
+      img.decoding = 'async';
+      const t0 = performance.now();
+      img.onload = () => {
+        st.textContent = `${Math.round(performance.now()-t0)}ms`;
+        frame.innerHTML = '';
+        frame.appendChild(img);
+      };
+      img.onerror = () => {
+        st.textContent = 'ERR';
+        frame.innerHTML = `<div class="ph">load error<br><code style="font-size:10px">${esc(src)}</code></div>`;
+        dbg(`IMG ERR ${src}`);
+      };
+      img.ondblclick = () => window.open(src.replace(/([?&])w=\d+/g,'').replace(/[?&]$/,''), '_blank');
+      // set src last
+      img.src = src;
+    } else {
+      st.textContent = missing ? '—' : '';
+    }
+    return card;
+  }
+
+  function renderGrid() {
+    const c = state.case;
+    const grid = $('grid');
+    if (!c) { grid.innerHTML = '<div class="empty">Select a case</div>'; return; }
+    const a = c.assets;
+    if (!a) {
+      grid.innerHTML = `<div class="empty">Case has no assets field — hard refresh (Ctrl+Shift+R).<br>Server may be old.</div>`;
+      dbg('case missing assets');
+      return;
+    }
+    const w = state.thumbW;
+    const frag = document.createDocumentFragment();
+    frag.appendChild(makeCard('REF (src)', imgUrl(a.ref_image, w)));
+    frag.appendChild(makeCard('REF mask', imgUrl(a.ref_mask, w)));
+    frag.appendChild(makeCard('TAR', imgUrl(a.tar_image, w)));
+    frag.appendChild(makeCard('TAR mask', imgUrl(a.tar_mask, w)));
+    if (state.overlay) frag.appendChild(makeCard('TAR ⊕ mask', imgUrl(a.tar_overlay, w), {highlight:true}));
+    const methods = c.methods || [];
+    for (const m of methods) {
+      if (!state.methodsOn[m]) continue;
+      const p = a.results?.[m];
+      let label = c.method_labels?.[m] || m;
+      if (m === 'ours' && c.ours_file) label = `Ours (${c.ours_file})`;
+      frag.appendChild(makeCard(label, p ? imgUrl(p, w) : '', {missing:!p, highlight: m==='ours'}));
+    }
+    grid.innerHTML = '';
+    grid.appendChild(frag);
+    dbg(`render ${c.case_id} · ours=${c.ours_file||'?'} · w=${w}`);
+  }
+
+  async function selectIndex(i) {
+    if (!state.filtered.length) return;
+    state.idx = Math.max(0, Math.min(i, state.filtered.length-1));
+    renderList();
+    const it = state.filtered[state.idx];
+    dbg(`fetch case ${it.case_id}`);
+    try {
+      const data = await api(`/api/case/${encodeURIComponent(state.suite)}/${encodeURIComponent(it.case_id)}`);
+      state.case = data;
+      it.decision = data.decision; it.note = data.note;
+      $('caseTitle').textContent = `${data.case_id} · ${(data.index|0)+1}/${data.total}`;
+      $('note').value = data.note || '';
+      renderStars(data.stars || 0);
+      renderGrid();
+      // prefetch neighbors lightly
+      for (const nid of [data.next_id, data.prev_id]) {
+        if (!nid) continue;
+        const img = new Image();
+        // just warm next tar
+        api(`/api/case/${encodeURIComponent(state.suite)}/${encodeURIComponent(nid)}`).then(nc => {
+          if (nc.assets?.tar_image) { const i2 = new Image(); i2.src = imgUrl(nc.assets.tar_image, state.thumbW); }
+        }).catch(()=>{});
+      }
+    } catch (e) {
+      dbg(String(e));
+      toast(String(e));
+      $('grid').innerHTML = `<div class="empty">${esc(String(e))}</div>`;
+    }
+  }
+
+  async function saveDecision(decision) {
+    if (!state.case) return;
+    const body = {
+      suite: state.suite,
+      case_id: state.case.case_id,
+      decision: decision ?? (state.case.decision || 'none'),
+      note: $('note').value,
+      stars: parseInt($('stars').dataset.n || '0', 10),
+      methods_shown: Object.keys(state.methodsOn).filter(m => state.methodsOn[m]),
+    };
+    const res = await api('/api/decision', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    state.case.decision = res.item.decision;
+    const it = state.filtered[state.idx];
+    if (it) it.decision = res.item.decision;
+    renderList();
+    toast('saved: ' + res.item.decision);
+  }
+
+  // events
+  $('suite').onchange = async () => { state.suite = $('suite').value; fillMajors(); renderMethodChips(); await loadCases(); };
+  $('major').onchange = () => loadCases();
+  $('filterDecision').onchange = () => { applyDecisionFilter(); renderList(); if (state.filtered.length) selectIndex(0); };
+  let qt; $('q').oninput = () => { clearTimeout(qt); qt = setTimeout(loadCases, 250); };
+  $('chkOverlay').onchange = e => { state.overlay = e.target.checked; renderGrid(); };
+  $('thumbW').onchange = e => { state.thumbW = +e.target.value; renderGrid(); };
+  $('thumbW').oninput = e => { state.thumbW = +e.target.value; };
+  $('btnPrev').onclick = () => selectIndex(state.idx - 1);
+  $('btnNext').onclick = () => selectIndex(state.idx + 1);
+  $('btnSave').onclick = () => saveDecision();
+  document.querySelectorAll('button[data-dec]').forEach(btn => {
+    btn.onclick = async () => { await saveDecision(btn.dataset.dec); if (btn.dataset.dec !== 'none') selectIndex(state.idx + 1); };
+  });
+  $('stars').onclick = () => renderStars(((parseInt($('stars').dataset.n||'0',10)+1)%4));
+  $('btnReload').onclick = async () => {
+    await api('/api/reload', {method:'POST'});
+    await loadMeta(); fillMajors(); await loadCases(); toast('reloaded');
+  };
+  $('btnExportKeep').onclick = () => { location.href = u(`/api/export?suite=${encodeURIComponent(state.suite)}&decision=keep`); };
+  $('btnExportMaybe').onclick = () => { location.href = u(`/api/export?suite=${encodeURIComponent(state.suite)}&decision=maybe`); };
+  $('btnPing').onclick = async () => {
+    try {
+      const data = await api('/api/case/paperinsert_900/obj_companion_animals_000');
+      const src = imgUrl(data.assets.ref_image, 128);
+      dbg('ping ' + src);
+      const r = await fetch(src);
+      dbg(`ping status ${r.status} ct=${r.headers.get('content-type')} len=${(await r.blob()).size}`);
+      toast('ping ok ' + r.status);
+    } catch (e) { dbg(String(e)); toast(String(e)); }
+  };
+
+  window.addEventListener('keydown', (e) => {
+    if (e.target.matches('input, textarea')) {
+      if (e.key === 'Enter' && e.target.id === 'note') { e.preventDefault(); saveDecision(); }
+      return;
+    }
+    const k = e.key.toLowerCase();
+    if (k==='j' || k==='arrowdown' || k==='arrowright') { e.preventDefault(); selectIndex(state.idx+1); }
+    if (k==='k' || k==='arrowup' || k==='arrowleft') { e.preventDefault(); selectIndex(state.idx-1); }
+    if (k==='1') { e.preventDefault(); saveDecision('keep').then(()=>selectIndex(state.idx+1)); }
+    if (k==='2') { e.preventDefault(); saveDecision('maybe').then(()=>selectIndex(state.idx+1)); }
+    if (k==='3') { e.preventDefault(); saveDecision('drop').then(()=>selectIndex(state.idx+1)); }
+    if (k==='s') { e.preventDefault(); saveDecision(); }
+    if (k==='o') { e.preventDefault(); $('chkOverlay').checked=!$('chkOverlay').checked; state.overlay=$('chkOverlay').checked; renderGrid(); }
+  });
+
+  (async function init() {
+    try {
+      dbg(`boot ${location.href}`);
+      await loadMeta();
+      fillMajors();
+      await loadCases();
+    } catch (e) {
+      dbg(String(e));
+      $('sideStats').textContent = 'ERROR';
+      $('grid').innerHTML = `<div class="empty">${esc(String(e))}<br>Check you open http://&lt;host&gt;:8765 not a file:// page.</div>`;
+      toast(String(e));
+    }
+  })();
+})();
+</script>
+</body>
+</html>

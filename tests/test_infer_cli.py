@@ -154,6 +154,54 @@ class InferCliTest(unittest.TestCase):
                     latent_anchoring_is_enabled=True,
                 )
 
+    def test_output_plan_rejects_checkpoint_artifacts_and_symlink_outputs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            lora = checkpoint / "model.safetensors"
+            state = checkpoint / "state.json"
+            geometry = checkpoint / "mask_geometry_tokenizer.safetensors"
+            lora.write_bytes(b"lora")
+            state.write_text("state", encoding="utf-8")
+            geometry.write_bytes(b"geometry")
+
+            output_link = root / "result.png"
+            output_link.symlink_to(state)
+            args = SimpleNamespace(
+                output=output_link,
+                composite_output=None,
+                row_output=None,
+                skip_composite=True,
+                skip_row=True,
+            )
+            before = state.read_bytes()
+            with self.assertRaisesRegex(ValueError, "contains a symlink"):
+                infer.build_output_path_plan(
+                    args,
+                    has_crop=False,
+                    protected_paths=infer.checkpoint_protected_paths(lora),
+                )
+            self.assertEqual(state.read_bytes(), before)
+
+            output_link.unlink()
+            args.output = geometry
+            with self.assertRaisesRegex(ValueError, "must not overwrite"):
+                infer.build_output_path_plan(
+                    args,
+                    has_crop=False,
+                    protected_paths=infer.checkpoint_protected_paths(lora),
+                )
+
+            external = root / "external"
+            external.mkdir()
+            symlink_parent = root / "linked-output"
+            symlink_parent.symlink_to(external, target_is_directory=True)
+            args.output = symlink_parent / "result.png"
+            with self.assertRaisesRegex(ValueError, "contains a symlink"):
+                infer.build_output_path_plan(args, has_crop=False)
+            self.assertEqual(list(external.iterdir()), [])
+
     def test_main_saves_output_scoped_artifacts_and_effective_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

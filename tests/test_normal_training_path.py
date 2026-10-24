@@ -25,17 +25,17 @@ from tests.test_opd_strategy import FakeTrainer, _guidance, _plugin, _teacher
 
 @pytest.mark.parametrize("inference", [False, True])
 def test_text_encoder_is_offloaded_before_vae_encoding(inference):
-    class Encoder:
-        device = torch.device("cpu")
-
-        def to(self, device):
-            assert not torch.is_inference_mode_enabled()
-            self.device = torch.device(device)
-
     trainer = QwenImageEditPlusTrainer.__new__(QwenImageEditPlusTrainer)
     trainer.config = NS(train=NS(offload_text_encoder=True), loss=NS(mask_loss=False))
     trainer.accelerator = NS(device=torch.device("cuda:0"))
-    trainer.text_encoder = Encoder()
+    trainer.text_encoder = NS(device=torch.device("cpu"))
+
+    def stream(device):
+        # The pinned host copy is streamed outside inference mode; None returns to the host copy.
+        assert not torch.is_inference_mode_enabled()
+        trainer.text_encoder.device = torch.device("cpu" if device is None else device)
+
+    trainer._stream_text_encoder = stream
     trainer.weight_dtype = torch.float32
     trainer.num_channels_latents = 1
     trainer.preprocess_image_for_text_encoder = lambda value, **kwargs: value * 255
@@ -73,7 +73,7 @@ def test_standalone_prompt_encoding_keeps_explicit_prediction_device():
 
 def test_cpu_hybrid_metrics_are_sent_to_the_communication_device():
     trainer = QwenImageEditInsertAnythingTrainer.__new__(QwenImageEditInsertAnythingTrainer)
-    records = torch.arange(28, dtype=torch.float64).reshape(2, 14)
+    records = torch.arange(32, dtype=torch.float64).reshape(2, 16)
     trainer._hybrid_masking_metric_buffer = [records[:1], records[1:]]
 
     def gather(value):
@@ -84,8 +84,10 @@ def test_cpu_hybrid_metrics_are_sent_to_the_communication_device():
     trainer.accelerator = NS(device=torch.device("meta"), gather=gather)
     with patch.object(BaseTrainer, "build_training_logs", return_value={}):
         logs = trainer.build_training_logs(0, [None], None, 1.)
-    assert logs["hybrid/gt_area_mean"] == 7.
-    assert logs["hybrid/condition_area_p90"] == pytest.approx(14.6)
+    assert logs["hybrid/gt_area_mean"] == 8.
+    assert logs["hybrid/condition_area_p90"] == pytest.approx(16.4)
+    assert logs["hybrid/mode_oversized_box_rate"] == 21.
+    assert logs["hybrid/condition_expansion_max"] == 31.
     assert not trainer._hybrid_masking_metric_buffer
 
 

@@ -639,7 +639,16 @@ class RegionPerceptualLoss(nn.Module):
         ref_range: str,
         sample_valid: Optional[torch.Tensor],
         sample_weights: Optional[torch.Tensor],
+        gt_images: Optional[torch.Tensor] = None,
+        gt_range: str = "0-1",
+        hinge_margin: float = 0.0,
     ) -> torch.Tensor:
+        """``1 - cos(pred, ref)``, or with ``gt_images`` the GT-anchored hinge
+        ``relu(cos(GT, ref) - margin - cos(pred, ref))``: only falling behind the
+        real target is penalized, so copying the reference view earns nothing.
+        The GT object shares ``pred_mask``; its cosine carries no gradient.
+        """
+
         pred_crop, pred_box_valid = _masked_bbox_crop(
             pred_images,
             pred_mask,
@@ -674,7 +683,22 @@ class RegionPerceptualLoss(nn.Module):
             ref_feat = self._dino_embed(ref_crop).to(device=pred_feat.device, dtype=pred_feat.dtype)
 
         cos = F.cosine_similarity(pred_feat, ref_feat, dim=-1, eps=1e-6)
-        per_sample = 1.0 - cos
+        if gt_images is None:
+            per_sample = 1.0 - cos
+        else:
+            with torch.no_grad():
+                gt_crop, _ = _masked_bbox_crop(
+                    gt_images,
+                    pred_mask,
+                    out_size=self.dino_input_size,
+                    pad_ratio=self.dino_bbox_pad_ratio,
+                    mask_threshold=self.mask_threshold,
+                    input_range=gt_range,
+                    output_range="0-1",
+                )
+                gt_feat = self._dino_embed(gt_crop).to(device=pred_feat.device, dtype=pred_feat.dtype)
+                gt_cos = F.cosine_similarity(gt_feat, ref_feat, dim=-1, eps=1e-6)
+            per_sample = F.relu(gt_cos - float(hinge_margin) - cos)
         return self._reduce_per_sample(per_sample, sample_valid, sample_weights, pred_images)
 
     def forward(
@@ -697,7 +721,12 @@ class RegionPerceptualLoss(nn.Module):
         detail_patch_size: int = 256,
         boundary_weight: float = 0.0,
         interaction_radius_px: int = 0,
+        ref_dino_mode: str = "cosine",
+        ref_dino_hinge_margin: float = 0.0,
+        ref_dino_sample_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
+        if ref_dino_mode not in {"cosine", "gt_hinge"}:
+            raise ValueError(f"ref_dino_mode must be 'cosine' or 'gt_hinge', got {ref_dino_mode!r}")
         if pred_images.shape != target_images.shape:
             raise ValueError(
                 "pred/target image shapes must match, got "
@@ -802,6 +831,7 @@ class RegionPerceptualLoss(nn.Module):
             if not bool(fg_valid.any().item()):
                 ref_dino_loss = pred_images.sum() * 0.0
             else:
+                hinge = ref_dino_mode == "gt_hinge"
                 ref_dino_loss = self._reference_dino_identity(
                     pred_images=pred_images,
                     pred_mask=mask,
@@ -810,7 +840,10 @@ class RegionPerceptualLoss(nn.Module):
                     pred_range=pred_range,
                     ref_range=ref_range,
                     sample_valid=fg_valid,
-                    sample_weights=sample_weights,
+                    sample_weights=sample_weights if ref_dino_sample_weights is None else ref_dino_sample_weights,
+                    gt_images=target_images if hinge else None,
+                    gt_range=target_range,
+                    hinge_margin=ref_dino_hinge_margin,
                 )
 
         total = (

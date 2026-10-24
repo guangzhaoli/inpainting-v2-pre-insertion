@@ -106,17 +106,16 @@ def test_same_world_resume_keeps_tail_policy_and_idle_checkpoint_cursor(saved_dr
 
 
 def test_conditioning_offload_is_exception_safe():
-    encoder = Mock()
+    stream = Mock()
     trainer = NS(
         config=NS(train=NS(offload_text_encoder=True)),
-        text_encoder=encoder,
+        _stream_text_encoder=stream,
         accelerator=NS(device=torch.device("cpu")),
     )
     with pytest.raises(RuntimeError):
         with BaseTrainer.conditioning_context(trainer):
             raise RuntimeError("encoding failed")
-    assert encoder.to.call_args_list[0].args == (torch.device("cpu"),)
-    assert encoder.to.call_args_list[-1].args == ("cpu",)
+    assert [call.args for call in stream.call_args_list] == [(torch.device("cpu"),), (None,)]
 
 
 @pytest.mark.parametrize("gib,policy,expected", [(80, "auto", True), (141, "auto", False), (80, "configured", False)])
@@ -160,6 +159,9 @@ def test_checkpoint_builder_preserves_teacher_specific_conditioning(tmp_path):
     profiles = cfg.data.init_args.category_conditioning
     assert profiles["accessory"].hybrid_masking.interaction_dilation_px == 16
     assert profiles["person"].hybrid_masking.interaction_dilation_px == 32
+    # The human teacher's own person_hair profile (no loose families) survives.
+    assert profiles["person"].hybrid_masking.maskmix_v2.mode_weights.loose_blob > 0
+    assert profiles["person_hair"].hybrid_masking.maskmix_v2.mode_weights.loose_blob == 0
     cfg.distillation.teachers[0].lora.r = 256
     with pytest.raises(ValueError, match="lora.r"):
         preflight_teacher_checkpoints(cfg)

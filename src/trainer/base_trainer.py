@@ -5,6 +5,7 @@ Defines the core interface that all trainers must implement.
 
 from accelerate import Accelerator
 from accelerate.utils import (
+    InitProcessGroupKwargs,
     DataLoaderConfiguration,
     DistributedDataParallelKwargs,
     ProjectConfiguration,
@@ -14,6 +15,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Dict, Optional, Tuple
+import datetime
 import math
 import re
 import shutil
@@ -31,7 +33,7 @@ from functools import partial
 import numpy as np
 from src.utils.sampling import calculate_shift, retrieve_timesteps
 from tqdm import tqdm
-from diffusers.utils import convert_state_dict_to_diffusers
+from diffusers.utils import convert_unet_state_dict_to_peft
 from diffusers.utils.torch_utils import is_compiled_module
 from peft.utils import get_peft_model_state_dict
 import logging
@@ -48,13 +50,14 @@ from src.utils.lora_utils import FpsLogger
 from src.utils.tools import get_git_info
 from src.utils.tools import instantiate_class
 from src.utils.inference_metadata import (
+    ALPHA_HEAD_COMPANION_FILE_NAME,
     CHECKPOINT_ARTIFACT_MANIFEST_VERSION,
     MASK_GEOMETRY_COMPANION_FILE_NAME,
     validate_checkpoint_artifacts,
     validate_resume_mask_control_compatibility,
 )
 from src.scheduler.custom_flowmatch_scheduler import FlowMatchEulerDiscreteScheduler
-from src.utils.lora_utils import classify_lora_weight, filter_lora_state_keys
+from src.utils.lora_utils import filter_lora_state_keys
 from src.trainer.constants import LORA_FILE_BASE_NAME
 
 logger = logging.getLogger(__name__)
@@ -69,6 +72,11 @@ CHECKPOINT_ARTIFACT_ROLES = {
     PEFT_LORA_FILE_NAME: "lora_peft",
     LORA_FILE_BASE_NAME: "lora_diffusers",
     MASK_GEOMETRY_COMPANION_FILE_NAME: "mask_geometry_tokenizer",
+    ALPHA_HEAD_COMPANION_FILE_NAME: "alpha_head",
+    "flow_map_time_embedding.safetensors": "flow_map_time_embedding",
+    "fake_score_lora.safetensors": "fake_score_lora",
+    "fake_score_optimizer.pt": "fake_score_optimizer",
+    "meanflow_training_state.json": "meanflow_training_state",
 }
 PEFT_LORA_PARAMETER_PREFIXES = (
     "lora_A",
@@ -281,6 +289,17 @@ class BaseTrainer(ABC):
         # 根据配置决定是否启用梯度检查点
         if self.config.train.gradient_checkpointing:
             self.dit.enable_gradient_checkpointing()
+        if getattr(getattr(self, "training_strategy", None), "manual_gradient_sync", False):
+            if getattr(self.accelerator.state, "fsdp_plugin", None) is not None:
+                raise ValueError("Shared MeanFlow/DMD requires MULTI_GPU or CPU, not FSDP")
+            if getattr(self.accelerator.state, "deepspeed_plugin", None) is not None:
+                raise ValueError("Shared MeanFlow/DMD does not support DeepSpeed")
+            self.dit.to(self.accelerator.device)
+            self.optimizer, train_dataloader = self.accelerator.prepare(
+                self.optimizer, train_dataloader, device_placement=[True, False]
+            )
+            self.training_strategy.after_prepare(self)
+            return train_dataloader
 
         # sdp_kernel(enable_flash=False, enable_math=False, enable_mem_efficient=True)
 
@@ -289,6 +308,11 @@ class BaseTrainer(ABC):
             if getattr(self.dit, "mask_geometry_tokenizer", None) is not None:
                 raise NotImplementedError(
                     "mask_control.encoding=geometry_tokenizer does not support FSDP checkpointing yet; "
+                    "use the project's MULTI_GPU/DDP accelerate configuration"
+                )
+            if getattr(self.dit, "alpha_head", None) is not None:
+                raise NotImplementedError(
+                    "model.alpha_head does not support FSDP checkpointing yet; "
                     "use the project's MULTI_GPU/DDP accelerate configuration"
                 )
             from torch.distributed.fsdp import BackwardPrefetch, MixedPrecision
@@ -338,6 +362,11 @@ class BaseTrainer(ABC):
             )
         else:
             self.dit = self.dit.to(self.accelerator.device)
+            if self.accelerator.num_processes > 1:
+                # Every rank loads the same frozen base weights; DDP would otherwise broadcast all ~20B of them
+                # from rank 0 at wrap time. Only trainable parameters (LoRA, companion modules) are synced.
+                frozen = [name for name, parameter in self.dit.named_parameters() if not parameter.requires_grad]
+                torch.nn.parallel.DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(self.dit, frozen)
             self.dit, optimizer, train_dataloader = self.accelerator.prepare(
                 self.dit, self.optimizer, train_dataloader, device_placement=[True, True, False]
             )
@@ -380,6 +409,9 @@ class BaseTrainer(ABC):
     def clip_gradients(self):
         """Clip gradients"""
         if self.accelerator.sync_gradients:
+            if getattr(getattr(self, "training_strategy", None), "manual_gradient_sync", False):
+                from src.distillation.meanflow_math import synchronize_gradients
+                synchronize_gradients(self._trainable_params)
             grad_norm = self.accelerator.clip_grad_norm_(
                 self._trainable_params,
                 self.config.train.max_grad_norm,
@@ -402,13 +434,39 @@ class BaseTrainer(ABC):
         offload = offload and getattr(self, "accelerator", None) is not None
         if offload:
             with torch.inference_mode(False):
-                self.text_encoder.to(self.accelerator.device)
+                self._stream_text_encoder(self.accelerator.device)
         try:
             yield
         finally:
             if offload:
                 with torch.inference_mode(False):
-                    self.text_encoder.to("cpu")
+                    self._stream_text_encoder(None)
+
+    def _stream_text_encoder(self, device):
+        """Point the frozen text encoder at ``device`` copies of a pinned host copy (``None``: the host copy).
+
+        The weights never change, so offloading only drops the device copy (no device-to-host
+        transfer) and loading is one non-blocking pinned host-to-device copy per tensor.
+        """
+        host = getattr(self, "_text_encoder_host", None)
+        if host is None:
+            host = self._text_encoder_host = {}
+        for module in self.text_encoder.modules():
+            for kind, slots in (("parameter", module._parameters), ("buffer", module._buffers)):
+                for key, tensor in slots.items():
+                    if tensor is None:
+                        continue
+                    # Parameters persist (only .data moves); buffers are replaced, so key them by slot.
+                    slot = id(tensor) if kind == "parameter" else (id(module), key)
+                    pinned = host.get(slot)
+                    if pinned is None:
+                        pinned = tensor.detach().to("cpu")
+                        pinned = host[slot] = pinned.pin_memory() if torch.cuda.is_available() else pinned.clone()
+                    data = pinned if device is None else pinned.to(device, non_blocking=True)
+                    if kind == "parameter":
+                        tensor.data = data
+                    else:
+                        slots[key] = data
 
     def resolve_memory_policy(self):
         """Use the validated H100 memory path; avoid transfers/recompute on H200."""
@@ -823,6 +881,10 @@ class BaseTrainer(ABC):
 
     def fit(self, train_dataloader):
         """Main training loop implementation."""
+        if getattr(getattr(self.config.model, "flow_map", None), "enabled", False):
+            distill = getattr(self.config, "distillation", None)
+            if distill is None or not distill.enabled or distill.meanflow is None:
+                raise ValueError("Flow-map training requires the MeanFlow/DMD strategy")
         self.setup_signal_handlers()
         self.setup_accelerator()
         if getattr(getattr(self.config, "distillation", None), "enabled", False):
@@ -848,6 +910,8 @@ class BaseTrainer(ABC):
             self.setup_training_strategy()
 
         self.setup_model_device_train_mode(stage="fit")
+        if hasattr(getattr(self, "training_strategy", None), "configure_trainability"):
+            self.training_strategy.configure_trainability(self)
         from src.utils.seed import prepare_trainable_precision
 
         prepare_trainable_precision(self.dit, self.config.train.trainable_precision)
@@ -1078,7 +1142,12 @@ class BaseTrainer(ABC):
             mixed_precision=self.config.train.mixed_precision,
             log_with=self.config.logging.report_to,
             project_config=accelerator_project_config,
-            kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=True)],
+            # A slow node (shared-disk loading, DDP setup) must not kill a multi-node start through the
+            # 10-minute NCCL default; stalls are reported by the launcher and watcher instead.
+            kwargs_handlers=[
+                DistributedDataParallelKwargs(find_unused_parameters=True),
+                InitProcessGroupKwargs(timeout=datetime.timedelta(minutes=60)),
+            ],
             dataloader_config=DataLoaderConfiguration(
                 non_blocking=self.config.data.non_blocking,
             ),
@@ -1152,6 +1221,8 @@ class BaseTrainer(ABC):
         if self.accelerator.is_main_process:
             self.save_lora(save_path, adapter_name=self.adapter_name)
             self.save_additional_modules(save_path)
+            if hasattr(getattr(self, "training_strategy", None), "save_state"):
+                self.training_strategy.save_state(self, save_path)
             torch.save(self.optimizer.state_dict(), os.path.join(save_path, OPTIMIZER_FILE_NAME))
             if self.lr_scheduler is not None:
                 torch.save(self.lr_scheduler.state_dict(), os.path.join(save_path, SCHEDULER_FILE_NAME))
@@ -1355,8 +1426,10 @@ class BaseTrainer(ABC):
             os.path.join(save_folder, PEFT_LORA_FILE_NAME),
         )
 
-        diffusers_lora_state_dict = convert_state_dict_to_diffusers(peft_lora_state_dict)
-        self.pipeline_class.save_lora_weights(save_folder, diffusers_lora_state_dict, safe_serialization=True)
+        # Qwen's pipeline accepts PEFT keys and adds the transformer prefix.
+        # The legacy conversion rewrites q/k/v/out but leaves added projections
+        # and MLPs in PEFT form, producing a mixed-format, partially loaded file.
+        self.pipeline_class.save_lora_weights(save_folder, peft_lora_state_dict, safe_serialization=True)
         logging.info(f"Saved PEFT and Diffusers LoRA weights to {save_folder}")
 
     def save_additional_modules(self, save_folder):
@@ -1390,6 +1463,9 @@ class BaseTrainer(ABC):
     def configure_optimizers(self):
         """Configure optimizer and learning rate scheduler"""
         trainable_named_params = [(name, param) for name, param in self.dit.named_parameters() if param.requires_grad]
+        if hasattr(getattr(self, "training_strategy", None), "generator_parameters"):
+            allowed = {id(p) for p in self.training_strategy.generator_parameters(self)}
+            trainable_named_params = [(name, p) for name, p in trainable_named_params if id(p) in allowed]
         lora_layers = [param for _, param in trainable_named_params]
         if len(lora_layers) == 0:
             raise ValueError("No trainable parameters found. Check the LoRA configuration before training.")
@@ -1453,6 +1529,8 @@ class BaseTrainer(ABC):
                 scheduler_state = self._torch_load(scheduler_path, map_location="cpu")
                 self.lr_scheduler.load_state_dict(scheduler_state)
             self._load_random_state(self.config.resume)
+            if hasattr(getattr(self, "training_strategy", None), "restore_state"):
+                self.training_strategy.restore_state(self, self.config.resume)
             logging.info(f"Loaded LoRA-only training state from {self.config.resume}")
         except Exception as e:
             raise RuntimeError(f"Failed to load LoRA-only training state from {self.config.resume}: {e}") from e
@@ -1490,7 +1568,7 @@ class BaseTrainer(ABC):
         model = quantize_model_to_fp8(
             model,
             engine="bnb",
-            skip_modules=["mask_geometry_tokenizer"],
+            skip_modules=["mask_geometry_tokenizer", "alpha_head"],
             verbose=True,
             device=device,
         )
@@ -1652,31 +1730,26 @@ class BaseTrainer(ABC):
 
             sha256 = calculate_sha256_file(pretrained_weight)
             logging.info(f"sha256 for pretrained_weight: {sha256}")
-            lora_type = classify_lora_weight(pretrained_weight)
-            # DIFFUSERS can be loaded directly, otherwise, need to add lora first
-            if lora_type != "PEFT":
-                transformer.load_lora_adapter(pretrained_weight, adapter_name=adapter_name)
-                logging.info(f"set_lora: {lora_type} Loaded lora from {pretrained_weight} for {adapter_name}")
-            else:
-                # add lora first
-                # Configure model
-                cls.add_lora_adapter(transformer, config, adapter_name)
-
-                state_dict = safetensors.torch.load_file(pretrained_weight)
-                missing = cls._load_peft_lora_state_dict(
-                    transformer=transformer,
-                    state_dict=state_dict,
-                    adapter_name=adapter_name,
-                    stage=stage,
-                )
-                logging.info(f"set_lora: {lora_type} Loaded lora from {pretrained_weight} for {adapter_name}")
-                if len(missing) > 0:
-                    logging.info(
-                        f"non-LoRA missing keys ignored: {len(missing)}, first_missing={missing[0]}"
-                    )
-                else:
-                    logging.info("missing keys: 0")
-                # self.load_lora(self.config.model.lora.pretrained_weight)
+            state_dict = safetensors.torch.load_file(pretrained_weight)
+            state_dict = {key.removeprefix("transformer."): value for key, value in state_dict.items()}
+            # Normalize every key, including existing mixed-format exports.
+            # Do not infer the whole file's format from its first tensor.
+            state_dict = convert_unet_state_dict_to_peft(state_dict)
+            cls.add_lora_adapter(transformer, config, adapter_name)
+            if stage == "fit" and config.train.trainable_precision == "float32":
+                # Upcast the destination BEFORE copying checkpoint tensors.
+                # Upcasting after load cannot recover bits rounded to BF16.
+                for name, parameter in transformer.named_parameters():
+                    if cls._is_lora_key_for_adapter(name, adapter_name):
+                        parameter.data = parameter.data.float()
+            missing = cls._load_peft_lora_state_dict(
+                transformer=transformer,
+                state_dict=state_dict,
+                adapter_name=adapter_name,
+                stage=stage,
+            )
+            if missing:
+                logging.info(f"non-LoRA missing keys ignored: {len(missing)}, first_missing={missing[0]}")
             logging.info(f"set_lora: Loaded lora from {pretrained_weight}")
 
         elif stage == "fit":

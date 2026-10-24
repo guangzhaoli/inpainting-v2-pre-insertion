@@ -5,6 +5,7 @@ from typing import Any, Optional
 
 import yaml
 
+from src.models.alpha_head import ALPHA_HEAD_FILE_NAME as ALPHA_HEAD_COMPANION_FILE_NAME
 from src.utils.latent_anchoring import ensure_latent_anchoring_config
 from src.utils.tools import calculate_sha256_file
 
@@ -15,6 +16,9 @@ MASK_GEOMETRY_COMPANION_FILE_NAME = "mask_geometry_tokenizer.safetensors"
 CHECKPOINT_COMPANION_FILE_NAMES = frozenset(
     {
         MASK_GEOMETRY_COMPANION_FILE_NAME,
+        ALPHA_HEAD_COMPANION_FILE_NAME,
+        "flow_map_time_embedding.safetensors",
+        "fake_score_lora.safetensors",
     }
 )
 
@@ -96,6 +100,24 @@ def _effective_mask_control_contract(config) -> dict:
     return contract
 
 
+def _effective_complementary_canvas_contract(config) -> dict:
+    """Fields that change what a checkpoint learned; condition caching is an exact inference-only speedup,
+    and the ring loss weight, isolation annealing and local decode only shape training. Fields at their
+    round-1 defaults are left out so older checkpoints keep their contract."""
+
+    canvas = getattr(config.model, "complementary_canvas", None)
+    if canvas is None or not canvas.enabled:
+        return {"enabled": False}
+    contract = {"enabled": True, "isolate_conditions": bool(canvas.isolate_conditions)}
+    if canvas.isolate_conditions and canvas.isolation != "image":
+        contract["isolation"] = str(canvas.isolation)
+    if canvas.ring_tokens:
+        contract.update(ring_tokens=int(canvas.ring_tokens), ring_sigma_max=float(canvas.ring_sigma_max))
+    if canvas.text_as_condition:
+        contract["text_as_condition"] = True
+    return contract
+
+
 def validate_inference_mode_inputs(
     config,
     *,
@@ -103,13 +125,16 @@ def validate_inference_mode_inputs(
     negative_prompt: Optional[str],
 ) -> None:
     reference_cfg_enabled = bool(config.model.reference_cfg.enabled)
-    reference_cfg_force_empty_prompt = (
-        reference_cfg_enabled and bool(config.model.reference_cfg.force_empty_prompt)
+    flow_map_enabled = bool(getattr(getattr(config.model, "flow_map", None), "enabled", False))
+    force_empty_prompt = (
+        (reference_cfg_enabled or flow_map_enabled) and bool(config.model.reference_cfg.force_empty_prompt)
     )
 
     if reference_cfg_enabled and negative_prompt is not None:
         raise ValueError("reference_cfg cannot be combined with negative_prompt")
-    if prompt is None and not reference_cfg_force_empty_prompt:
+    if flow_map_enabled and negative_prompt is not None:
+        raise ValueError("flow-map conditioning cannot be combined with negative_prompt")
+    if prompt is None and not force_empty_prompt:
         raise ValueError("prompt is required when no prompt-free conditioning mode is enabled")
     # mask_control is independent and may be combined with reference_cfg; no extra input rules.
 
@@ -162,7 +187,11 @@ def build_effective_inference_metadata(
         reference_cfg_enabled and bool(config.model.reference_cfg.force_empty_prompt)
     )
 
-    effective_prompt = "" if reference_cfg_force_empty_prompt else prompt
+    flow_map_force_empty_prompt = (
+        bool(getattr(getattr(config.model, "flow_map", None), "enabled", False))
+        and bool(config.model.reference_cfg.force_empty_prompt)
+    )
+    effective_prompt = "" if reference_cfg_force_empty_prompt or flow_map_force_empty_prompt else prompt
     effective_negative_prompt = None if reference_cfg_enabled else negative_prompt
     text_true_cfg_active = (
         not reference_cfg_enabled
@@ -203,6 +232,7 @@ def build_effective_inference_metadata(
             "width": effective_width,
         },
         "modes": {
+            "complementary_canvas": _effective_complementary_canvas_contract(config),
             "mask_control_enabled": mask_control_enabled,
             "mask_control_active": mask_control_active,
             "mask_control_encoding": effective_mask_control["encoding"],
@@ -229,9 +259,15 @@ def build_inference_config_metadata(config, config_path: Optional[Path] = None) 
         "processor": _dump_model(config.data.init_args.processor.init_args),
         "adaptive_crop": _dump_model(config.data.init_args.adaptive_crop),
         "latent_anchoring": _dump_model(ensure_latent_anchoring_config(config)),
+        "sigma_handoff": _dump_model(
+            getattr(getattr(config, "predict", None), "sigma_handoff", None) or {"enabled": False}
+        ),
         "model_modes": {
             "mask_control": _dump_model(getattr(config.model, "mask_control", {"enabled": False})),
             "reference_cfg": _dump_model(config.model.reference_cfg),
+            "complementary_canvas": _dump_model(
+                getattr(config.model, "complementary_canvas", None) or {"enabled": False}
+            ),
         },
         "lora": {
             "r": int(config.model.lora.r),
@@ -256,6 +292,11 @@ def _checkpoint_contract(config, adaptive_enabled_field: str) -> dict:
             "pretrained_model_name_or_path": str(config.model.pretrained_model_name_or_path),
             "quantize": bool(config.model.quantize),
             "zero_cond_t": bool(getattr(config.model, "zero_cond_t", False)),
+            "flow_map": (
+                {"enabled": True, "source_time_weight": config.model.flow_map.source_time_weight}
+                if getattr(getattr(config.model, "flow_map", None), "enabled", False)
+                else {"enabled": False}
+            ),
             "lora": {
                 "r": int(config.model.lora.r),
                 "lora_alpha": int(config.model.lora.lora_alpha),
@@ -264,6 +305,9 @@ def _checkpoint_contract(config, adaptive_enabled_field: str) -> dict:
             },
             "mask_control": _effective_mask_control_contract(config),
             "reference_cfg": config.model.reference_cfg.model_dump(mode="json"),
+            "alpha_head": {"enabled": bool(getattr(getattr(config.model, "alpha_head", None), "enabled", False))},
+            "complementary_canvas": _effective_complementary_canvas_contract(config),
+            **({} if getattr(config.model, "vl_masked_source", True) else {"vl_masked_source": False}),
         },
         "data": {
             "class_path": str(config.data.class_path),
@@ -367,8 +411,19 @@ def validate_resume_mask_control_compatibility(config, checkpoint_dir: Path) -> 
         )
 
     checkpoint_config = _load_checkpoint_train_config(train_config_path)
+    saved_flow = getattr(checkpoint_config.model, "flow_map", None)
+    active_flow = getattr(config.model, "flow_map", None)
+    if bool(getattr(saved_flow, "enabled", False)) != bool(getattr(active_flow, "enabled", False)):
+        raise ValueError("Resume checkpoint model.flow_map mismatch; use a warm start for stage conversion")
+    if getattr(active_flow, "enabled", False) and saved_flow.source_time_weight != active_flow.source_time_weight:
+        raise ValueError("Resume checkpoint flow-map time interpolation differs")
     if bool(getattr(checkpoint_config.model, "zero_cond_t", False)) != bool(getattr(config.model, "zero_cond_t", False)):
         raise ValueError("Resume checkpoint model.zero_cond_t mismatch; retain the checkpoint's condition timestep contract")
+    if _effective_complementary_canvas_contract(checkpoint_config) != _effective_complementary_canvas_contract(config):
+        raise ValueError(
+            "Resume checkpoint model.complementary_canvas mismatch; use model.lora.pretrained_weight "
+            "for an intentional warm start into another canvas mode"
+        )
     checkpoint_contract = _effective_mask_control_contract(checkpoint_config)
     current_contract = _effective_mask_control_contract(config)
     mismatches = _flatten_contract_mismatches(
@@ -419,6 +474,18 @@ def _required_checkpoint_artifacts(config, resolved_lora_path: Path) -> list[dic
                 "roles": {"mask_geometry_tokenizer"},
             }
         )
+    if getattr(getattr(config.model, "alpha_head", None), "enabled", False):
+        required.append({"filename": ALPHA_HEAD_COMPANION_FILE_NAME, "roles": {"alpha_head"}})
+    if getattr(getattr(config.model, "flow_map", None), "enabled", False):
+        required.append({"filename": "flow_map_time_embedding.safetensors", "roles": {"flow_map_time_embedding"}})
+        options = getattr(getattr(config, "distillation", None), "meanflow", None)
+        if options is not None and config.distillation.enabled:
+            required.append({"filename": "meanflow_training_state.json", "roles": {"meanflow_training_state"}})
+            if options.stage == "dmd":
+                required.extend([
+                    {"filename": "fake_score_lora.safetensors", "roles": {"fake_score_lora"}},
+                    {"filename": "fake_score_optimizer.pt", "roles": {"fake_score_optimizer"}},
+                ])
     return required
 
 

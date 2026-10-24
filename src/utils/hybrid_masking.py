@@ -17,9 +17,11 @@ adaptations for the Qwen training pipeline:
 
 from __future__ import annotations
 
+import math
 import random
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -33,13 +35,26 @@ INSERT_ANYTHING_DILATED_SEGMENTATION = "dilated_segmentation"
 MASKMIX_V2_EXACT = "exact"
 MASKMIX_V2_RANDOM_MORPHOLOGY = "random_morphology"
 MASKMIX_V2_ASYMMETRIC_BOX = "asymmetric_box"
+LOOSE_BLOB = "loose_blob"
+LOOSE_OVERSIZED_BOX = "oversized_box"
 
+_LOOSE_MODE_ORDER = (LOOSE_BLOB, LOOSE_OVERSIZED_BOX)
+_LOOSE_BLOB_SHAPE_ORDER = ("ellipse", "superellipse", "spline_blob", "brush")
+_TIGHT_MODE_ORDER = (MASKMIX_V2_EXACT, MASKMIX_V2_RANDOM_MORPHOLOGY)
+_LOOSE_GROWTH_STEP = 1.06
+_LOOSE_MAX_GROWTH_STEPS = 120
+
+# Loose families are appended last so zero loose weights keep the legacy
+# random-number-to-mode mapping unchanged.
 _MASKMIX_V2_MODE_ORDER = (
     INSERT_ANYTHING_AUGMENTED_BOX,
     MASKMIX_V2_ASYMMETRIC_BOX,
     MASKMIX_V2_EXACT,
     MASKMIX_V2_RANDOM_MORPHOLOGY,
+    LOOSE_BLOB,
+    LOOSE_OVERSIZED_BOX,
 )
+MASKMIX_LOOSE_MODES = frozenset(_LOOSE_MODE_ORDER)
 _MASKMIX_V2_KERNEL_ORDER = (
     "ellipse",
     "rectangle",
@@ -374,6 +389,16 @@ def _maskmix_v2_random_morphology_mask(mask: np.ndarray, config, rng) -> np.ndar
     return cv2.dilate(mask, kernel, iterations=1).astype(np.uint8)
 
 
+def maskmix_has_loose_modes(config) -> bool:
+    """Whether MaskMix-v2 samples loose families, which the dataset must build before cropping."""
+
+    if getattr(config, "strategy", "maskmix_v2") != "maskmix_v2":
+        return False
+    weights = config.maskmix_v2.mode_weights
+    # Weight objects that predate the loose families count as zero loose weight.
+    return any(getattr(weights, mode, 0.0) > 0 for mode in _LOOSE_MODE_ORDER)
+
+
 def sample_maskmix_v2_mode(category: str, config, rng=None) -> str:
     """Sample MaskMix-v2; category is accepted for batch-API compatibility."""
 
@@ -383,7 +408,7 @@ def sample_maskmix_v2_mode(category: str, config, rng=None) -> str:
     return _weighted_choice(
         rng,
         _MASKMIX_V2_MODE_ORDER,
-        tuple(getattr(weights, mode) for mode in _MASKMIX_V2_MODE_ORDER),
+        tuple(getattr(weights, mode, 0.0) for mode in _MASKMIX_V2_MODE_ORDER),
     )
 
 
@@ -405,6 +430,11 @@ def build_maskmix_v2_mask_for_mode(
         generated = gt_mask.copy()
     elif mode == MASKMIX_V2_RANDOM_MORPHOLOGY:
         generated = _maskmix_v2_random_morphology_mask(gt_mask, config, rng)
+    elif mode in MASKMIX_LOOSE_MODES:
+        raise ValueError(
+            f"MaskMix-v2 mode {mode} must be built by build_loose_placement_mask in the dataset, "
+            "before adaptive crop"
+        )
     else:
         raise ValueError(f"Unsupported MaskMix-v2 mode: {mode}")
 
@@ -464,6 +494,11 @@ def build_maskmix_v2_hybrid_masks(
 ) -> Tuple[torch.Tensor, List[str]]:
     """Apply MaskMix-v2 independently to every sample in a batch."""
 
+    if maskmix_has_loose_modes(config):
+        raise ValueError(
+            "MaskMix-v2 loose_blob/oversized_box weights require the dataset to precompute "
+            "tar_mask_cond (InsertAnythingDataset plans the crop on the loose region)"
+        )
     if masks.ndim != 3:
         raise ValueError(f"Hybrid Masking expects [B, H, W], got shape={tuple(masks.shape)}")
     if isinstance(categories, str):
@@ -490,14 +525,296 @@ def build_maskmix_v2_hybrid_masks(
     return stacked, modes
 
 
-def add_interaction_context(condition_masks, gt_masks, radius_px, threshold=0.5):
-    """Remove object-adjacent context too, so contact/shadow pixels must be learned."""
+@dataclass(frozen=True)
+class LoosePlacementMask:
+    """A σ-split loose placement mask in full-image coordinates.
+
+    ``scale_h``/``scale_w`` are the nominal per-axis expansion factors after any
+    context-guard shrinking; ``coverage_growth`` is the extra uniform growth
+    that made the outline cover the target.
+    """
+
+    mask: np.ndarray
+    mode: str
+    shape: str
+    scale_h: float
+    scale_w: float
+    bottom_aligned: bool
+    coverage_growth: float
+    guard_shrinks: int
+    area_ratio: float
+    guard_exhausted: bool
+
+
+def sample_tight_mode(config, rng=None) -> str:
+    """Sample the exact/morphology family used by the low-noise segment."""
+
+    rng = rng or random
+    weights = config.loose_placement.tight_mode_weights
+    return _weighted_choice(
+        rng,
+        _TIGHT_MODE_ORDER,
+        tuple(getattr(weights, mode) for mode in _TIGHT_MODE_ORDER),
+    )
+
+
+def _catmull_rom_closed(points: np.ndarray, samples_per_segment: int = 16) -> np.ndarray:
+    count = len(points)
+    t = np.linspace(0.0, 1.0, samples_per_segment, endpoint=False)[:, None]
+    curve = []
+    for index in range(count):
+        p0, p1, p2, p3 = (points[(index + offset) % count] for offset in (-1, 0, 1, 2))
+        curve.append(
+            0.5
+            * (
+                2.0 * p1
+                + (p2 - p0) * t
+                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t**2
+                + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t**3
+            )
+        )
+    return np.concatenate(curve, axis=0)
+
+
+def _sample_loose_outline(shape: str, rng) -> Optional[np.ndarray]:
+    """Closed outline whose bounding box is exactly the unit frame [-1, 1]^2."""
+
+    if shape == "box":
+        return np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])
+    theta = np.linspace(0.0, 2.0 * np.pi, 128, endpoint=False)
+    if shape == "ellipse":
+        return np.stack([np.cos(theta), np.sin(theta)], axis=1)
+    if shape == "superellipse":
+        power = 2.0 / _sample_uniform(rng, 2.5, 5.0)
+        cos, sin = np.cos(theta), np.sin(theta)
+        return np.stack([np.sign(cos) * np.abs(cos) ** power, np.sign(sin) * np.abs(sin) ** power], axis=1)
+    if shape == "spline_blob":
+        count = rng.randint(6, 10)
+        angles = np.array(
+            [2.0 * np.pi * (index + _sample_uniform(rng, -0.3, 0.3)) / count for index in range(count)]
+        )
+        radii = np.array([_sample_uniform(rng, 0.7, 1.0) for _ in range(count)])
+        curve = _catmull_rom_closed(np.stack([radii * np.cos(angles), radii * np.sin(angles)], axis=1))
+        low, high = curve.min(axis=0), curve.max(axis=0)
+        return 2.0 * (curve - low) / np.maximum(high - low, 1e-6) - 1.0
+    if shape == "brush":
+        return None
+    raise ValueError(f"Unsupported loose placement shape: {shape}")
+
+
+def _brush_strokes(jitter: Sequence[Tuple[float, float]], half: bool, radius_fraction: float, aspect: float):
+    """Zig-zag scribble in the unit frame; consecutive rows overlap, so it has no gaps."""
+
+    # The brush radius is relative to the shorter frame side; ``aspect`` is
+    # half_height / half_width, so the same pixel radius in unit-y is smaller
+    # on a tall frame.
+    radius_y = radius_fraction * min(1.0, 1.0 / aspect)
+    radius_x = radius_fraction * min(1.0, aspect)
+    top, bottom = -1.0 + radius_y, (0.0 if half else 1.0 - radius_y)
+    rows = max(2, math.ceil(max(bottom - top, 0.0) / (1.5 * radius_y)) + 1)
+    points = []
+    for row, y in enumerate(np.linspace(top, bottom, rows)):
+        left_jitter, right_jitter = jitter[row % len(jitter)]
+        left = -1.0 + radius_x + left_jitter
+        right = 1.0 - radius_x - right_jitter
+        if right < left:
+            left = right = 0.5 * (left + right)
+        ends = [(left, y), (right, y)]
+        points.extend(ends if row % 2 == 0 else ends[::-1])
+    return np.array(points), radius_fraction
+
+
+def _rasterize_loose_shape(
+    outline: Optional[np.ndarray],
+    brush,
+    image_shape: Tuple[int, int],
+    center: Tuple[float, float],
+    half_size: Tuple[float, float],
+    ground_row: Optional[int],
+) -> np.ndarray:
+    height, width = image_shape
+    canvas = np.zeros((height, width), dtype=np.uint8)
+    center_xy = np.asarray(center, dtype=np.float64)
+    half_xy = np.asarray(half_size, dtype=np.float64)
+    shift = 4
+    scale = float(1 << shift)
+    if outline is not None:
+        points = np.round((center_xy + outline * half_xy) * scale).astype(np.int32)
+        cv2.fillPoly(canvas, [points], 1, lineType=cv2.LINE_8, shift=shift)
+    else:
+        stroke_points, radius_fraction = brush
+        radius = max(1, int(round(radius_fraction * min(half_xy))))
+        points = np.round(center_xy + stroke_points * half_xy).astype(np.int32)
+        cv2.polylines(canvas, [points], False, 1, thickness=2 * radius + 1, lineType=cv2.LINE_8)
+        for x, y in points:
+            cv2.circle(canvas, (int(x), int(y)), radius, 1, thickness=-1, lineType=cv2.LINE_8)
+    if ground_row is not None:
+        canvas[ground_row + 1 :] = 0
+    return canvas
+
+
+def build_loose_placement_mask(
+    mask: np.ndarray,
+    config,
+    rng=None,
+    *,
+    coverage_radius_px: int = 0,
+    canvas_fn: Optional[Callable[[np.ndarray], Tuple[int, int, int, int]]] = None,
+    max_area_ratio: Optional[float] = None,
+    mode: Optional[str] = None,
+) -> LoosePlacementMask:
+    """Sample a loose placement region that decouples the mask from the GT outline.
+
+    ``mode`` fixes the loose family when the caller already sampled it (MaskMix-v2
+    loose weights); otherwise ``loose_placement.mode_weights`` decides (σ-split).
+
+    The region is a smooth blob or an oversized box whose height and width are
+    independently scaled by U(scale_min, scale_max) relative to the GT box
+    (``size_reference``), with the object placed at a random position inside it
+    or, with ``bottom_align_prob``, standing on its bottom edge. If the outline
+    does not cover ``dilate(GT, coverage_radius_px)`` it is uniformly grown
+    about its anchor until it does; it is never unioned with the GT, so its
+    boundary carries no object-outline information. When the area inside the
+    canvas (the adaptive crop planned on this very mask) exceeds
+    ``max_area_ratio``, the expansion factors are shrunk toward one instead of
+    falling back to the exact GT mask.
+    """
+
+    rng = rng or random
+    loose_cfg = config.loose_placement
+    gt_mask = _binary_mask(mask, config.mask_threshold)
+    height, width = gt_mask.shape
+    gy1, gy2, gx1, gx2 = _tight_bbox(gt_mask)
+    # Dilate only a window around the object; the band cannot reach further.
+    radius = max(0, int(coverage_radius_px))
+    wy1, wy2 = max(0, gy1 - radius), min(height, gy2 + radius + 1)
+    wx1, wx2 = max(0, gx1 - radius), min(width, gx2 + radius + 1)
+    target = gt_mask[wy1:wy2, wx1:wx2]
+    if radius > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)
+        target = cv2.dilate(target, kernel)
+    target_ys, target_xs = np.nonzero(target)
+    target_ys, target_xs = target_ys + wy1, target_xs + wx1
+    object_h, object_w = gy2 - gy1 + 1, gx2 - gx1 + 1
+    if loose_cfg.size_reference == "bbox_geometric_mean":
+        base_h = base_w = math.sqrt(object_h * object_w)
+    else:
+        base_h, base_w = float(object_h), float(object_w)
+
+    if mode is None:
+        mode = _weighted_choice(
+            rng,
+            _LOOSE_MODE_ORDER,
+            tuple(getattr(loose_cfg.mode_weights, name) for name in _LOOSE_MODE_ORDER),
+        )
+    elif mode not in MASKMIX_LOOSE_MODES:
+        raise ValueError(f"Unsupported loose placement mode: {mode}")
+    if mode == LOOSE_OVERSIZED_BOX:
+        shape = "box"
+    else:
+        shape = _weighted_choice(
+            rng,
+            _LOOSE_BLOB_SHAPE_ORDER,
+            tuple(getattr(loose_cfg.blob_shape_weights, name) for name in _LOOSE_BLOB_SHAPE_ORDER),
+        )
+    sampled_scale_h = _sample_uniform(rng, loose_cfg.scale_min, loose_cfg.scale_max)
+    sampled_scale_w = _sample_uniform(rng, loose_cfg.scale_min, loose_cfg.scale_max)
+    bottom_aligned = rng.random() < loose_cfg.bottom_align_prob
+    offset_x, offset_y = rng.random(), rng.random()
+    outline = _sample_loose_outline(shape, rng)
+    if shape == "brush":
+        # Stroke randomness is drawn once so guard retries only change scale.
+        brush_radius = _sample_uniform(rng, 0.35, 0.5)
+        brush_jitter = [(_sample_uniform(rng, 0.0, 0.3), _sample_uniform(rng, 0.0, 0.3)) for _ in range(32)]
+    ground_row = int(target_ys.max()) if bottom_aligned else None
+
+    def _origin(start: int, extent: int, size: float, offset: float) -> float:
+        # cv2 vertices are pixel centres; a box covering pixels [start, start+extent) spans start-0.5.
+        slack = size - extent
+        if slack < 0:
+            return start - 0.5 + 0.5 * extent - 0.5 * size
+        return start - 0.5 - offset * slack
+
+    for attempt in range(int(loose_cfg.guard_max_attempts) + 1):
+        shrink = float(loose_cfg.guard_shrink) ** attempt
+        scale_h = 1.0 + (sampled_scale_h - 1.0) * shrink
+        scale_w = 1.0 + (sampled_scale_w - 1.0) * shrink
+        size_h, size_w = scale_h * base_h, scale_w * base_w
+        center_x = _origin(gx1, object_w, size_w, offset_x) + 0.5 * size_w
+        if bottom_aligned:
+            center_y, half_h = ground_row + 0.5, size_h
+        else:
+            center_y, half_h = _origin(gy1, object_h, size_h, offset_y) + 0.5 * size_h, 0.5 * size_h
+        brush = None
+        if outline is None:
+            brush = _brush_strokes(brush_jitter, bottom_aligned, brush_radius, half_h / (0.5 * size_w))
+
+        growth = 1.0
+        for _ in range(_LOOSE_MAX_GROWTH_STEPS):
+            loose = _rasterize_loose_shape(
+                outline,
+                brush,
+                (height, width),
+                (center_x, center_y),
+                (0.5 * size_w * growth, half_h * growth),
+                ground_row,
+            )
+            if loose[target_ys, target_xs].all():
+                break
+            growth *= _LOOSE_GROWTH_STEP
+        else:
+            raise RuntimeError("loose placement outline failed to cover the target mask")
+
+        if canvas_fn is None:
+            x1, y1, x2, y2 = 0, 0, width, height
+        else:
+            x1, y1, x2, y2 = canvas_fn(loose)
+        area_ratio = float(loose[y1:y2, x1:x2].sum()) / float((y2 - y1) * (x2 - x1))
+        if max_area_ratio is None or area_ratio <= max_area_ratio:
+            break
+
+    return LoosePlacementMask(
+        mask=loose,
+        mode=mode,
+        shape=shape,
+        scale_h=float(scale_h),
+        scale_w=float(scale_w),
+        bottom_aligned=bool(bottom_aligned),
+        coverage_growth=float(growth),
+        guard_shrinks=int(attempt),
+        area_ratio=area_ratio,
+        guard_exhausted=bool(max_area_ratio is not None and area_ratio > max_area_ratio),
+    )
+
+
+def add_interaction_context(condition_masks, gt_masks, radius_px, threshold=0.5, mode="union"):
+    """Remove object-adjacent context too, so contact/shadow pixels must be learned.
+
+    ``mode="union"`` adds dilate(GT, radius_px) to each condition mask. ``mode="grow"``
+    instead dilates the condition mask itself by the smallest Euclidean radius that
+    covers dilate(GT, radius_px): the hole keeps its sampled outline, offset outward,
+    rather than tracing the GT contour wherever the sampled shape fell short.
+    """
     if radius_px <= 0:
         return condition_masks
+    if mode not in ("union", "grow"):
+        raise ValueError(f"interaction context mode must be 'union' or 'grow', got {mode!r}")
     radius_px = int(radius_px)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius_px + 1,) * 2)
     binary = (gt_masks.detach().float().cpu().numpy() > threshold).astype(np.uint8)
     expanded = np.stack([cv2.dilate(mask, kernel) for mask in binary])
+    if mode == "grow":
+        condition = (condition_masks.detach().float().cpu().numpy() > threshold).astype(np.uint8)
+        grown = []
+        for sampled, band in zip(condition, expanded):
+            if not sampled.any():
+                grown.append(band)
+                continue
+            # Distance of every pixel to the sampled shape; grow to the farthest band pixel.
+            distance = cv2.distanceTransform(1 - sampled, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+            reach = float(distance[band > 0].max()) if band.any() else 0.0
+            grown.append(np.maximum(sampled, (distance <= reach).astype(np.uint8)))
+        return torch.from_numpy(np.stack(grown)).to(device=condition_masks.device, dtype=condition_masks.dtype)
     expanded = torch.from_numpy(expanded).to(device=condition_masks.device, dtype=condition_masks.dtype)
     return torch.maximum(condition_masks, expanded)
 
@@ -546,14 +863,21 @@ def apply_hybrid_masking_context_guard(
     condition_masks: torch.Tensor,
     gt_masks: torch.Tensor,
     config,
+    allow_fallback: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Bound tail-risk context removal without ever exposing GT object pixels.
 
     The official Hybrid Masking sampler remains unchanged.  This optional local
     post-processing guard replaces an over-large sampled condition mask with the
-    binary GT mask, which is the smallest leakage-safe fallback.  If the GT mask
-    itself exceeds the configured limit, the fallback is still GT and the
+    binary GT mask (``fallback_to_gt``), the smallest leakage-safe fallback, or
+    with GT plus the interaction band (``fallback_to_band``), which keeps the
+    contact/shadow ring hidden as in every other mode.  If the GT mask itself
+    exceeds the configured limit, the fallback is still applied and the
     metadata marks the overflow as unavoidable.
+
+    ``allow_fallback`` ([B] bool) exempts samples whose sampler already
+    enforced the limit by shrinking (σ-split loose masks); they are reported
+    but never replaced by the exact GT mask.
     """
 
     if condition_masks.ndim != 3 or gt_masks.ndim != 3:
@@ -588,17 +912,27 @@ def apply_hybrid_masking_context_guard(
 
     if guard_cfg.enabled:
         guard_triggered = sampled_ratio > max_ratio
-        if guard_cfg.overflow_policy != "fallback_to_gt":
+        if guard_cfg.overflow_policy == "fallback_to_gt":
+            fallback_masks = gt_binary
+        elif guard_cfg.overflow_policy == "fallback_to_band":
+            fallback_masks = add_interaction_context(
+                gt_binary, gt_binary, getattr(config, "interaction_dilation_px", 0), threshold
+            ).to(device=gt_binary.device, dtype=gt_binary.dtype)
+        else:
             raise ValueError(
                 "Unsupported Hybrid Masking context guard overflow policy: " f"{guard_cfg.overflow_policy}"
             )
+        fallback_applied = guard_triggered
+        if allow_fallback is not None:
+            fallback_applied = guard_triggered & allow_fallback.to(device=guard_triggered.device, dtype=torch.bool)
         guarded_masks = torch.where(
-            guard_triggered[:, None, None],
-            gt_binary,
+            fallback_applied[:, None, None],
+            fallback_masks,
             condition_binary,
         )
     else:
         guard_triggered = torch.zeros_like(sampled_ratio, dtype=torch.bool)
+        fallback_applied = guard_triggered
         guarded_masks = condition_binary
 
     final_ratio = torch.count_nonzero(guarded_masks, dim=(-2, -1)).to(torch.float64) / pixel_count
@@ -619,7 +953,7 @@ def apply_hybrid_masking_context_guard(
         "sampled_condition_expansion": sampled_expansion,
         "condition_expansion": final_expansion,
         "context_guard_triggered": guard_triggered,
-        "fallback_applied": guard_triggered,
+        "fallback_applied": fallback_applied,
         "unavoidable_large_gt": unavoidable_large_gt,
     }
     return guarded_masks.to(dtype=condition_masks.dtype), metadata

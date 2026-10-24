@@ -5,13 +5,16 @@ from __future__ import annotations
 import math
 from typing import Any, Optional
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from src.models.complementary_canvas import complementary_canvas_enabled
 from src.utils.adaptive_crop import (
     AdaptiveCropPlan,
+    _binary_mask,
     build_adaptive_crop_plan,
     crop_pil_mask,
 )
@@ -35,6 +38,12 @@ _MIN_CORE_PIXELS = 1
 _LANCZOS_SUPPORT_THRESHOLD = 1.0 / 255.0
 # Search budget for applied-crop expansion before full-frame fallback.
 DEFAULT_MAX_EXPAND_ITERS = 24
+# Change gate of the gated paste-back: |blur(output - source)| (Gaussian σ in model px, mean over RGB in [0, 1]) maps
+# linearly from 0 at LOW to 1 at HIGH, then grows by GROW model px and is smoothed by a 1 model px Gaussian.
+_GATE_BLUR_PX = 2.0
+_GATE_LOW = 0.03
+_GATE_HIGH = 0.08
+_GATE_GROW_PX = 2.0
 
 
 def require_matching_mask_thresholds(adaptive_crop_config, anchoring_config) -> float:
@@ -940,6 +949,74 @@ def paste_local_output_to_original(
     return Image.fromarray(np.clip(restored_np, 0, 255).astype(np.uint8), mode="RGB")
 
 
+def change_gated_paste_back(
+    original_source: Image.Image,
+    original_mask: Image.Image,
+    raw_restored: Image.Image,
+    *,
+    local_size: tuple[int, int],
+    crop_plan: Optional[AdaptiveCropPlan],
+    settings,
+) -> Image.Image:
+    """Paste the hard-pasted model output back into the source around M_free, keeping only what changed.
+
+    M_free is M_core dilated by ``settings.interaction_dilation_px`` (M_core itself for mode core). The output is kept
+    inside M_free and the source is exact beyond ``settings.transition_width_px`` outside it. Across that width on
+    either side of the M_free boundary the weight is max(a_in, gate * a_out): a_in rises from 0 at the boundary to 1
+    inside, a_out falls from 1 at the boundary to 0 outside (both raised cosines), and the gate is 1 where the
+    output's local mean colour departs from the source (object, shadow) and 0 on redrawn or VAE-perturbed background.
+    Widths are model pixels, mapped to source pixels by the crop's scale; the weight also fades out at interior crop
+    edges like the crop feather.
+    """
+
+    if raw_restored.size != original_source.size:
+        raise ValueError(
+            f"paste-back geometry mismatch: source={original_source.size}, output={raw_restored.size}"
+        )
+    width, height = original_source.size
+    core = _binary_mask(original_mask, float(settings.mask_threshold))
+    if core.shape != (height, width) or not core.any():
+        raise ValueError("change-gated paste-back needs a non-empty M_core of the source size")
+    x1, y1, x2, y2 = crop_plan.crop_box if crop_plan is not None else (0, 0, width, height)
+    scale = 0.5 * ((x2 - x1) / local_size[0] + (y2 - y1) / local_size[1])
+    radius = 0 if normalize_latent_anchoring_mode(settings.mode) == "core" else int(settings.interaction_dilation_px)
+    band = float(settings.transition_width_px)
+
+    # Beyond M_free's outer band plus the reach of the gate's blurs the result is the source.
+    margin = math.ceil((radius + band + 4 * _GATE_BLUR_PX + _GATE_GROW_PX + 4) * scale) + 2
+    left, top, core_w, core_h = cv2.boundingRect(core.view(np.uint8))
+    box = (
+        max(0, left - margin),
+        max(0, top - margin),
+        min(width, left + core_w + margin),
+        min(height, top + core_h + margin),
+    )
+    window = (slice(box[1], box[3]), slice(box[0], box[2]))
+    src = np.asarray(original_source.crop(box).convert("RGB"), dtype=np.float32) / 255.0
+    out = np.asarray(raw_restored.crop(box).convert("RGB"), dtype=np.float32) / 255.0
+    distance_to_core = cv2.distanceTransform((~core[window]).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    free = distance_to_core <= radius * scale
+    d_out = cv2.distanceTransform((~free).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE) / scale
+    d_in = cv2.distanceTransform(free.astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE) / scale
+    a_out = np.where(free, 1.0, 0.5 * (1.0 + np.cos(np.pi * np.minimum(d_out, band) / band)))
+    a_in = np.where(free, 0.5 * (1.0 - np.cos(np.pi * np.minimum(d_in, band) / band)), 0.0)
+
+    change = np.abs(cv2.GaussianBlur(out - src, (0, 0), _GATE_BLUR_PX * scale)).mean(-1)
+    gate = np.clip((change - _GATE_LOW) / (_GATE_HIGH - _GATE_LOW), 0.0, 1.0).astype(np.float32)
+    grow = max(1, round(_GATE_GROW_PX * scale))
+    gate = cv2.dilate(gate, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * grow + 1, 2 * grow + 1)))
+    gate = cv2.GaussianBlur(gate, (0, 0), scale)
+
+    alpha = np.maximum(a_in, gate * a_out)
+    if crop_plan is not None and crop_plan.applied:
+        alpha = alpha * build_crop_edge_alpha(crop_plan, feather_width_px=DEFAULT_CROP_EDGE_FEATHER_PX)[window]
+    alpha = alpha.astype(np.float32)[..., None]
+    fused = np.clip(np.rint((alpha * out + (1.0 - alpha) * src) * 255.0), 0, 255).astype(np.uint8)
+    restored = original_source.convert("RGB")
+    restored.paste(Image.fromarray(fused, mode="RGB"), box[:2])
+    return restored
+
+
 def map_model_mask_to_original(
     mask: Image.Image | np.ndarray,
     *,
@@ -1014,6 +1091,14 @@ def prepare_adaptive_crop_for_inference(
         config=adaptive_crop_config,
     )
     anchoring = ensure_latent_anchoring_config(config)
+    if complementary_canvas_enabled(config):
+        # The canvas regenerates the packed support of M_free, which is hard expanded anchoring's support,
+        # plus a ring of ring_tokens tokens: dilating M_free by 16 px * ring * sqrt(2) reaches every ring token.
+        ring_tokens = int(config.model.complementary_canvas.ring_tokens)
+        dilation = anchoring.interaction_dilation_px + math.ceil(2 * vae_scale_factor * ring_tokens * math.sqrt(2))
+        anchoring = type(anchoring).model_validate(
+            {**anchoring.model_dump(), "mode": "expanded" if dilation > 0 else "core", "interaction_dilation_px": dilation}
+        )
     compatibility: dict[str, Any] = {
         "enabled": True,
         "anchoring_enabled": latent_anchoring_enabled(anchoring.mode),

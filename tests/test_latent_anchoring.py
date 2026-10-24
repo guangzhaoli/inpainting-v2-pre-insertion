@@ -7,7 +7,7 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from PIL import Image
 
-from src.data.config import Config, LatentAnchoringConfig, LatentAnchoringMode
+from src.data.config import Config, LatentAnchoringConfig, LatentAnchoringMode, PredictConfig
 from src.trainer.qwen_image_edit_insert_anything_trainer import (
     QwenImageEditInsertAnythingTrainer,
 )
@@ -113,6 +113,14 @@ class LatentAnchoringConfigTest(unittest.TestCase):
         self.assertEqual(overridden.mode, LatentAnchoringMode.expanded)
         self.assertEqual(overridden.interaction_dilation_px, 16)
         self.assertEqual(overridden.transition_width_px, 24)
+        self.assertEqual(overridden.paste_back, "crop_feather")
+
+        args.paste_back = "change_gated"
+        gated = apply_latent_anchoring_cli_overrides(config, args)
+        self.assertEqual(gated.paste_back, "change_gated")
+        self.assertEqual(latent_anchoring_metadata(gated)["paste_back"], "change_gated")
+        with self.assertRaisesRegex(ValueError, "transition_width_px >= 2"):
+            LatentAnchoringConfig(mode="expanded", transition_width_px=1, paste_back="change_gated")
 
     def test_runtime_allows_adaptive_crop_when_thresholds_match_and_rejects_explicit_size(self):
         config = Config()
@@ -486,6 +494,81 @@ class InsertAnythingLatentAnchoringRoutingTest(unittest.TestCase):
             legacy_embeddings = trainer.prepare_embeddings(legacy_batch, stage="predict")
         legacy_encode_mock.assert_not_called()
         self.assertNotIn("anchor_source_latents", legacy_embeddings)
+
+
+class SourceNoiseStartTest(unittest.TestCase):
+    @staticmethod
+    def _trainer(start):
+        trainer = object.__new__(QwenImageEditInsertAnythingTrainer)
+        settings = {"mode": "expanded_soft", "transition_width_px": 4, "source_noise_start": start}
+        trainer.config = SimpleNamespace(predict=PredictConfig(latent_anchoring=settings))
+        trainer.vae_scale_factor = 8
+        trainer.weight_dtype = torch.float32
+        trainer.scheduler = SimpleNamespace(sigmas=torch.tensor([1.0, 0.95, 0.88, 0.8, 0.6, 0.3, 0.1, 0.0]))
+        trainer.prepare_predict_timesteps = lambda steps, seq_len: (trainer.scheduler.sigmas[:-1] * 1000, steps)
+        trainer._dit_config = lambda: SimpleNamespace(in_channels=64)
+        trainer._dit_device = lambda: torch.device("cpu")
+        return trainer
+
+    @staticmethod
+    def _embeddings():
+        return {
+            "height": 32,
+            "width": 48,
+            "num_inference_steps": 7,
+            "control_latents": torch.zeros(1, 18, 64),
+            "anchor_source_latents": torch.full((1, 6, 64), 2.0),
+        }
+
+    def test_config_cli_and_metadata(self):
+        with self.assertRaisesRegex(ValueError, r"in \(0, 1\)"):
+            LatentAnchoringConfig(mode="expanded_soft", source_noise_start=1.0)
+        with self.assertRaisesRegex(ValueError, "anchored source latent"):
+            LatentAnchoringConfig(source_noise_start=0.9)
+        config = Config()
+        config.predict.latent_anchoring = LatentAnchoringConfig(mode="expanded_soft")
+        args = SimpleNamespace(latent_anchoring_mode=None, latent_anchoring_mask_threshold=None,
+                               interaction_dilation_px=None, transition_width_px=None, source_noise_start=None)
+        self.assertIsNone(apply_latent_anchoring_cli_overrides(config, args).source_noise_start)
+        args.source_noise_start = 0.9
+        settings = apply_latent_anchoring_cli_overrides(config, args)
+        self.assertEqual(settings.source_noise_start, 0.9)
+        self.assertEqual(latent_anchoring_metadata(settings)["source_noise_start"], 0.9)
+
+    def test_starts_from_noised_source_at_nearest_step(self):
+        trainer = self._trainer(0.9)
+        noise = torch.randn(1, 6, 64)
+        trainer.prepare_initial_latents = lambda **_kwargs: noise
+        calls = []
+
+        def fake_segment(_self, embeddings, **kwargs):
+            calls.append(kwargs)
+            return embeddings["anchor_source_latents"]
+
+        with patch.object(QwenImageEditTrainer, "sampling_from_embeddings", autospec=True, side_effect=fake_segment):
+            trainer.sampling_from_embeddings(self._embeddings())
+            # Segment calls (σ-split hand-off internals) keep their own start.
+            trainer.sampling_from_embeddings(self._embeddings(), step_start=3)
+
+        started, segment = calls
+        self.assertEqual(started["step_start"], 2)  # σ=0.88 is nearest to 0.9
+        self.assertIs(started["anchor_noise"], noise)
+        torch.testing.assert_close(started["initial_latents"], 0.88 * noise + 0.12 * 2.0)
+        self.assertEqual(segment, {"step_start": 3})
+        last = trainer.get_last_source_noise_start()
+        self.assertEqual((last["requested"], last["step"]), (0.9, 2))
+        self.assertAlmostEqual(last["sigma"], 0.88, places=5)
+
+    def test_requires_anchoring_and_excludes_sigma_handoff(self):
+        trainer = self._trainer(0.9)
+        trainer.prepare_initial_latents = lambda **_kwargs: torch.zeros(1, 6, 64)
+        embeddings = self._embeddings()
+        del embeddings["anchor_source_latents"]
+        with self.assertRaisesRegex(ValueError, "needs latent anchoring"):
+            trainer.sampling_from_embeddings(embeddings)
+        with self.assertRaisesRegex(ValueError, "σ-split hand-off"):
+            trainer.sampling_from_embeddings({**self._embeddings(), "_sigma_handoff": {}})
+
 
 if __name__ == "__main__":
     unittest.main()

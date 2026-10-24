@@ -85,7 +85,9 @@ def cli_status(manifest):
     data = json.loads(result.stdout)
     if not data.get("success"):
         raise RuntimeError("Inspire status returned unsuccessful response")
-    return {j["name"]: j for j in data["data"]["items"]}
+    # One job name returns the job itself; several return {"items": [...]}.
+    jobs = data["data"]["items"] if "items" in data["data"] else [data["data"]]
+    return {j["name"]: j for j in jobs}
 
 
 def notify(manifest, key, text, state, state_path):

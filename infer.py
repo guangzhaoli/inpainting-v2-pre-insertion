@@ -3,23 +3,27 @@
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image, ImageOps
 
+from src.models.complementary_canvas import complementary_canvas_enabled
 from src.utils.adaptive_crop import (
     crop_pil_pair,
     restore_pil_output,
 )
 from src.utils.adaptive_crop_anchoring import (
     DEFAULT_CROP_EDGE_FEATHER_PX,
+    change_gated_paste_back,
     map_model_mask_to_original,
     prepare_adaptive_crop_for_inference,
 )
 from src.utils.inference_metadata import (
     CHECKPOINT_COMPANION_FILE_NAMES,
+    CHECKPOINT_STATE_FILE_NAME,
     MASK_GEOMETRY_COMPANION_FILE_NAME,
     build_effective_inference_metadata,
     build_inference_config_metadata,
@@ -35,6 +39,7 @@ from src.utils.latent_anchoring import (
     normalize_latent_anchoring_mode,
     validate_latent_anchoring_runtime,
 )
+from src.utils.sigma_split import add_sigma_handoff_cli_args, apply_sigma_handoff_cli_overrides
 from src.utils.visualization import (
     binarize_mask,
     build_strict_mask_composite,
@@ -112,7 +117,28 @@ def parse_args(argv=None):
     )
     parser.add_argument("--skip-row", action="store_true", help="Do not save row preview and mask overlays.")
     add_latent_anchoring_cli_args(parser)
-    return parser.parse_args(argv)
+    add_sigma_handoff_cli_args(parser)
+    return record_sampling_overrides(parser.parse_args(argv), argv)
+
+
+def record_sampling_overrides(args, argv=None):
+    tokens = sys.argv[1:] if argv is None else argv
+    for name in ("num-inference-steps", "true-cfg-scale"):
+        setattr(args, "_" + name.replace("-", "_") + "_explicit",
+                any(token == "--" + name or token.startswith("--" + name + "=") for token in tokens))
+    return args
+
+
+def apply_flow_map_defaults(config, args):
+    flow = getattr(config.model, "flow_map", None)
+    if flow is None or not flow.enabled:
+        return
+    if not getattr(args, "_num_inference_steps_explicit", True):
+        args.num_inference_steps = flow.inference_steps
+    if not getattr(args, "_true_cfg_scale_explicit", True):
+        args.true_cfg_scale = 1.0
+    if args.prompt is None and config.model.reference_cfg.force_empty_prompt:
+        args.prompt = ""
 
 
 def validate_args(args) -> None:
@@ -177,6 +203,12 @@ def checkpoint_dir_for_lora(lora_path: Path) -> Path:
 
 
 def validate_configured_inference(config, args, resolved_lora_path: Path | None) -> None:
+    if getattr(getattr(config.model, "flow_map", None), "enabled", False):
+        from src.models.flow_map import FLOW_MAP_FILE
+        if resolved_lora_path is None or not (checkpoint_dir_for_lora(resolved_lora_path) / FLOW_MAP_FILE).is_file():
+            raise FileNotFoundError(f"Flow-map inference requires trained {FLOW_MAP_FILE}")
+        if args.true_cfg_scale != 1.0 or args.negative_prompt is not None or config.model.reference_cfg.enabled:
+            raise ValueError("Flow-map inference uses absorbed guidance: true-cfg-scale=1 and no negative prompt")
     validate_inference_mode_inputs(
         config,
         prompt=args.prompt,
@@ -224,13 +256,47 @@ def output_artifact_path(output_path: Path, label: str, suffix: str = ".png") ->
     return output_path.with_name(f"{output_path.stem}.{label}{suffix}")
 
 
+def checkpoint_protected_paths(resolved_lora_path: Path | None) -> tuple[Path, ...]:
+    """Return every checkpoint-owned path that inference must never replace."""
+
+    if resolved_lora_path is None:
+        return ()
+    resolved_lora_path = resolved_lora_path.resolve()
+    checkpoint_dir = checkpoint_dir_for_lora(resolved_lora_path)
+    return (
+        resolved_lora_path,
+        checkpoint_dir / CHECKPOINT_STATE_FILE_NAME,
+        *(checkpoint_dir / name for name in sorted(CHECKPOINT_COMPANION_FILE_NAMES)),
+    )
+
+
+def reject_symlinked_output_path(path: Path, label: str) -> None:
+    """Reject a leaf or parent symlink before any inference output is written."""
+
+    absolute = path if path.is_absolute() else Path.cwd() / path
+    current = absolute
+    while True:
+        if current.is_symlink():
+            raise ValueError(f"inference output {label} contains a symlink: {current}")
+        if current == current.parent:
+            break
+        current = current.parent
+    if absolute.exists() and not absolute.is_file():
+        raise ValueError(
+            f"inference output {label} is an existing non-regular file: {absolute}"
+        )
+
+
 def build_output_path_plan(
     args,
     *,
     has_crop: bool,
     latent_anchoring_is_enabled: bool = False,
+    latent_preserving: bool | None = None,
     protected_paths=(),
 ) -> dict[str, Path]:
+    if latent_preserving is None:
+        latent_preserving = latent_anchoring_is_enabled
     output_path = args.output
     paths = {
         "output": output_path,
@@ -267,12 +333,13 @@ def build_output_path_plan(
     seen: dict[Path, str] = {}
     output_resolved = output_path.resolve()
     for name, path in paths.items():
+        reject_symlinked_output_path(path, name)
         resolved = path.resolve()
         if name == "composite_compatibility_copy" and resolved == output_resolved:
-            if latent_anchoring_is_enabled:
+            if latent_preserving:
                 raise ValueError(
-                    "B/C/D require --output and --composite-output to be distinct because the primary "
-                    "anchored output and strict M_core composite have different semantics"
+                    "B/C/D and the complementary canvas require --output and --composite-output to be distinct "
+                    "because the primary latent-preserving output and strict M_core composite have different semantics"
                 )
             continue
         previous = seen.get(resolved)
@@ -394,11 +461,13 @@ def main():
     # validating a Student deployment config so moved/archived Teacher files
     # are not required for inference.
     config = load_config_from_yaml(str(args.config), for_inference=True)
+    apply_flow_map_defaults(config, args)
     if getattr(args, "device", None) is not None:
         from src.data.config import DeviceConfig
 
         config.predict.devices = DeviceConfig(vae=args.device, text_encoder=args.device, dit=args.device)
     latent_anchoring_config = apply_latent_anchoring_cli_overrides(config, args)
+    apply_sigma_handoff_cli_overrides(config, args)
     validate_adaptive_crop_inference_args(config, args)
     validate_latent_anchoring_runtime(
         config,
@@ -407,6 +476,9 @@ def main():
     )
     anchoring_metadata = latent_anchoring_metadata(latent_anchoring_config)
     anchoring_is_enabled = bool(anchoring_metadata["enabled"])
+    canvas_is_enabled = complementary_canvas_enabled(config)
+    # Both keep the source latent outside the edit region, so the raw output is primary.
+    latent_preserving = anchoring_is_enabled or canvas_is_enabled
     lora_path = args.lora
     if lora_path is None and config.model.lora.pretrained_weight is not None:
         lora_path = Path(config.model.lora.pretrained_weight)
@@ -462,7 +534,12 @@ def main():
             original_src_mask,
             crop_plan,
         )
-        if anchoring_is_enabled and crop_plan is not None and crop_plan.applied:
+        if (
+            latent_preserving
+            and crop_plan is not None
+            and crop_plan.applied
+            and latent_anchoring_config.paste_back == "crop_feather"
+        ):
             edge_feather_px = int(
                 crop_compatibility.get("feather_width_px", DEFAULT_CROP_EDGE_FEATHER_PX)
             )
@@ -471,9 +548,10 @@ def main():
         args,
         has_crop=crop_plan is not None,
         latent_anchoring_is_enabled=anchoring_is_enabled,
+        latent_preserving=latent_preserving,
         protected_paths=(
             args.config,
-            resolved_lora_path,
+            *checkpoint_protected_paths(resolved_lora_path),
             checkpoint_compatibility.get("train_config"),
             args.src_image,
             args.src_mask,
@@ -544,7 +622,16 @@ def main():
             raw_restored_img,
             composite_mask_threshold,
         )
-    primary_output_img = primary_restored_img if anchoring_is_enabled else strict_composite_img
+    if latent_anchoring_config.paste_back == "change_gated":
+        primary_restored_img = change_gated_paste_back(
+            original_src_img,
+            original_src_mask,
+            raw_restored_img,
+            local_size=local_generated_img.size,
+            crop_plan=crop_plan,
+            settings=latent_anchoring_config,
+        )
+    primary_output_img = primary_restored_img if latent_preserving else strict_composite_img
     if (
         raw_restored_img.size != original_src_img.size
         or strict_composite_img.size != original_src_img.size
@@ -561,6 +648,8 @@ def main():
     print(f"Raw restored output saved to {raw_restored_output_path}")
     if anchoring_is_enabled:
         print(f"Primary latent-anchored output saved to {args.output}")
+    elif canvas_is_enabled:
+        print(f"Primary complementary-canvas output saved to {args.output}")
     else:
         print(f"Final strict-mask output saved to {args.output}")
 
@@ -571,7 +660,7 @@ def main():
         "output_restored_raw": str(raw_restored_output_path),
         "metadata": str(metadata_output_path),
     }
-    if not anchoring_is_enabled:
+    if not latent_preserving:
         output_paths["final_composite"] = str(args.output)
         output_paths["strict_composite"] = str(args.output)
     elif args.skip_composite:
@@ -611,7 +700,7 @@ def main():
         if composite_output_path != args.output:
             ensure_rgb(strict_composite_img).save(composite_output_path)
         output_paths["composite_compatibility_copy"] = str(composite_output_path)
-        if anchoring_is_enabled:
+        if latent_preserving:
             output_paths["strict_composite"] = str(composite_output_path)
             output_paths["final_composite"] = str(composite_output_path)
         print(f"Composite compatibility copy saved to {composite_output_path}")
@@ -670,6 +759,7 @@ def main():
             "final_composite": list(strict_composite_img.size),
         },
         "latent_anchoring": anchoring_metadata,
+        "complementary_canvas": getattr(trainer, "_last_complementary_canvas", None) if canvas_is_enabled else None,
         "adaptive_crop": {
             "config": adaptive_crop_config.model_dump(mode="json"),
             "plan": crop_plan.to_dict() if crop_plan is not None else None,
@@ -680,6 +770,9 @@ def main():
                 "Primary latent-anchored result in original source coordinates "
                 "(crop-edge-safe when adaptive crop is applied)."
                 if anchoring_is_enabled
+                else "Primary complementary-canvas result (generated M_free tokens in the source latent) "
+                "in original source coordinates (crop-edge-safe when adaptive crop is applied)."
+                if canvas_is_enabled
                 else "Final strict-mask composite in original source coordinates."
             ),
             "output_local": "Direct model output in processor coordinates.",
@@ -687,6 +780,9 @@ def main():
                 "Latent-anchored model output hard-pasted into original source coordinates "
                 "before optional crop-edge feathering / strict RGB compositing."
                 if anchoring_is_enabled
+                else "Complementary-canvas model output hard-pasted into original source coordinates "
+                "before optional crop-edge feathering / strict RGB compositing."
+                if canvas_is_enabled
                 else "Model output mapped to original source coordinates before mask compositing."
             ),
             "strict_composite": "Compatibility M_core strict composite for A/B comparison.",

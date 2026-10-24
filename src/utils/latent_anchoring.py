@@ -10,6 +10,8 @@ import cv2
 import numpy as np
 import torch
 
+from src.models.complementary_canvas import complementary_canvas_enabled
+
 
 LATENT_ANCHORING_MODES = (
     "legacy",
@@ -107,6 +109,27 @@ def add_latent_anchoring_cli_args(parser) -> None:
         default=None,
         help="Threshold used to binarize M_core before building anchoring masks; overrides YAML when provided.",
     )
+    parser.add_argument(
+        "--source-noise-start",
+        type=float,
+        default=None,
+        help=(
+            "Replacement tasks: start sampling at the step nearest this σ (e.g. 0.9) from the source "
+            "noised inside M_free, so the old object's pose, scale and lighting carry over. Needs B/C/D; "
+            "overrides predict.latent_anchoring.source_noise_start from YAML when provided."
+        ),
+    )
+    parser.add_argument(
+        "--paste-back",
+        choices=("crop_feather", "change_gated"),
+        default=None,
+        help=(
+            "Pixel paste-back of the restored primary output (anchored or complementary-canvas runs): crop_feather "
+            "feathers the decoded crop over 8 px at its interior edges; change_gated keeps the output inside M_free "
+            "and the exact source beyond its transition band, keeping the output in the band only where it changed. "
+            "Overrides predict.latent_anchoring.paste_back from YAML when provided."
+        ),
+    )
 
 
 def apply_latent_anchoring_cli_overrides(config, args):
@@ -119,6 +142,8 @@ def apply_latent_anchoring_cli_overrides(config, args):
         "interaction_dilation_px": getattr(args, "interaction_dilation_px", None),
         "transition_width_px": getattr(args, "transition_width_px", None),
         "mask_threshold": getattr(args, "latent_anchoring_mask_threshold", None),
+        "source_noise_start": getattr(args, "source_noise_start", None),
+        "paste_back": getattr(args, "paste_back", None),
     }
     payload.update({key: value for key, value in overrides.items() if value is not None})
     config.predict.latent_anchoring = type(current).model_validate(payload)
@@ -153,6 +178,8 @@ def latent_anchoring_metadata(config_or_settings) -> dict[str, Any]:
         "mask_threshold": float(settings.mask_threshold),
         "interaction_dilation_px": int(settings.interaction_dilation_px),
         "transition_width_px": int(settings.transition_width_px),
+        "source_noise_start": getattr(settings, "source_noise_start", None),
+        "paste_back": getattr(settings, "paste_back", "crop_feather"),
         "source_hole_mask": source_hole_mask,
         "placement_and_reference_mask": "M_core",
         "edit_weight": edit_weight,
@@ -164,7 +191,17 @@ def latent_anchoring_metadata(config_or_settings) -> dict[str, Any]:
 
 
 def validate_latent_anchoring_runtime(config, *, height=None, width=None) -> None:
+    from src.data.config import check_latent_anchoring_contract
+
     settings = ensure_latent_anchoring_config(config)
+    check_latent_anchoring_contract(getattr(getattr(config, "model", None), "complementary_canvas", None), settings)
+    if complementary_canvas_enabled(config):
+        if height is not None or width is not None:
+            raise ValueError(
+                "the complementary canvas does not yet support explicit --height/--width; "
+                "use the processor-derived prediction geometry size"
+            )
+        return
     if not latent_anchoring_enabled(settings.mode):
         return
     if height is not None or width is not None:

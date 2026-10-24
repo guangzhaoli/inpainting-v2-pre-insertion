@@ -1,8 +1,10 @@
+import math
 import torch
 import torch.nn.functional as F  # NOQA
 import PIL
 import numpy as np
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Optional, Union, List, Tuple
 import logging
 from tqdm.auto import tqdm
@@ -17,6 +19,13 @@ from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit import (
 )
 
 from src.loss.edit_mask_loss import map_mask_to_latent
+from src.models.complementary_canvas import (
+    canvas_plan_from_region,
+    compose_canvas_latents,
+    gather_tokens,
+    ring_feather_weights,
+    ring_sigma,
+)
 from src.trainer.base_trainer import BaseTrainer
 from src.utils.tools import infer_image_tensor
 from src.utils.latent_anchoring import latent_anchoring_enabled, normalize_latent_anchoring_mode
@@ -404,6 +413,108 @@ class QwenImageEditTrainer(BaseTrainer):
             source_next = anchor_source_latents
         source_next = source_next.to(device=generated_next.device, dtype=generated_next.dtype)
         return torch.lerp(source_next, generated_next, edit_weight)
+
+    def _complementary_canvas_cfg(self):
+        canvas = getattr(getattr(self.config, "model", None), "complementary_canvas", None)
+        return canvas if canvas is not None and canvas.enabled else None
+
+    def _canvas_plan(self, embeddings: dict, img_shapes, device):
+        """Edit-region (and ring) plan on the target grid; the masked source must share that grid."""
+
+        target_shape, source_shape = tuple(img_shapes[0][0]), tuple(img_shapes[0][1])
+        if target_shape != source_shape:
+            raise ValueError(
+                f"complementary canvas needs the masked source on the target grid, got {source_shape} vs {target_shape}"
+            )
+        region = embeddings["canvas_region"]
+        if region.shape[-1] != math.prod(target_shape):
+            raise ValueError(
+                f"canvas region has {region.shape[-1]} tokens, the target grid {target_shape} has {math.prod(target_shape)}"
+            )
+        ring_tokens = self._complementary_canvas_cfg().ring_tokens
+        return canvas_plan_from_region(region, device=device, grid=target_shape[1:], ring_tokens=ring_tokens)
+
+    def _canvas_ring_weights(self, plan, img_shapes, latents: torch.Tensor):
+        """Feather weights of the ring tokens in the packed latent layout, or None without a ring."""
+
+        if not plan.ring_count:
+            return None
+        canvas = self._complementary_canvas_cfg()
+        weights = ring_feather_weights(plan, tuple(img_shapes[0][0][1:]), canvas.ring_tokens, latents.shape[-1] // 4)
+        return weights.to(device=latents.device, dtype=latents.dtype)
+
+    def _canvas_dit_kwargs(self, canvas, plan, ring_timestep=None, isolation_bias=None) -> dict:
+        """DiT forward arguments of the canvas: token selection, isolation, ring group, text condition."""
+
+        kwargs = {"image_token_index": plan.image_token_index, "isolate_conditions": canvas.isolate_conditions}
+        if canvas.isolate_conditions and canvas.isolation != "image":
+            kwargs["isolation"] = canvas.isolation
+        if plan.ring_count:
+            kwargs.update(ring_token_count=plan.ring_count, ring_timestep=ring_timestep)
+        if canvas.text_as_condition:
+            kwargs["text_as_condition"] = True
+        if isolation_bias is not None:
+            kwargs["isolation_bias"] = isolation_bias
+        return kwargs
+
+    def _canvas_loss_crop(self, plan, img_shapes, pixel_mask: torch.Tensor, margin_px: int) -> SimpleNamespace:
+        """Token-aligned crop for the pixel losses: bbox(R and its ring) plus ``margin_px``, grown to
+        hold the GT box with the LPIPS/DINO bbox pads and half a detail patch, so every loss term
+        except the far-background L1 sees exactly the pixels it sees on the full image."""
+
+        loss = self.config.loss
+        grid_h, grid_w = (int(value) for value in img_shapes[0][0][1:])
+        token_px = self.vae_scale_factor * 2
+        rows, cols = plan.target_index // grid_w, plan.target_index % grid_w
+        y0, y1 = int(rows.min()) * token_px - margin_px, (int(rows.max()) + 1) * token_px + margin_px
+        x0, x1 = int(cols.min()) * token_px - margin_px, (int(cols.max()) + 1) * token_px + margin_px
+        threshold = float(getattr(loss, "mask_threshold", 0.5))
+        ys, xs = torch.where((pixel_mask >= threshold).any(dim=0))
+        if ys.numel():
+            pad_ratio = max(float(getattr(loss, "lpips_bbox_pad_ratio", 0.1)), float(getattr(loss, "dino_bbox_pad_ratio", 0.1)))
+            detail_half = int(getattr(loss, "detail_patch_size", 256)) // 2 if float(getattr(loss, "detail_lpips_weight", 0.0)) > 0 else 0
+            gy0, gy1, gx0, gx1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+            pad_y = max(round((gy1 - gy0) * pad_ratio), detail_half) + 1
+            pad_x = max(round((gx1 - gx0) * pad_ratio), detail_half) + 1
+            y0, y1 = min(y0, gy0 - pad_y), max(y1, gy1 + pad_y)
+            x0, x1 = min(x0, gx0 - pad_x), max(x1, gx1 + pad_x)
+        ty0, ty1 = max(0, y0 // token_px), min(grid_h, -(-y1 // token_px))
+        tx0, tx1 = max(0, x0 // token_px), min(grid_w, -(-x1 // token_px))
+        device = plan.target_index.device
+        token_index = (
+            torch.arange(ty0, ty1, device=device)[:, None] * grid_w + torch.arange(tx0, tx1, device=device)[None, :]
+        ).flatten()
+        rows_px, cols_px = slice(ty0 * token_px, ty1 * token_px), slice(tx0 * token_px, tx1 * token_px)
+        from src.loss.local_detail import interaction_masks
+
+        foreground = (pixel_mask >= threshold).float().unsqueeze(1)
+        background = interaction_masks(foreground, int(getattr(loss, "interaction_radius_px", 0)))[1]
+        total = float(background.sum())
+        return SimpleNamespace(
+            token_index=token_index,
+            rows=rows_px,
+            cols=cols_px,
+            height=(ty1 - ty0) * token_px,
+            width=(tx1 - tx0) * token_px,
+            background_fraction=float(background[..., rows_px, cols_px].sum()) / total if total > 0 else 1.0,
+        )
+
+    def _canvas_isolation_bias(self, canvas) -> Optional[float]:
+        """Annealed isolation: the logit bias ramps 0 -> anneal_max_bias, then hard isolation (None)."""
+
+        step = int(getattr(self, "global_step", 0))
+        if not canvas.isolate_conditions or step >= canvas.anneal_steps:
+            return None
+        return float(canvas.anneal_max_bias) * step / canvas.anneal_steps
+
+    @staticmethod
+    def _complementary_canvas_conditions(control_latents: torch.Tensor, plan) -> torch.Tensor:
+        """Condition stream: masked-source tokens outside R, then the remaining condition images."""
+
+        return torch.cat(
+            [gather_tokens(control_latents[:, : plan.num_tokens], plan.source_index), control_latents[:, plan.num_tokens :]],
+            dim=1,
+        )
 
     def _unwrap_dit(self):
         if self.accelerator is not None:
@@ -904,6 +1015,39 @@ class QwenImageEditTrainer(BaseTrainer):
                     )
         return [img_shapes] * batch_size
 
+    def _timestep_indices_from_u(self, u: torch.Tensor) -> torch.Tensor:
+        """Map uniform samples to training-schedule indices (shared by σ-split routing)."""
+
+        max_timestep_index = self.scheduler.config.num_train_timesteps - 1
+        return (u * self.scheduler.config.num_train_timesteps).long().clamp(min=0, max=max_timestep_index)
+
+    def _auxiliary_losses(self, embeddings: dict, dit_outputs, device) -> Tuple[Optional[torch.Tensor], dict]:
+        """Alpha-head occupancy loss (every σ) and σ-split route statistics, when enabled."""
+
+        metrics = {}
+        route_high = embeddings.get("_sigma_split_route_high")
+        if route_high is not None:
+            metrics["train/sigma_split_high_rate"] = route_high.float().mean().to(device)
+        alpha_target_mask = embeddings.get("alpha_target_mask")
+        if alpha_target_mask is None:
+            return None, metrics
+
+        from src.models.alpha_head import alpha_head_loss, alpha_occupancy_targets
+
+        mask = resize_mask_bhw(
+            self._move_tensor(alpha_target_mask, device=device, dtype=torch.float32),
+            int(embeddings["height"]),
+            int(embeddings["width"]),
+        )
+        alpha_loss, bce, dice = alpha_head_loss(
+            dit_outputs[1],
+            alpha_occupancy_targets(mask, self.vae_scale_factor * 2),
+            bce_weight=float(self.config.loss.alpha_bce_weight),
+            dice_weight=float(self.config.loss.alpha_dice_weight),
+        )
+        metrics.update({"train/alpha_bce": bce.detach(), "train/alpha_dice": dice.detach()})
+        return alpha_loss, metrics
+
     def _compute_loss(self, embeddings: dict) -> torch.Tensor:
         device = self.accelerator.device
         image_latents = self._move_tensor(embeddings["image_latents"], device=device, dtype=self.weight_dtype)
@@ -943,6 +1087,9 @@ class QwenImageEditTrainer(BaseTrainer):
             # Sample timesteps
             analysis_timestep_u = embeddings.get("_analysis_timestep_u")
             if analysis_timestep_u is None:
+                # σ-split training samples σ before it builds the route's condition.
+                analysis_timestep_u = embeddings.get("_sigma_split_timestep_u")
+            if analysis_timestep_u is None:
                 u = compute_density_for_timestep_sampling(
                     weighting_scheme="none",
                     batch_size=batch_size,
@@ -961,8 +1108,7 @@ class QwenImageEditTrainer(BaseTrainer):
                     )
                 if not bool(torch.isfinite(u).all()) or bool(torch.any((u < 0) | (u >= 1))):
                     raise ValueError("_analysis_timestep_u values must be finite and in [0, 1)")
-            max_timestep_index = self.scheduler.config.num_train_timesteps - 1
-            indices = (u * self.scheduler.config.num_train_timesteps).long().clamp(min=0, max=max_timestep_index)
+            indices = self._timestep_indices_from_u(u)
             schedule_timesteps, schedule_sigmas = self._get_cached_scheduler_training_tensors(device, image_latents.dtype)
             indices = indices.to(device=device)
             timesteps = schedule_timesteps[indices]
@@ -970,8 +1116,40 @@ class QwenImageEditTrainer(BaseTrainer):
             noisy_model_input = (1.0 - sigmas) * image_latents + sigmas * noise
             packed_input = torch.cat([noisy_model_input, control_latents], dim=1)
             txt_seq_lens = prompt_embeds_mask.sum(dim=1).tolist()
+            output_token_count = image_latents.size(1)
+            canvas = self._complementary_canvas_cfg()
+            canvas_plan = None
+            canvas_kwargs = {}
+            if canvas is not None:
+                # Only R (and its ring) is noised and supervised; the rest of the source is clean context.
+                canvas_plan = self._canvas_plan(embeddings, img_shapes, device)
+                generated_input = gather_tokens(noisy_model_input, canvas_plan.target_index)
+                token_sigmas = sigmas.expand(batch_size, generated_input.shape[1], 1)
+                ring_timestep = None
+                if canvas_plan.ring_count:
+                    # The ring starts from the noised GT, which equals the source outside the hole, with σ capped.
+                    core = canvas_plan.core_count
+                    ring_sigmas = ring_sigma(sigmas, canvas.ring_sigma_max)
+                    ring_input = (1.0 - ring_sigmas) * gather_tokens(
+                        image_latents, canvas_plan.ring_index
+                    ) + ring_sigmas * gather_tokens(noise, canvas_plan.ring_index)
+                    generated_input = torch.cat([generated_input[:, :core], ring_input], dim=1)
+                    token_sigmas = torch.cat(
+                        [token_sigmas[:, :core], ring_sigmas.expand(batch_size, canvas_plan.ring_count, 1)], dim=1
+                    )
+                    ring_timestep = torch.minimum(timesteps, timesteps.new_tensor(1000.0 * canvas.ring_sigma_max)) / 1000
+                packed_input = torch.cat(
+                    [generated_input, self._complementary_canvas_conditions(control_latents, canvas_plan)], dim=1
+                )
+                output_token_count = int(canvas_plan.target_index.numel())
+                canvas_kwargs = self._canvas_dit_kwargs(
+                    canvas, canvas_plan, ring_timestep, self._canvas_isolation_bias(canvas)
+                )
 
-        model_pred = self.dit(
+        # The alpha head runs inside the (DDP-wrapped) forward so its gradients
+        # take part in the normal reducer bookkeeping.
+        alpha_kwargs = {"return_alpha_logits": True} if "alpha_target_mask" in embeddings else {}
+        dit_outputs = self.dit(
             hidden_states=packed_input,
             timestep=timesteps / 1000,
             guidance=None,
@@ -980,14 +1158,37 @@ class QwenImageEditTrainer(BaseTrainer):
             img_shapes=img_shapes,
             txt_seq_lens=txt_seq_lens,
             mask_geometry=mask_geometry,
-            output_token_count=image_latents.size(1),
+            output_token_count=output_token_count,
             return_dict=False,
-        )[0]
-        model_pred = model_pred[:, : image_latents.size(1)]
+            **alpha_kwargs,
+            **canvas_kwargs,
+        )
+        model_pred = dit_outputs[0]
+        model_pred = model_pred[:, :output_token_count]
         weighting = compute_loss_weighting_for_sd3(weighting_scheme="none", sigmas=sigmas)
         target = noise - image_latents
+        core_pred = model_pred
+        if canvas_plan is not None:
+            # Region-balanced over R: GT object tokens vs the rest of the edit region.
+            target = gather_tokens(target, canvas_plan.target_index)
+            if edit_mask is not None:
+                edit_mask = gather_tokens(edit_mask, canvas_plan.core_index)
+            if canvas_plan.ring_count:
+                core = canvas_plan.core_count
+                ring_mse = F.mse_loss(model_pred[:, core:].float(), target[:, core:].float())
+                core_pred, target = model_pred[:, :core], target[:, :core]
         # pred shape [2, 4104, 64], target shape [2, 4104, 64]
-        latent_mse = self.forward_loss(model_pred, target, weighting, edit_mask)
+        latent_mse = self.forward_loss(core_pred, target, weighting, edit_mask)
+        auxiliary_loss, auxiliary_metrics = self._auxiliary_losses(embeddings, dit_outputs, device)
+        if canvas_plan is not None and canvas.ring_tokens:
+            # The ring's flow-matching loss joins the auxiliary terms with its own small weight. Every rank logs
+            # the metric, also without ring tokens (R covering the grid): DDP reduces all ranks' keys together.
+            ring_metric = latent_mse.detach().float().new_zeros(())
+            if canvas_plan.ring_count:
+                ring_loss = float(canvas.ring_loss_weight) * ring_mse
+                auxiliary_loss = ring_loss if auxiliary_loss is None else auxiliary_loss + ring_loss
+                ring_metric = ring_mse.detach()
+            auxiliary_metrics["train/ring_mse"] = ring_metric
 
         use_region = (
             getattr(self.config.loss, "region_perceptual", False)
@@ -997,8 +1198,9 @@ class QwenImageEditTrainer(BaseTrainer):
             # Only total loss is used for progress bar; no region TB metrics.
             self._step_loss_metrics = {
                 "train/latent_mse": latent_mse.detach().float().reshape(()),
+                **auxiliary_metrics,
             }
-            return latent_mse
+            return latent_mse if auxiliary_loss is None else latent_mse + auxiliary_loss
 
         height = int(embeddings["height"])
         width = int(embeddings["width"])
@@ -1048,6 +1250,8 @@ class QwenImageEditTrainer(BaseTrainer):
         if torch.count_nonzero(sample_weights).item() == 0:
             zero_metric = latent_mse.detach().float().new_zeros(())
             total = latent_w * latent_mse
+            if auxiliary_loss is not None:
+                total = total + auxiliary_loss
             self._step_loss_metrics = {
                 "train/latent_mse": latent_mse.detach().float().reshape(()),
                 "train/latent_mse_weighted": total.detach().float().reshape(()),
@@ -1062,12 +1266,32 @@ class QwenImageEditTrainer(BaseTrainer):
                 "train/region_w_t_mean": sample_weights.detach().float().mean().reshape(()),
                 "train/region_w_t_max": sample_weights.detach().float().max().reshape(()),
                 "train/sigma_mean": sigmas.detach().float().reshape(sigmas.shape[0], -1)[:, 0].mean().reshape(()),
+                **auxiliary_metrics,
             }
             return total
 
         # Flow-matching clean estimate: x0 = x_t - sigma * v_pred, with v_pred ~ noise - x0.
-        pred_x0 = noisy_model_input - sigmas * model_pred
+        if canvas_plan is None:
+            pred_x0 = noisy_model_input - sigmas * model_pred
+        else:
+            # Pixel losses see what inference decodes: the predicted R and the ring feathered into the GT latent.
+            pred_x0 = compose_canvas_latents(
+                image_latents,
+                canvas_plan,
+                generated_input - token_sigmas * model_pred,
+                self._canvas_ring_weights(canvas_plan, img_shapes, image_latents),
+            )
         pixel_mask = self._move_tensor(embeddings["pixel_mask"], device=device, dtype=torch.float32)
+        bg_weight = float(self.config.loss.bg_l1_weight)
+        crop = None
+        if canvas_plan is not None and canvas.local_decode_margin_px is not None:
+            # Decode only the crop holding R, its ring and every pixel-loss support; outside it the
+            # latent is the exact GT. The background L1 keeps its full-image normalization.
+            crop = self._canvas_loss_crop(canvas_plan, img_shapes, pixel_mask, int(canvas.local_decode_margin_px))
+            bg_weight *= crop.background_fraction
+            pred_x0 = gather_tokens(pred_x0, crop.token_index)
+            pixel_mask = pixel_mask[..., crop.rows, crop.cols]
+            height, width = crop.height, crop.width
 
         # Only decode the prediction. GT uses the original pixel tar_image when available
         # (cheaper and free of VAE reconstruction error). Fallback: decode image_latents.
@@ -1092,18 +1316,22 @@ class QwenImageEditTrainer(BaseTrainer):
                 embeddings["target_image_for_loss"], device=device, dtype=torch.float32
             )
             target_range = "0-1"
+            full_size = (int(embeddings["height"]), int(embeddings["width"]))
             # Align geometry if dataset resolution differs slightly from VAE decode size.
-            if target_images.shape[-2:] != (height, width):
+            if target_images.shape[-2:] != full_size:
                 target_images = F.interpolate(
                     target_images,
-                    size=(height, width),
+                    size=full_size,
                     mode="bilinear",
                     align_corners=False,
                 )
+            if crop is not None:
+                target_images = target_images[..., crop.rows, crop.cols]
         else:
+            gt_latents = image_latents if crop is None else gather_tokens(image_latents, crop.token_index)
             with self._loaded_model_decode_context():
                 with torch.no_grad():
-                    target_images = self.decode_vae_latent_for_loss(image_latents, height, width)
+                    target_images = self.decode_vae_latent_for_loss(gt_latents, height, width)
             target_images = target_images.to(device=device)
             target_range = "-1-1"
 
@@ -1117,6 +1345,18 @@ class QwenImageEditTrainer(BaseTrainer):
                 embeddings["ref_mask_for_loss"], device=device, dtype=torch.float32
             )
 
+        # σ-split: the reference identity term belongs to the low-noise route only.
+        identity_kwargs = {}
+        route_high = embeddings.get("_sigma_split_route_high")
+        if route_high is not None and ref_dino_weight > 0.0:
+            low_route = (~route_high).to(device=device, dtype=sample_weights.dtype)
+            if not bool(low_route.any()):
+                ref_dino_weight = 0.0
+            identity_kwargs["ref_dino_sample_weights"] = sample_weights * low_route
+        if getattr(self.config.loss, "ref_dino_mode", "cosine") == "gt_hinge":
+            identity_kwargs["ref_dino_mode"] = "gt_hinge"
+            identity_kwargs["ref_dino_hinge_margin"] = float(self.config.loss.ref_dino_hinge_margin)
+
         # Explicit value-range contracts:
         # - VAE decode pred path returns [-1,1]
         # - InsertAnything tar/ref images are [0,1]
@@ -1125,7 +1365,7 @@ class QwenImageEditTrainer(BaseTrainer):
             target_images,
             pixel_mask,
             fg_weight=float(self.config.loss.fg_lpips_weight),
-            bg_weight=float(self.config.loss.bg_l1_weight),
+            bg_weight=bg_weight,
             ref_dino_weight=ref_dino_weight,
             ref_images=ref_images,
             ref_mask=ref_mask,
@@ -1138,17 +1378,23 @@ class QwenImageEditTrainer(BaseTrainer):
             detail_patch_size=int(getattr(self.config.loss, "detail_patch_size", 256)),
             boundary_weight=float(getattr(self.config.loss, "boundary_l1_weight", 0.0)),
             interaction_radius_px=int(getattr(self.config.loss, "interaction_radius_px", 0)),
+            **identity_kwargs,
         )
         region_total = region_out["total"]
         face_loss = region_total.new_zeros(())
         if face_dino_weight > 0:
+            target_face_mask = self._move_tensor(embeddings["target_face_mask"], device=device, dtype=torch.float32)
+            if crop is not None:
+                target_face_mask = target_face_mask[..., crop.rows, crop.cols]
             face_loss = self.region_perceptual_criterion._reference_dino_identity(
-                pred_images, self._move_tensor(embeddings["target_face_mask"], device=device, dtype=torch.float32),
+                pred_images, target_face_mask,
                 ref_images, self._move_tensor(embeddings["reference_face_mask"], device=device, dtype=torch.float32),
                 pred_range="-1-1", ref_range="0-1", sample_valid=None, sample_weights=sample_weights,
             )
             region_total = region_total + face_dino_weight * face_loss
         total = latent_w * latent_mse + region_total
+        if auxiliary_loss is not None:
+            total = total + auxiliary_loss
 
         # TensorBoard metrics only (no text spam). Progress bar still shows total loss only.
         # fg_lpips / bg_l1 / ref_dino already include w(t) from sample_weights.
@@ -1166,6 +1412,7 @@ class QwenImageEditTrainer(BaseTrainer):
             "train/region_w_t_mean": sample_weights.detach().float().mean().reshape(()),
             "train/region_w_t_max": sample_weights.detach().float().max().reshape(()),
             "train/sigma_mean": sigmas.detach().float().reshape(sigmas.shape[0], -1)[:, 0].mean().reshape(()),
+            **auxiliary_metrics,
         }
         return total
 
@@ -1440,10 +1687,28 @@ class QwenImageEditTrainer(BaseTrainer):
         data["guidance"] = guidance_scale
         return data
 
-    def sampling_from_embeddings(self, embeddings: dict) -> torch.Tensor:
+    def sampling_from_embeddings(
+        self,
+        embeddings: dict,
+        *,
+        initial_latents: Optional[torch.Tensor] = None,
+        anchor_noise: Optional[torch.Tensor] = None,
+        step_start: int = 0,
+        step_end: Optional[int] = None,
+        capture_alpha: bool = False,
+    ) -> torch.Tensor:
         """Sampling from embeddings. Only handle the latent diffusion steps. Output the final latents. Need
         to decode the latents to images.
+
+        The keyword arguments run one segment ``[step_start, step_end)`` of the
+        schedule (σ-split hand-off): ``initial_latents`` are the latents at
+        ``step_start`` and ``anchor_noise`` is the shared initial noise of the
+        latent-anchoring source trajectory. ``capture_alpha`` keeps the last
+        conditional alpha-head logits in ``self._last_alpha_logits``.
         """
+        if getattr(getattr(self.config.model, "flow_map", None), "enabled", False):
+            from src.distillation.meanflow import sample_flow_map
+            return sample_flow_map(self, embeddings)
         num_inference_steps = embeddings["num_inference_steps"]
         true_cfg_scale = embeddings["true_cfg_scale"]
         control_latents = embeddings["control_latents"]
@@ -1597,9 +1862,13 @@ class QwenImageEditTrainer(BaseTrainer):
             width=width_image,
             device=device,
             dtype=self.weight_dtype,
+            latents=initial_latents,
         )
         image_seq_len = latents.shape[1]
 
+        if step_start > 0 and do_latent_anchoring and anchor_noise is None:
+            raise ValueError("a later sampling segment with latent anchoring needs the initial anchor_noise")
+        segment_anchor_noise = anchor_noise
         anchor_noise = None
         if do_latent_anchoring:
             anchor_source_latents = anchor_source_latents.to(
@@ -1622,7 +1891,10 @@ class QwenImageEditTrainer(BaseTrainer):
                 )
             if torch.any(anchor_edit_weight < 0).item() or torch.any(anchor_edit_weight > 1).item():
                 raise ValueError("packed W_edit must remain in [0, 1]")
-            anchor_noise = latents.detach().clone()
+            if segment_anchor_noise is None:
+                anchor_noise = latents.detach().clone()
+            else:
+                anchor_noise = segment_anchor_noise.to(device=device, dtype=latents.dtype)
 
         logging.info(f"image latent got grad: {control_latents.requires_grad}")
         logging.info(f"latents shape: {latents.shape}")
@@ -1647,7 +1919,109 @@ class QwenImageEditTrainer(BaseTrainer):
             )
             logging.info(f"reference_cfg latent mask shape: {reference_cfg_latent_mask.shape}")
 
+        canvas = self._complementary_canvas_cfg()
+        canvas_plan = None
+        canvas_kwargs = reference_cfg_canvas_kwargs = {}
+        if canvas is not None:
+            if initial_latents is not None or step_start or step_end is not None or capture_alpha:
+                raise ValueError("complementary canvas sampling runs the whole schedule from noise")
+            if do_latent_anchoring and canvas.ring_tokens:
+                raise ValueError("latent anchoring inside R does not combine with a canvas ring")
+            if canvas.text_as_condition and do_true_cfg:
+                raise ValueError("a text condition is cached per prompt; text CFG with a negative prompt is not supported")
+            canvas_plan = self._canvas_plan(embeddings, img_shapes, device)
+            # The full-grid draw keeps a dense run's noise at R for the same seed; only R (and its ring) is denoised.
+            latents = gather_tokens(latents, canvas_plan.target_index)
+            if do_latent_anchoring:
+                # R's latent pixels outside M_free (and its soft transition) follow the source trajectory, as in a
+                # dense anchored run; the rest of the grid is the exact source anyway.
+                anchor_source_latents, anchor_edit_weight, anchor_noise = (
+                    gather_tokens(value, canvas_plan.target_index)
+                    for value in (anchor_source_latents, anchor_edit_weight, anchor_noise)
+                )
+            canvas_source_latents = embeddings["canvas_source_latents"].to(device=device, dtype=self.weight_dtype)
+            control_latents = self._complementary_canvas_conditions(control_latents, canvas_plan)
+            canvas_kwargs = self._canvas_dit_kwargs(canvas, canvas_plan)
+            reference_cfg_canvas_kwargs = canvas_kwargs
+            if do_reference_cfg:
+                reference_cfg_control_latents = self._complementary_canvas_conditions(
+                    reference_cfg_control_latents, canvas_plan
+                )
+                if reference_cfg_latent_mask is not None:
+                    reference_cfg_latent_mask = gather_tokens(reference_cfg_latent_mask, canvas_plan.target_index)
+            condition_cache_bytes = 0
+            if canvas.cache_conditions:
+                # Isolated t=0 conditions (and a text condition) are step-invariant: run them once,
+                # then only the target (and a non-condition text) per step.
+                dit = self._unwrap_dit()
+
+                def build_cache(conditions, shapes, prompt, prompt_mask):
+                    text = {}
+                    if canvas.text_as_condition:
+                        text = {
+                            "encoder_hidden_states": prompt.to(device, dtype=self.weight_dtype),
+                            "txt_seq_lens": prompt_mask.sum(dim=1).tolist(),
+                        }
+                    return dit.build_condition_cache(
+                        conditions,
+                        shapes,
+                        canvas_plan.image_token_index,
+                        isolation=canvas.isolation,
+                        target_groups=2 if canvas_plan.ring_count else 1,
+                        **text,
+                    )
+
+                with torch.inference_mode():
+                    condition_cache = build_cache(control_latents, img_shapes, prompt_embeds, prompt_embeds_mask)
+                    canvas_kwargs = {**canvas_kwargs, "condition_cache": condition_cache}
+                    condition_cache_bytes = condition_cache.nbytes
+                    if do_reference_cfg:
+                        source_count = int(canvas_plan.source_index.numel())
+                        shares_source = (
+                            condition_cache.per_image
+                            and condition_cache.text_layers is None
+                            and reference_cfg_control_latents.shape[1] == source_count
+                            and torch.equal(reference_cfg_control_latents, control_latents[:, :source_count])
+                        )
+                        # Per-image isolated source tokens never see the reference, so both CFG branches
+                        # share them; a condition group or a text condition needs its own null pass.
+                        reference_cfg_cache = (
+                            condition_cache.select([0])
+                            if shares_source
+                            else build_cache(
+                                reference_cfg_control_latents,
+                                reference_cfg_img_shapes,
+                                reference_cfg_prompt_embeds,
+                                reference_cfg_prompt_embeds_mask,
+                            )
+                        )
+                        if not shares_source:
+                            condition_cache_bytes += reference_cfg_cache.nbytes
+                        reference_cfg_canvas_kwargs = {**reference_cfg_canvas_kwargs, "condition_cache": reference_cfg_cache}
+                        reference_cfg_control_latents = None
+                control_latents = None
+            self._last_complementary_canvas = {
+                "edit_tokens": int(canvas_plan.core_count),
+                "ring_tokens": int(canvas_plan.ring_count),
+                "grid_tokens": int(canvas_plan.num_tokens),
+                "text_tokens": int(prompt_embeds.shape[1]),
+                "text_tokens_null": int(reference_cfg_prompt_embeds.shape[1]) if do_reference_cfg else None,
+                "text_cached": bool(canvas.cache_conditions and canvas.text_as_condition),
+                "condition_cache_bytes": int(condition_cache_bytes),
+            }
+
         timesteps, num_inference_steps = self.prepare_predict_timesteps(num_inference_steps, image_seq_len)
+        ring_sigmas = ring_weights = None
+        if canvas_plan is not None and canvas_plan.ring_count:
+            # The ring starts from the source noised at σ_ring = min(σ, ring_sigma_max) with its own
+            # noise draw; it moves only once σ falls below the cap.
+            ring_sigmas = ring_sigma(self.scheduler.sigmas.detach().float(), canvas.ring_sigma_max).tolist()
+            core = canvas_plan.core_count
+            ring_source = gather_tokens(canvas_source_latents, canvas_plan.ring_index)
+            latents = torch.cat(
+                [latents[:, :core], torch.lerp(ring_source.to(latents.dtype), latents[:, core:], ring_sigmas[0])], dim=1
+            )
+            ring_weights = self._canvas_ring_weights(canvas_plan, img_shapes, latents)
 
         if do_latent_anchoring:
             initial_sigma = self.scheduler.sigmas[0].detach().float()
@@ -1679,8 +2053,9 @@ class QwenImageEditTrainer(BaseTrainer):
         )
 
         # 7. 降噪循环 (遵循原始pipeline逻辑)
-        self.scheduler.set_begin_index(0)
+        self.scheduler.set_begin_index(step_start)
         self.attention_kwargs = {}
+        alpha_kwargs = {"return_alpha_logits": True} if capture_alpha else {}
 
         # set to proper device
         prompt_embeds = prompt_embeds.to(device, dtype=self.weight_dtype)
@@ -1698,6 +2073,10 @@ class QwenImageEditTrainer(BaseTrainer):
             for i, t in tqdm(enumerate(timesteps), total=len(timesteps), desc="Generating"):
                 # progress_bar.set_postfix({'timestep': f'{t:.1f}'})
                 # progress_bar.update()
+                if i < step_start:
+                    continue
+                if step_end is not None and i >= step_end:
+                    break
 
                 self._current_timestep = t
                 latents = latents.to(device, dtype=self.weight_dtype)
@@ -1708,11 +2087,15 @@ class QwenImageEditTrainer(BaseTrainer):
 
                 # broadcast to batch dimension
                 timestep = t.expand(latents.shape[0]).to(latents.dtype)
+                if ring_sigmas is not None:
+                    ring_timestep = torch.full_like(timestep, ring_sigmas[i])
+                    canvas_kwargs = {**canvas_kwargs, "ring_timestep": ring_timestep}
+                    reference_cfg_canvas_kwargs = {**reference_cfg_canvas_kwargs, "ring_timestep": ring_timestep}
 
                 # Usecache_context (如果transformer支持)
                 with torch.inference_mode():  # 外层关掉梯度 & 减元数据
                     with self._dit_cache_context("cond"):
-                        noise_pred = self.dit(
+                        dit_outputs = self.dit(
                             hidden_states=latent_model_input,
                             timestep=timestep / 1000,
                             guidance=guidance,
@@ -1724,7 +2107,12 @@ class QwenImageEditTrainer(BaseTrainer):
                             attention_kwargs=self.attention_kwargs,
                             output_token_count=latents.size(1),
                             return_dict=False,
-                        )[0]
+                            **alpha_kwargs,
+                            **canvas_kwargs,
+                        )
+                        noise_pred = dit_outputs[0]
+                        if capture_alpha:
+                            self._last_alpha_logits = dit_outputs[1]
                         noise_pred = noise_pred[:, : latents.size(1)]
                 if do_reference_cfg:
                     reference_cfg_latent_model_input = latents
@@ -1747,6 +2135,7 @@ class QwenImageEditTrainer(BaseTrainer):
                                 attention_kwargs=self.attention_kwargs,
                                 output_token_count=latents.size(1),
                                 return_dict=False,
+                                **reference_cfg_canvas_kwargs,
                             )[0]
                             reference_cfg_noise_pred = reference_cfg_noise_pred[:, : latents.size(1)]
 
@@ -1779,6 +2168,7 @@ class QwenImageEditTrainer(BaseTrainer):
                                 attention_kwargs=self.attention_kwargs,
                                 output_token_count=latents.size(1),
                                 return_dict=False,
+                                **canvas_kwargs,
                             )[0]
                             neg_noise_pred = neg_noise_pred[:, : latents.size(1)]
 
@@ -1797,7 +2187,14 @@ class QwenImageEditTrainer(BaseTrainer):
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
-                generated_next = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                if ring_sigmas is None:
+                    generated_next = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+                else:
+                    # Euler on the ring's own σ schedule: no motion while σ is above the cap.
+                    core = canvas_plan.core_count
+                    core_next = self.scheduler.step(noise_pred[:, :core], t, latents[:, :core], return_dict=False)[0]
+                    ring_next = latents[:, core:].float() + (ring_sigmas[i + 1] - ring_sigmas[i]) * noise_pred[:, core:].float()
+                    generated_next = torch.cat([core_next.to(latents_dtype), ring_next.to(latents_dtype)], dim=1)
                 # Flow scheduler arithmetic can promote BF16 latents to FP32.
                 # The anchoring tensors are prepared in model dtype, so restore
                 # the latent stream dtype before mixing the source trajectory.
@@ -1818,6 +2215,9 @@ class QwenImageEditTrainer(BaseTrainer):
                 if latents.dtype != latents_dtype:
                     latents = latents.to(latents_dtype)
         self._current_timestep = None
+        if canvas_plan is not None:
+            # The source latent stays exact outside R and its ring by construction; the ring is feathered.
+            latents = compose_canvas_latents(canvas_source_latents, canvas_plan, latents, ring_weights)
         return latents
 
     def decode_vae_latent(self, latents: torch.Tensor, height: int, width: int) -> torch.Tensor:

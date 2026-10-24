@@ -12,6 +12,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
+from src.models.complementary_canvas import complementary_canvas_enabled
 from src.utils.tools import instantiate_class
 from src.utils.visualization import (
     binarize_mask,
@@ -27,7 +28,7 @@ from src.utils.adaptive_crop import (
     crop_pil_pair,
     restore_pil_output,
 )
-from src.utils.adaptive_crop_anchoring import prepare_adaptive_crop_for_inference
+from src.utils.adaptive_crop_anchoring import change_gated_paste_back, prepare_adaptive_crop_for_inference
 from src.utils.inference_metadata import (
     build_effective_inference_metadata,
     build_inference_config_metadata,
@@ -254,6 +255,8 @@ class InsertAnythingValidationSampler:
                 crop_plan = None
                 anchoring = ensure_latent_anchoring_config(self.config)
                 anchored = anchoring.mode.value != "legacy"
+                # Anchoring and the complementary canvas both keep the latent source outside the edit region.
+                latent_preserving = anchored or complementary_canvas_enabled(self.config)
                 edge_feather_px = 0
                 predict_source = source
                 predict_source_mask = source_mask
@@ -265,7 +268,7 @@ class InsertAnythingValidationSampler:
                         config=self.config,
                         processor_config=self.config.data.init_args.processor,
                     )
-                    if anchored and crop_plan.applied:
+                    if latent_preserving and crop_plan.applied:
                         edge_feather_px = int(crop_compatibility.get("feather_width_px", 8))
                     predict_source, predict_source_mask = crop_pil_pair(
                         source,
@@ -303,9 +306,14 @@ class InsertAnythingValidationSampler:
                     )
 
                 primary = final_composite
-                if anchored:
+                if latent_preserving:
                     primary = raw_restored
-                    if edge_feather_px:
+                    if anchoring.paste_back == "change_gated":
+                        primary = change_gated_paste_back(
+                            source, source_mask, raw_restored,
+                            local_size=local_generated.size, crop_plan=crop_plan, settings=anchoring,
+                        )
+                    elif edge_feather_px:
                         primary, _ = restore_pil_output(
                             original_source=source, original_mask=source_mask,
                             local_output=local_generated, plan=crop_plan,

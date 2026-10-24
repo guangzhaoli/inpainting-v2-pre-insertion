@@ -27,7 +27,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--port", type=int, default=18865)
+    parser.add_argument("--dashboard", action="store_true", help="Serve live curves and checkpoint case comparisons")
     args = parser.parse_args()
+    if args.dashboard:
+        from teacher_dashboard.server import serve
+        serve(args.manifest, args.port)
+        return
     run = args.manifest.resolve().parent
 
     class Handler(BaseHTTPRequestHandler):

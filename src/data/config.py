@@ -20,6 +20,7 @@ from pydantic import (
 
 from pydantic import computed_field
 from enum import Enum
+from src.distillation.meanflow_config import FlowMapConfig, MeanFlowDMDConfig
 
 # ----------------------------
 # Common helpers / types
@@ -194,6 +195,23 @@ class LatentAnchoringConfig(BaseModel):
     mask_threshold: float = 0.5
     interaction_dilation_px: int = 32
     transition_width_px: int = 32
+    # Replacement tasks (e.g. head swap): start at the schedule step nearest this σ,
+    # with the free region holding the source latent noised by the run's own noise,
+    # so the old object's pose, scale and lighting carry over. None starts from noise.
+    source_noise_start: Optional[float] = None
+    # Pixel paste-back of the restored primary output of anchored or complementary-canvas runs.
+    # crop_feather: the decoded crop, feathered over 8 px at its interior edges.
+    # change_gated: the decoded output inside M_free, the exact source beyond transition_width_px outside it; across
+    # the transition_width_px band on either side of the M_free boundary it fades to the source except where the
+    # output's local mean colour changed (object, shadow).
+    paste_back: Literal["crop_feather", "change_gated"] = "crop_feather"
+
+    @field_validator("source_noise_start")
+    @classmethod
+    def _check_source_noise_start(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and (not math.isfinite(value) or value <= 0 or value >= 1):
+            raise ValueError("predict.latent_anchoring.source_noise_start must be in (0, 1)")
+        return value
 
     @field_validator("mode", mode="before")
     @classmethod
@@ -232,13 +250,75 @@ class LatentAnchoringConfig(BaseModel):
             raise ValueError(
                 "predict.latent_anchoring.mode=expanded_soft requires transition_width_px >= 2"
             )
+        if self.paste_back == "change_gated" and self.transition_width_px < 2:
+            raise ValueError(
+                "predict.latent_anchoring.paste_back=change_gated requires transition_width_px >= 2"
+            )
+        if self.source_noise_start is not None and self.mode == LatentAnchoringMode.legacy:
+            raise ValueError(
+                "predict.latent_anchoring.source_noise_start needs the anchored source latent; "
+                "use mode core, expanded or expanded_soft"
+            )
         return self
+
+
+def check_latent_anchoring_contract(canvas, anchoring: LatentAnchoringConfig) -> None:
+    """Combinations of predict.latent_anchoring with the complementary canvas; rerun after CLI overrides."""
+
+    canvas_enabled = canvas is not None and canvas.enabled
+    if anchoring.paste_back == "change_gated" and anchoring.mode == LatentAnchoringMode.legacy and not canvas_enabled:
+        raise ValueError(
+            "predict.latent_anchoring.paste_back=change_gated pastes back the restored output of an anchored or "
+            "complementary-canvas run; legacy runs deliver the strict M_core composite"
+        )
+    if not canvas_enabled or anchoring.mode == LatentAnchoringMode.legacy:
+        return
+    # Inside R, expanded/expanded_soft anchoring pulls the latent pixels outside M_free back to the source trajectory.
+    if anchoring.mode == LatentAnchoringMode.core:
+        raise ValueError(
+            "model.complementary_canvas regenerates M_free (M_core dilated by interaction_dilation_px); "
+            "anchor inside R with predict.latent_anchoring.mode expanded or expanded_soft"
+        )
+    if canvas.ring_tokens:
+        raise ValueError("latent anchoring inside R does not combine with model.complementary_canvas.ring_tokens")
+    if anchoring.source_noise_start is not None:
+        raise ValueError(
+            "model.complementary_canvas samples the whole schedule from noise; "
+            "unset predict.latent_anchoring.source_noise_start"
+        )
+
+
+class SigmaHandoffConfig(BaseModel):
+    """Inference hand-off between the σ-split layout and identity segments.
+
+    While σ > τ the sampler uses the shuffled reference, the user's loose mask
+    and no reference CFG. At the first step with σ <= τ the alpha head's
+    region (thresholded, intersected with the user mask, then dilated by the
+    interaction band) becomes the geometry condition, the latent-anchoring
+    free region and the reference-CFG region, and the ordered reference returns.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    # None uses model.sigma_split.tau.
+    tau: Optional[float] = None
+    alpha_threshold: float = 0.5
+    # None uses predict.latent_anchoring.interaction_dilation_px.
+    interaction_dilation_px: Optional[int] = Field(default=None, ge=0, le=256)
+
+    @field_validator("tau", "alpha_threshold")
+    @classmethod
+    def _check_unit_interval(cls, value: Optional[float]) -> Optional[float]:
+        if value is not None and (not math.isfinite(value) or value <= 0 or value >= 1):
+            raise ValueError("predict.sigma_handoff tau/alpha_threshold must be in (0, 1)")
+        return value
 
 
 class PredictConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     devices: DeviceConfig = Field(default_factory=DeviceConfig)
     latent_anchoring: LatentAnchoringConfig = Field(default_factory=LatentAnchoringConfig)
+    sigma_handoff: SigmaHandoffConfig = Field(default_factory=SigmaHandoffConfig)
 
 
 # ----------------------------
@@ -371,6 +451,132 @@ class ReferenceCFGConfig(BaseModel):
         return v
 
 
+class AlphaHeadConfig(BaseModel):
+    """Token-level object-occupancy head on the final DiT target hidden states."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+
+
+class ComplementaryCanvasConfig(BaseModel):
+    """Generate only the condition-hole tokens R and keep the source outside R as clean context.
+
+    The image stream is [x_t at R (frame 0), masked source outside R (frame 1),
+    conditions...]; every token keeps its own grid RoPE coordinate. The final
+    latent is the generated R scattered into the source latent; latent anchoring
+    (expanded/expanded_soft, no ring) additionally pulls R's latent pixels outside
+    M_free back to the source trajectory. ``isolate_conditions`` keeps the condition images from
+    attending to the text and the target: with ``isolation=image`` each image
+    attends only to itself, with ``isolation=group`` the conditions attend to
+    each other. ``cache_conditions`` (inference only) then runs the conditions
+    once and reuses their per-layer K/V at every sampling step.
+
+    ``ring_tokens`` adds the three-zone ring: the band of grid tokens within that
+    many tokens of R is generated after R with its own modulation group, starts
+    from the noised source with σ capped at ``ring_sigma_max``, is supervised
+    with ``ring_loss_weight`` and is feathered into the source latent at the end.
+    ``text_as_condition`` modulates the text stream at t=0 and lets it attend only
+    to text and conditions, so it is cached with them. ``anneal_steps`` (training)
+    replaces hard isolation by a logit bias on the isolated queries' other keys,
+    ramped from 0 to ``anneal_max_bias`` over that many optimizer steps.
+    ``local_decode_margin_px`` makes the pixel losses decode only bbox(R and its
+    ring) plus this margin; the far background there is the exact source.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    isolate_conditions: bool = False
+    isolation: Literal["image", "group"] = "image"
+    cache_conditions: bool = False
+    ring_tokens: int = Field(default=0, ge=0, le=4)
+    ring_sigma_max: float = Field(default=0.3, gt=0, le=1)
+    ring_loss_weight: float = Field(default=0.1, ge=0)
+    text_as_condition: bool = False
+    anneal_steps: int = Field(default=0, ge=0)
+    anneal_max_bias: float = Field(default=12.0, gt=0, le=100)
+    local_decode_margin_px: Optional[int] = Field(default=None, ge=0, le=1024)
+
+    @model_validator(mode="after")
+    def _check_dependencies(self):
+        changed = {
+            "isolate_conditions": self.isolate_conditions,
+            "cache_conditions": self.cache_conditions,
+            "ring_tokens": self.ring_tokens > 0,
+            "text_as_condition": self.text_as_condition,
+            "local_decode_margin_px": self.local_decode_margin_px is not None,
+        }
+        if any(changed.values()) and not self.enabled:
+            enabled = ", ".join(name for name, value in changed.items() if value)
+            raise ValueError(f"model.complementary_canvas.{enabled} require enabled=true")
+        if self.cache_conditions and not self.isolate_conditions:
+            raise ValueError("model.complementary_canvas.cache_conditions requires isolate_conditions")
+        if self.isolation != "image" and not self.isolate_conditions:
+            raise ValueError("model.complementary_canvas.isolation=group requires isolate_conditions")
+        if self.text_as_condition and not self.isolate_conditions:
+            raise ValueError("model.complementary_canvas.text_as_condition requires isolate_conditions")
+        if self.anneal_steps and not self.isolate_conditions:
+            raise ValueError("model.complementary_canvas.anneal_steps requires isolate_conditions")
+        return self
+
+
+class SigmaSplitHighNoiseConfig(BaseModel):
+    """Layout segment (σ > τ): the reference says what, never which pose."""
+
+    model_config = ConfigDict(extra="forbid")
+    shuffle_reference_tokens: bool = True
+    flip_prob: float = 0.5
+    rotation_deg: float = Field(default=15.0, ge=0, le=180)
+    # Color jitter factors are sampled from [1 - x, 1 + x]; hue from [-x, x] turns.
+    brightness: float = Field(default=0.3, ge=0, lt=1)
+    contrast: float = Field(default=0.3, ge=0, lt=1)
+    saturation: float = Field(default=0.3, ge=0, lt=1)
+    hue: float = Field(default=0.05, ge=0, le=0.5)
+    # "drop" keeps the reference out of the VL prompt; "augmented" shows the
+    # same strongly augmented image to the VL encoder.
+    vl_reference: Literal["drop", "augmented"] = "drop"
+
+    @field_validator("flip_prob")
+    @classmethod
+    def _check_probability(cls, value: float) -> float:
+        if not 0 <= value <= 1:
+            raise ValueError("sigma_split.high_noise.flip_prob must be in [0, 1]")
+        return value
+
+
+class SigmaSplitLowNoiseConfig(BaseModel):
+    """Identity segment (σ <= τ): ordered reference with light photometric jitter."""
+
+    model_config = ConfigDict(extra="forbid")
+    exposure_ev: float = Field(default=0.25, ge=0, le=2)
+    gamma: float = Field(default=0.1, ge=0, lt=1)
+    saturation: float = Field(default=0.1, ge=0, lt=1)
+    temperature: float = Field(default=0.05, ge=0, lt=1)
+
+
+class SigmaSplitConfig(BaseModel):
+    """Build the training condition from the sampled σ (one LoRA, two segments).
+
+    σ > τ uses the loose mask and the shuffled, strongly augmented reference;
+    σ <= τ uses the tight mask and the ordered reference. Inside
+    [τ - overlap, τ + overlap] each sample picks one of the two at random.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    tau: float = 0.7
+    overlap: float = 0.05
+    high_noise: SigmaSplitHighNoiseConfig = Field(default_factory=SigmaSplitHighNoiseConfig)
+    low_noise: SigmaSplitLowNoiseConfig = Field(default_factory=SigmaSplitLowNoiseConfig)
+
+    @model_validator(mode="after")
+    def _check_band(self):
+        if not (math.isfinite(self.tau) and 0 < self.tau < 1):
+            raise ValueError("model.sigma_split.tau must be in (0, 1)")
+        if not (math.isfinite(self.overlap) and 0 <= self.overlap < min(self.tau, 1 - self.tau)):
+            raise ValueError("model.sigma_split.overlap must be in [0, min(tau, 1 - tau))")
+        return self
+
+
 class ModelConfig(BaseModel):
     attention_backend: Literal["sdpa", "flash_attention_2"] = "flash_attention_2"
     # Legacy checkpoints used one timestep for every image token. New 2511
@@ -382,6 +588,12 @@ class ModelConfig(BaseModel):
     lora: LoraConfig = Field(default_factory=LoraConfig)
     mask_control: MaskControlConfig = Field(default_factory=MaskControlConfig)
     reference_cfg: ReferenceCFGConfig = Field(default_factory=ReferenceCFGConfig)
+    flow_map: FlowMapConfig = Field(default_factory=FlowMapConfig)
+    alpha_head: AlphaHeadConfig = Field(default_factory=AlphaHeadConfig)
+    sigma_split: SigmaSplitConfig = Field(default_factory=SigmaSplitConfig)
+    complementary_canvas: ComplementaryCanvasConfig = Field(default_factory=ComplementaryCanvasConfig)
+    # Show the masked source image to the VL encoder (Picture 1); false keeps only the reference.
+    vl_masked_source: bool = True
     quantize: bool = False
 
     @model_validator(mode="before")
@@ -507,7 +719,7 @@ class HybridMaskingContextGuardConfig(BaseModel):
     @field_validator("overflow_policy")
     @classmethod
     def _check_overflow_policy(cls, value: str) -> str:
-        allowed = {"fallback_to_gt"}
+        allowed = {"fallback_to_gt", "fallback_to_band"}
         if value not in allowed:
             raise ValueError(
                 "hybrid_masking.context_guard.overflow_policy must be one of "
@@ -517,19 +729,27 @@ class HybridMaskingContextGuardConfig(BaseModel):
 
 
 class MaskMixV2ModeWeightsConfig(BaseModel):
-    """Sampling probabilities for the four MaskMix-v2 mask families."""
+    """Sampling probabilities for the MaskMix-v2 mask families.
+
+    ``loose_blob`` and ``oversized_box`` reuse the ``loose_placement`` geometry
+    without σ-split routing: the dataset builds them before adaptive crop.
+    """
 
     model_config = ConfigDict(extra="forbid")
     augmented_box: float = 0.10
     asymmetric_box: float = 0.10
     exact: float = 0.60
     random_morphology: float = 0.20
+    loose_blob: float = 0.0
+    oversized_box: float = 0.0
 
     @field_validator(
         "augmented_box",
         "asymmetric_box",
         "exact",
         "random_morphology",
+        "loose_blob",
+        "oversized_box",
     )
     @classmethod
     def _check_probability(cls, value: float) -> float:
@@ -544,6 +764,8 @@ class MaskMixV2ModeWeightsConfig(BaseModel):
             + self.asymmetric_box
             + self.exact
             + self.random_morphology
+            + self.loose_blob
+            + self.oversized_box
         )
         if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-6):
             raise ValueError(
@@ -735,6 +957,90 @@ class MaskMixV2Config(BaseModel):
     )
 
 
+def _check_distribution(name: str, values: Dict[str, float]) -> None:
+    for key, value in values.items():
+        if not math.isfinite(value) or value < 0 or value > 1:
+            raise ValueError(f"{name}.{key} must be finite and in [0, 1]")
+    total = sum(values.values())
+    if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise ValueError(f"{name} must sum to 1 (got {total})")
+
+
+class LooseMaskModeWeightsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    loose_blob: float = 0.6
+    oversized_box: float = 0.4
+
+    @model_validator(mode="after")
+    def _check_weights(self):
+        _check_distribution("hybrid_masking.loose_placement.mode_weights", self.model_dump())
+        return self
+
+
+class LooseBlobShapeWeightsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ellipse: float = 0.25
+    superellipse: float = 0.25
+    spline_blob: float = 0.25
+    brush: float = 0.25
+
+    @model_validator(mode="after")
+    def _check_weights(self):
+        _check_distribution("hybrid_masking.loose_placement.blob_shape_weights", self.model_dump())
+        return self
+
+
+class TightMaskModeWeightsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    exact: float = 0.5
+    random_morphology: float = 0.5
+
+    @model_validator(mode="after")
+    def _check_weights(self):
+        _check_distribution("hybrid_masking.loose_placement.tight_mode_weights", self.model_dump())
+        return self
+
+
+class LoosePlacementConfig(BaseModel):
+    """σ-split placement masks sampled in the dataset, before adaptive crop.
+
+    Each sample carries a loose region (high-noise layout segment) and, in the
+    same crop, a tight exact/morphology mask (low-noise identity segment).
+    The geometry fields also shape the MaskMix-v2 ``loose_blob``/``oversized_box``
+    families when ``enabled`` is false.
+    ``size_reference=bbox_geometric_mean`` scales both axes from sqrt(h*w) of
+    the GT box so the mask aspect ratio is independent of the object's;
+    ``bbox_axes`` scales each GT box side by its own factor.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    mode_weights: LooseMaskModeWeightsConfig = Field(default_factory=LooseMaskModeWeightsConfig)
+    blob_shape_weights: LooseBlobShapeWeightsConfig = Field(default_factory=LooseBlobShapeWeightsConfig)
+    scale_min: float = 1.2
+    scale_max: float = 2.5
+    size_reference: Literal["bbox_geometric_mean", "bbox_axes"] = "bbox_geometric_mean"
+    bottom_align_prob: float = 0.7
+    # Extra processed pixels beyond interaction_dilation_px that the outline must
+    # cover, absorbing resize rounding so the trainer's interaction union is a no-op.
+    coverage_margin_px: int = Field(default=2, ge=0, le=64)
+    guard_shrink: float = 0.7
+    guard_max_attempts: int = Field(default=8, ge=0, le=64)
+    tight_mode_weights: TightMaskModeWeightsConfig = Field(default_factory=TightMaskModeWeightsConfig)
+
+    @model_validator(mode="after")
+    def _check_ranges(self):
+        if not (math.isfinite(self.scale_min) and math.isfinite(self.scale_max)):
+            raise ValueError("loose_placement scale range must be finite")
+        if self.scale_min < 1 or self.scale_max < self.scale_min:
+            raise ValueError("loose_placement requires 1 <= scale_min <= scale_max")
+        if not 0 <= self.bottom_align_prob <= 1:
+            raise ValueError("loose_placement.bottom_align_prob must be in [0, 1]")
+        if not 0 < self.guard_shrink < 1:
+            raise ValueError("loose_placement.guard_shrink must be in (0, 1)")
+        return self
+
+
 class HybridMaskingConfig(BaseModel):
     """Training-only Insert Anything or MaskMix-v2 mask augmentation."""
 
@@ -754,9 +1060,13 @@ class HybridMaskingConfig(BaseModel):
     context_guard: HybridMaskingContextGuardConfig = Field(
         default_factory=HybridMaskingContextGuardConfig
     )
+    loose_placement: LoosePlacementConfig = Field(default_factory=LoosePlacementConfig)
 
     # Extra context removed around the supervised object, in processed pixels.
     interaction_dilation_px: int = Field(default=0, ge=0, le=128)
+    # "union" adds dilate(GT, interaction_dilation_px) to the sampled mask; "grow" dilates the
+    # sampled mask itself until it covers that band, so R's outline never follows the GT contour.
+    interaction_context_mode: Literal["union", "grow"] = "union"
 
     @field_validator("strategy")
     @classmethod
@@ -824,6 +1134,17 @@ class HybridMaskingConfig(BaseModel):
             raise ValueError(
                 "hybrid_masking.context_guard requires ensure_gt_coverage=true "
                 "to prevent completed-target pixel leakage"
+            )
+        if self.loose_placement.enabled and not (self.enabled and self.strategy == "maskmix_v2"):
+            raise ValueError(
+                "hybrid_masking.loose_placement requires hybrid_masking.enabled=true "
+                "and strategy=maskmix_v2 (its tight masks reuse the MaskMix-v2 families)"
+            )
+        weights = self.maskmix_v2.mode_weights
+        if self.loose_placement.enabled and (weights.loose_blob > 0 or weights.oversized_box > 0):
+            raise ValueError(
+                "hybrid_masking.maskmix_v2.mode_weights.loose_blob/oversized_box are for training without "
+                "σ-split; with loose_placement.enabled the σ-split routes already pair loose and tight masks"
             )
         return self
 
@@ -1218,6 +1539,10 @@ class LossConfig(BaseModel):
     # Reference identity is deliberately independent from foreground LPIPS and
     # stays disabled by default because it needs an additional frozen encoder.
     ref_dino_weight: float = 0.0
+    # cosine: 1 - cos(pred, ref). gt_hinge: relu(cos(GT, ref) - margin - cos(pred, ref)),
+    # so matching the reference better than the real GT earns nothing.
+    ref_dino_mode: Literal["cosine", "gt_hinge"] = "cosine"
+    ref_dino_hinge_margin: float = Field(default=0.05, ge=0, le=2)
     face_dino_weight: float = 0.0
     dino_backend: Literal["transformers", "torch_hub"] = "transformers"
     dino_model_name: str = "facebook/dinov2-small"
@@ -1225,6 +1550,10 @@ class LossConfig(BaseModel):
     dino_checkpoint_path: Optional[str] = None
     dino_input_size: int = 224
     dino_bbox_pad_ratio: float = 0.1
+
+    # Token-level occupancy supervision of model.alpha_head at every σ.
+    alpha_bce_weight: float = 0.0
+    alpha_dice_weight: float = 0.0
 
     @field_validator("forground_weight", "background_weight")
     @classmethod
@@ -1249,6 +1578,8 @@ class LossConfig(BaseModel):
         "face_dino_weight",
         "detail_lpips_weight",
         "boundary_l1_weight",
+        "alpha_bce_weight",
+        "alpha_dice_weight",
     )
     @classmethod
     def _non_negative_loss_weight(cls, v: float) -> float:
@@ -1534,6 +1865,7 @@ class DistillationConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
+    meanflow: MeanFlowDMDConfig | None = None
     algorithm: PluginConfig = Field(
         default_factory=lambda: PluginConfig(class_path="src.distillation.opd.QwenImageEditOPDStrategy")
     )
@@ -1683,10 +2015,96 @@ class Config(BaseModel):
     def quantization_type(self) -> str:
         return self._compute_quantization_type()
 
+    def _check_sigma_split_contract(self) -> None:
+        insert_anything = self.trainer == TrainerKind.QwenImageEditInsertAnything
+        alpha_supervised = self.loss.alpha_bce_weight > 0 or self.loss.alpha_dice_weight > 0
+        if alpha_supervised and not self.model.alpha_head.enabled:
+            raise ValueError("loss.alpha_*_weight > 0 requires model.alpha_head.enabled")
+        if self.model.alpha_head.enabled and not insert_anything:
+            raise ValueError("model.alpha_head is implemented for trainer=QwenImageEditInsertAnything")
+        if self.loss.ref_dino_mode == "gt_hinge" and self.loss.ref_dino_weight > 0 and not self.loss.region_perceptual:
+            raise ValueError("loss.ref_dino_mode=gt_hinge is computed by loss.region_perceptual")
+
+        sigma_split = self.model.sigma_split
+        loose_enabled = self.data.init_args.hybrid_masking.loose_placement.enabled
+        if loose_enabled != sigma_split.enabled:
+            raise ValueError(
+                "hybrid_masking.loose_placement.enabled and model.sigma_split.enabled must match: "
+                "loose masks feed the σ > τ route and only σ-split training consumes them"
+            )
+        if sigma_split.enabled:
+            if not insert_anything:
+                raise ValueError("model.sigma_split requires trainer=QwenImageEditInsertAnything")
+            if self.data.batch_size != 1:
+                raise ValueError("model.sigma_split routes the VL prompt per batch and requires data.batch_size=1")
+            if self.distillation.enabled or self.model.flow_map.enabled:
+                raise ValueError("model.sigma_split is a teacher-training path; disable distillation/flow_map")
+
+        handoff = self.predict.sigma_handoff
+        if handoff.enabled and not (sigma_split.enabled and self.model.alpha_head.enabled):
+            raise ValueError("predict.sigma_handoff requires model.sigma_split and model.alpha_head")
+
+    def _check_complementary_canvas_contract(self) -> None:
+        canvas = self.model.complementary_canvas
+        if not canvas.enabled:
+            return
+        if self.trainer != TrainerKind.QwenImageEditInsertAnything:
+            raise ValueError("model.complementary_canvas requires trainer=QwenImageEditInsertAnything")
+        if self.data.batch_size != 1:
+            raise ValueError("model.complementary_canvas generates a per-sample token set and requires data.batch_size=1")
+        if canvas.cache_conditions and not self.model.zero_cond_t:
+            raise ValueError("model.complementary_canvas.cache_conditions requires model.zero_cond_t")
+        if (canvas.ring_tokens or canvas.text_as_condition) and not self.model.zero_cond_t:
+            raise ValueError(
+                "model.complementary_canvas.ring_tokens/text_as_condition need model.zero_cond_t (per-group timesteps)"
+            )
+        unsupported = {
+            "model.sigma_split": self.model.sigma_split.enabled,
+            "model.alpha_head": self.model.alpha_head.enabled,
+            "model.flow_map": self.model.flow_map.enabled,
+            "distillation": self.distillation.enabled,
+        }
+        enabled = [name for name, value in unsupported.items() if value]
+        if enabled:
+            raise ValueError(f"model.complementary_canvas is not implemented together with {', '.join(enabled)}")
+
     @model_validator(mode="after")
     def _wire_cross_defaults(self):
+        if self.model.flow_map.enabled and self.trainer != TrainerKind.QwenImageEditInsertAnything:
+            raise ValueError("Flow-map conditioning is implemented for the InsertAnything trainer")
+        if self.distillation.enabled and self.distillation.meanflow is not None:
+            if not self.model.flow_map.enabled:
+                raise ValueError("MeanFlow/DMD requires model.flow_map.enabled")
+            if self.trainer != TrainerKind.QwenImageEditInsertAnything:
+                raise ValueError("MeanFlow/DMD requires the InsertAnything trainer")
+            if self.distillation.algorithm.class_path != "src.distillation.meanflow.QwenImageEditMeanFlowDMDStrategy":
+                raise ValueError("meanflow options require QwenImageEditMeanFlowDMDStrategy")
+            if len(self.distillation.teachers) != 1:
+                raise ValueError("MeanFlow/DMD requires exactly one frozen fused teacher")
+            if self.distillation.teacher_backend.class_path != "src.distillation.backends.SharedLoRATeacherBackend":
+                raise ValueError("MeanFlow/DMD currently requires the shared LoRA backend")
+            if self.distillation.teachers[0].guidance.mode != "none":
+                raise ValueError("Use a fused, guidance-absorbed teacher with guidance.mode=none")
+            if self.distillation.teachers[0].guidance.prompt_mode != self.distillation.student_guidance.prompt_mode:
+                raise ValueError("Teacher and generator must use the same prompt conditioning")
+            if self.distillation.student_guidance.mode != "none" or self.model.reference_cfg.enabled:
+                raise ValueError("MeanFlow/DMD generator uses a single positive-reference branch")
+            if self.train.mixed_precision == "fp16":
+                raise ValueError("MeanFlow/DMD supports bf16 or no mixed precision, not fp16")
+            if self.train.trainable_precision != "float32":
+                raise ValueError("MeanFlow/DMD requires FP32 trainable parameters and optimizer moments")
+            if self.distillation.meanflow.fake_adapter in {
+                self.model.lora.adapter_name, self.distillation.teachers[0].lora.adapter_name
+            }:
+                raise ValueError("fake, generator and teacher adapters must be distinct")
+        if self.distillation.enabled and self.distillation.algorithm.class_path == "src.distillation.meanflow.QwenImageEditMeanFlowDMDStrategy":
+            if self.distillation.meanflow is None:
+                raise ValueError("MeanFlow/DMD strategy requires distillation.meanflow")
         if self.loss.face_dino_weight > 0 and not self.data.init_args.face_identity_supervision:
             raise ValueError("face_dino_weight requires data.init_args.face_identity_supervision")
+        self._check_sigma_split_contract()
+        self._check_complementary_canvas_contract()
+        check_latent_anchoring_contract(self.model.complementary_canvas, self.predict.latent_anchoring)
         self.train.train_batch_size = self.data.batch_size
         if self.quantization_type in {"pretrain_fp4", "pretrain_fp8", "pretrain_fp16"}:
             self.model.quantize = False

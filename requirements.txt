@@ -29,7 +29,11 @@ pydantic==2.11.7
 blake3
 pillow
 rich
-imagehash
+imagehash>=4.3,<5
 faiss-cpu
+gdown>=5.2,<6
+pycocotools>=2.0.10,<3
+pyarrow>=16,<25
+scipy>=1.10,<2
 # wandb
 # transformer_engine[pytorch]

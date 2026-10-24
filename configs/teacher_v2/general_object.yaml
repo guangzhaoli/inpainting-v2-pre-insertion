@@ -69,23 +69,25 @@ data:
       ensure_gt_coverage: true
       maskmix_v2:
         mode_weights:
-          exact: 0.2
+          exact: 0.0
           random_morphology: 0.2
-          augmented_box: 0.3
-          asymmetric_box: 0.3
+          augmented_box: 0.2
+          asymmetric_box: 0.2
+          loose_blob: 0.25
+          oversized_box: 0.15
         asymmetric_box:
-          margin_ratio_min: 0.0
-          margin_ratio_max: 0.25
+          margin_ratio_min: 0.05
+          margin_ratio_max: 0.3
         augmented_box:
           jitter_object_scale_min: 0.05
           jitter_object_scale_max: 0.2
           jitter_min_px: 2
           jitter_max_px: 64
         morphology:
-          radius_object_scale_min: 0.02
-          radius_object_scale_max: 0.12
-          radius_min_px: 1
-          radius_max_px: 32
+          radius_object_scale_min: 0.06
+          radius_object_scale_max: 0.2
+          radius_min_px: 8
+          radius_max_px: 96
           anisotropy_min: 1.5
           anisotropy_max: 3.0
           kernel_weights:
@@ -96,8 +98,13 @@ data:
       context_guard:
         enabled: true
         max_condition_area_ratio: 0.8
-        overflow_policy: fallback_to_gt
+        overflow_policy: fallback_to_band
       interaction_dilation_px: 32
+      loose_placement:
+        enabled: false
+        scale_min: 1.2
+        scale_max: 2.2
+        bottom_align_prob: 0.5
     processor:
       class_path: src.data.preprocess.ImageProcessor
       init_args:
@@ -143,7 +150,6 @@ lr_scheduler:
   scheduler_type: cosine
   warmup_steps: 500
 train:
-  memory_policy: auto
   gradient_accumulation_steps: 1
   max_train_steps: 100000000
   num_epochs: 5
@@ -155,6 +161,7 @@ train:
   trainable_precision: float32
   rank_specific_rng: true
   seed: 42
+  memory_policy: auto
 loss:
   mask_loss: true
   forground_weight: 3.0

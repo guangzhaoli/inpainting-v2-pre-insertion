@@ -61,6 +61,7 @@ class RuntimeHotspotRegressionTest(unittest.TestCase):
 
     def test_fp32_scheduler_output_preserves_bf16_anchoring_stream(self):
         trainer = object.__new__(QwenImageEditTrainer)
+        trainer.config = SimpleNamespace(model=SimpleNamespace())
         trainer.accelerator = None
         trainer.dit = _FakeSamplingDit()
         trainer.scheduler = _FakeScheduler()
@@ -283,6 +284,7 @@ class RuntimeHotspotRegressionTest(unittest.TestCase):
 
     def test_reference_cfg_keeps_predictions_on_device_without_allocator_flush(self):
         trainer = object.__new__(QwenImageEditTrainer)
+        trainer.config = SimpleNamespace(model=SimpleNamespace())
         trainer.accelerator = None
         trainer.dit = _FakeSamplingDit()
         trainer.scheduler = _FakeScheduler()
