@@ -68,17 +68,24 @@ def _inputs(seed=2):
     )
 
 
-def _reference(model, x, timestep=0.6, shared=True):
-    """The model's own cached forward per branch (what the trainer's cached loop calls)."""
+def _reference(model, x, timestep=0.6, shared=True, isolation="image", text=False):
+    """The model's own cached forward per branch (what the trainer's cached loop calls); ``text``: each
+    branch's prompt is a text condition, cached with that branch's condition images."""
 
     plan, device = x.plan, model.img_in.weight.device
     common = dict(mask_geometry_tokens=model.prepare_mask_geometry_tokens(x.geometry, IMG_SHAPES),
                   image_token_index=plan.image_token_index, output_token_count=x.target.shape[1], return_dict=False,
-                  timestep=torch.full((1,), timestep, device=device))
+                  timestep=torch.full((1,), timestep, device=device), **({"text_as_condition": True} if text else {}))
+
+    def build_cache(conditions, shapes, prompt):
+        kwargs = {"isolation": isolation} if isolation != "image" else {}
+        if text:
+            kwargs.update(encoder_hidden_states=prompt, txt_seq_lens=[prompt.shape[1]])
+        return model.build_condition_cache(conditions, shapes, plan.image_token_index, **kwargs)
+
     with torch.no_grad():
-        cache = model.build_condition_cache(x.conditions, IMG_SHAPES, plan.image_token_index)
-        null_cache = cache.select([0]) if shared else model.build_condition_cache(
-            x.null_conditions, NULL_SHAPES, plan.image_token_index)
+        cache = build_cache(x.conditions, IMG_SHAPES, x.positive)
+        null_cache = cache.select([0]) if shared else build_cache(x.null_conditions, NULL_SHAPES, x.null)
         outputs = []
         for prompt, shapes, branch_cache in ((x.positive, IMG_SHAPES, cache), (x.null, NULL_SHAPES, null_cache)):
             outputs.append(model(
@@ -89,12 +96,13 @@ def _reference(model, x, timestep=0.6, shared=True):
     return outputs
 
 
-def _fast(model, x, options, shared=True, segments=None):
+def _fast(model, x, options, shared=True, segments=None, isolation="image", text=False):
     plan = x.plan
-    passes = [ConditionPass(x.conditions, IMG_SHAPES, plan.image_token_index, (0, 1))]
+    passes = [ConditionPass(x.conditions, IMG_SHAPES, plan.image_token_index, (0, 1), isolation, 0 if text else None)]
     null_ids = (0,)
     if not shared:
-        passes.append(ConditionPass(x.null_conditions, NULL_SHAPES, plan.image_token_index, (2,)))
+        passes.append(ConditionPass(x.null_conditions, NULL_SHAPES, plan.image_token_index, (2,), isolation,
+                                    1 if text else None))
         null_ids = (2,)
     branches = [BranchInputs(x.positive, IMG_SHAPES, (0, 1)), BranchInputs(x.null, NULL_SHAPES, null_ids)]
     geometry = model.prepare_mask_geometry_tokens(x.geometry, IMG_SHAPES)
@@ -126,6 +134,28 @@ def test_step_matches_the_cached_isolated_forward(options, shared):
     if options.kv_buffer:
         n, keys = x.target.shape[1], forward.layout.total
         assert keys == (5 + n) + 9 + 10 + (0 if shared else 10) + (n + 3)
+
+
+@pytest.mark.skipif("text_as_condition" not in inspect.signature(QwenImageTransformer2DModel.forward).parameters,
+                    reason="the model has no text condition")
+@pytest.mark.parametrize("options", OPTION_GRID, ids=lambda o: o.label)
+@pytest.mark.parametrize("isolation", ["image", "group"])
+def test_text_condition_step_matches_the_cached_forward(options, isolation):
+    """text_as_condition: each prompt runs once with its branch's condition pass (t=0, over itself and the
+    pass's images); a step has only image queries and attends to the cached text K/V."""
+
+    model, x = _tiny_dit(), _inputs()
+    expected = _reference(model, x, shared=False, isolation=isolation, text=True)
+    if options.fuse_qkv:
+        fuse_qkv_(model)
+    forward = _fast(model, x, options, shared=False, isolation=isolation, text=True)
+    with torch.inference_mode():
+        actual = forward.step(x.target, {"t": torch.full((1,), 0.6)})
+    for got, want in zip(actual, expected):
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+    if options.kv_buffer:  # [q_0 | text_0 | images_0 | images_1 | text_1 | q_1]
+        n, keys = x.target.shape[1], forward.layout.total
+        assert keys == n + 5 + (10 + 9) + 10 + 3 + n
 
 
 def test_merged_lora_and_fused_qkv_keep_the_model_forward():
@@ -258,6 +288,11 @@ def test_key_layout_overlaps_on_shared_conditions():
     assert own.branch_keys == ((0, 21), (21, 14))
     single = KeyLayout.build([7], [(0, 1)], {0: 10, 1: 4})
     assert single.branch_keys == ((0, 21),)
+    # A text condition sits between its branch's step rows and images.
+    text = KeyLayout.build([7, 9], [(0, 1), (2,)], {0: 10, 1: 4, 2: 5}, text_lengths=[3, 2])
+    assert [part[:2] for part in text.parts] == [("step", 0), ("text", 0), ("image", 0), ("image", 1), ("image", 2),
+                                                 ("text", 1), ("step", 1)]
+    assert text.branch_keys == ((0, 7 + 3 + 14), (24, 5 + 2 + 9)) and text.total == 40
 
 
 class _EulerScheduler:
@@ -273,10 +308,16 @@ class _EulerScheduler:
         self.index += 1
         return (latents,)
 
+    def scale_noise(self, sample, _timestep, noise):
+        """diffusers after ``set_begin_index``: the σ of the current step index (the next step's after ``step``)."""
 
-def _trainer(dit):
+        sigma = self.sigmas[self.index]
+        return sigma * noise + (1.0 - sigma) * sample
+
+
+def _trainer(dit, canvas=None):
     trainer = object.__new__(QwenImageEditTrainer)
-    canvas = ComplementaryCanvasConfig(enabled=True, isolate_conditions=True, cache_conditions=True)
+    canvas = canvas or ComplementaryCanvasConfig(enabled=True, isolate_conditions=True, cache_conditions=True)
     trainer.config = NS(model=NS(complementary_canvas=canvas))
     trainer.accelerator = None
     trainer.dit = dit
@@ -328,12 +369,42 @@ def test_sampler_matches_the_trainer_cached_loop(batch_cfg, merge):
     assert sampler.last["steps"] == 3
 
 
+@pytest.mark.parametrize("batch_cfg", [False, True])
+def test_sampler_with_text_condition_and_anchoring_matches_the_trainer_cached_loop(batch_cfg):
+    """The deploy path: group isolation, the text as a condition and soft latent anchoring inside R."""
+
+    generator = torch.Generator().manual_seed(11)
+    anchoring = {"latent_anchoring_mode": "expanded_soft", "anchor_source_latents": torch.randn(1, 16, 16, generator=generator),
+                 "anchor_edit_weight": torch.rand(1, 16, 16, generator=generator)}
+    embeddings = {**_embeddings(), **anchoring}
+    canvas = ComplementaryCanvasConfig(enabled=True, isolate_conditions=True, isolation="group", cache_conditions=True,
+                                       text_as_condition=True)
+    trainer = _trainer(_tiny_dit(), canvas)
+    with patch("src.trainer.qwen_image_edit_trainer.tqdm", side_effect=lambda iterable, **_: iterable):
+        expected = trainer.sampling_from_embeddings(embeddings)
+    expected_canvas = dict(trainer._last_complementary_canvas)
+    trainer.scheduler = _EulerScheduler(torch.tensor([1.0, 0.7, 0.4, 0.0]))
+    sampler = FastCanvasSampler(trainer, FastCanvasOptions(batch_cfg=batch_cfg, cuda_graph=False))
+    sampler.install()
+    actual = trainer.sampling_from_embeddings(embeddings)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    record = dict(trainer._last_complementary_canvas)
+    assert record.pop("fast_sampler")["steps"] == 3
+    assert record.keys() == expected_canvas.keys() and record["text_cached"] and expected_canvas["text_cached"]
+    # The anchoring is live: without it R ends elsewhere.
+    trainer.scheduler = _EulerScheduler(torch.tensor([1.0, 0.7, 0.4, 0.0]))
+    plain = {key: value for key, value in embeddings.items() if key not in anchoring}
+    assert (trainer.sampling_from_embeddings(plain) - actual).abs().max() > 1e-2
+
+
 def test_sampler_rejects_paths_it_does_not_cover():
     trainer = _trainer(_tiny_dit(lora=False))
     sampler = FastCanvasSampler(trainer, FastCanvasOptions(cuda_graph=False))
     assert sampler.merged_layers == 0  # the default keeps LoRA unmerged
     with pytest.raises(NotImplementedError, match="true CFG"):
         sampler.prepare({**_embeddings(), "negative_prompt": [""], "reference_cfg_embeddings": None})
+    with pytest.raises(ValueError, match="whole schedule"):
+        sampler.prepare({**_embeddings(), "_sigma_handoff": {}})
     trainer.config.model.complementary_canvas = ComplementaryCanvasConfig(enabled=True)
     with pytest.raises(ValueError, match="isolate_conditions"):
         sampler.prepare(_embeddings())
@@ -457,6 +528,22 @@ def test_fused_path_and_fused_lora_match_the_model_in_bf16():
             for got, want in zip(actual, expected):
                 relative = (got.float() - want.float()).norm() / want.float().norm()
                 assert relative < 2e-2
+
+
+@pytest.mark.skipif(not CUDA, reason="needs CUDA (Triton)")
+def test_text_condition_fused_path_matches_the_model_in_bf16():
+    model, x = _cuda_model_and_inputs()
+    expected = _reference(model, x, shared=False, isolation="group", text=True)
+    fuse_qkv_(model)
+    with torch.inference_mode():
+        forward = _fast(model, x, FastCanvasOptions(cuda_graph=False), shared=False, isolation="group", text=True)
+        steps = {"t": torch.full((1,), 0.6, device="cuda")}
+        temb, image, text = forward.modulation_table([steps])
+        assert text is None
+        actual = forward.step(x.target, steps, (temb[0], image[0], None))
+        for got, want in zip(actual, expected):
+            relative = (got.float() - want.float()).norm() / want.float().norm()
+            assert relative < 2e-2
 
 
 @pytest.mark.skipif(not CUDA, reason="needs CUDA")

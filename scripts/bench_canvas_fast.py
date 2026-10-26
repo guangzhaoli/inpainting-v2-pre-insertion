@@ -237,12 +237,20 @@ def reference_check(trainer, embeddings, reference_calls, batch: int):
         prepared = helper.prepare(embeddings)
         plan, branches, passes = prepared["plan"], prepared["branches"], prepared["passes"]
         device, dtype = trainer._dit_device(), trainer.weight_dtype
-        cache = dit.build_condition_cache(passes[0].states.repeat(batch, 1, 1), branches[0].img_shapes * batch,
-                                          plan.image_token_index)
+
+        def build_cache(condition):  # the trainer's build_cache: the pass's isolation and its text condition
+            text = {}
+            if condition.text is not None:
+                prompt = branches[condition.text].prompt_embeds.to(device, dtype).repeat(batch, 1, 1)
+                text = {"encoder_hidden_states": prompt, "txt_seq_lens": [prompt.shape[1]] * batch}
+            return dit.build_condition_cache(condition.states.repeat(batch, 1, 1), condition.img_shapes * batch,
+                                             plan.image_token_index, isolation=condition.isolation, **text)
+
+        cache = build_cache(passes[0])
         caches = [cache]
         if len(branches) == 2:
-            caches.append(cache.select([0]) if len(passes) == 1 else dit.build_condition_cache(
-                passes[1].states.repeat(batch, 1, 1), branches[1].img_shapes * batch, plan.image_token_index))
+            caches.append(cache.select([0]) if len(passes) == 1 else build_cache(passes[1]))
+        text_condition = {"text_as_condition": True} if prepared["text_condition"] else {}
         geometry = prepared["mask_geometry_tokens"]
         geometry = None if geometry is None else geometry.repeat(batch, 1, 1)
         rows = {"positive": [], "null": [], "guided": []}
@@ -259,6 +267,7 @@ def reference_check(trainer, embeddings, reference_calls, batch: int):
                     img_shapes=branch.img_shapes * batch, txt_seq_lens=[prompt.shape[1]] * batch,
                     mask_geometry_tokens=geometry, image_token_index=plan.image_token_index,
                     condition_cache=branch_cache, output_token_count=call["x"].shape[1], return_dict=False,
+                    **text_condition,
                 )[0][:1])
             expected = [call["out"].to(device) for call in calls]
             rows["positive"].append(relative(outputs[0], expected[0]))

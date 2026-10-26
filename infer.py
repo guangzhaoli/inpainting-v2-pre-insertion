@@ -116,9 +116,30 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument("--skip-row", action="store_true", help="Do not save row preview and mask overlays.")
+    add_fast_canvas_sampler_cli_arg(parser)
     add_latent_anchoring_cli_args(parser)
     add_sigma_handoff_cli_args(parser)
     return record_sampling_overrides(parser.parse_args(argv), argv)
+
+
+def add_fast_canvas_sampler_cli_arg(parser) -> None:
+    parser.add_argument(
+        "--fast-canvas-sampler",
+        action="store_true",
+        help=(
+            "Sample the complementary canvas with src/inference/canvas_fast_sampler.py: the cached path's math "
+            "with packed CFG branches, key buffers, fused kernels and a CUDA graph. Needs a CUDA DiT."
+        ),
+    )
+
+
+def install_fast_canvas_sampler(trainer, args) -> None:
+    """Route the loaded trainer's canvas sampling to the fast sampler when --fast-canvas-sampler is set."""
+
+    if getattr(args, "fast_canvas_sampler", False):
+        from src.inference.canvas_fast_sampler import FastCanvasSampler
+
+        FastCanvasSampler(trainer).install()
 
 
 def record_sampling_overrides(args, argv=None):
@@ -477,6 +498,8 @@ def main():
     anchoring_metadata = latent_anchoring_metadata(latent_anchoring_config)
     anchoring_is_enabled = bool(anchoring_metadata["enabled"])
     canvas_is_enabled = complementary_canvas_enabled(config)
+    if getattr(args, "fast_canvas_sampler", False) and not canvas_is_enabled:
+        raise ValueError("--fast-canvas-sampler needs model.complementary_canvas.enabled")
     # Both keep the source latent outside the edit region, so the raw output is primary.
     latent_preserving = anchoring_is_enabled or canvas_is_enabled
     lora_path = args.lora
@@ -588,6 +611,7 @@ def main():
 
     trainer = QwenImageEditInsertAnythingTrainer(config)
     trainer.setup_predict()
+    install_fast_canvas_sampler(trainer, args)
     guidance_embeds_enabled = resolve_guidance_embeds_enabled(config, trainer)
     seed_everything(args.seed)
     result = trainer.predict(**predict_kwargs)

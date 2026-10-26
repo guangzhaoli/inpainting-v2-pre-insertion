@@ -12,7 +12,9 @@ import torch
 from PIL import Image
 
 from infer import (
+    add_fast_canvas_sampler_cli_arg,
     apply_flow_map_defaults,
+    install_fast_canvas_sampler,
     record_sampling_overrides,
     load_rgb_image,
     resolve_lora_path,
@@ -165,6 +167,7 @@ def parse_args(argv=None):
         action="store_true",
         help="Skip samples whose sample_dir/output.png already exists; allow non-empty --output-dir.",
     )
+    add_fast_canvas_sampler_cli_arg(parser)
     add_latent_anchoring_cli_args(parser)
     add_sigma_handoff_cli_args(parser)
     return record_sampling_overrides(parser.parse_args(argv), argv)
@@ -849,6 +852,8 @@ def setup_trainer(args):
     apply_sigma_handoff_cli_overrides(config, args)
     validate_adaptive_crop_inference_args(config, args)
     validate_latent_anchoring_runtime(config, height=args.height, width=args.width)
+    if getattr(args, "fast_canvas_sampler", False) and not complementary_canvas_enabled(config):
+        raise ValueError("--fast-canvas-sampler needs model.complementary_canvas.enabled")
     resolved_lora_path = resolve_lora_path(args.lora)
     config.model.lora.pretrained_weight = str(resolved_lora_path)
 
@@ -867,6 +872,7 @@ def setup_trainer(args):
 
     trainer = QwenImageEditInsertAnythingTrainer(config)
     trainer.setup_predict()
+    install_fast_canvas_sampler(trainer, args)
     return trainer, config, resolved_lora_path, checkpoint_compatibility
 
 

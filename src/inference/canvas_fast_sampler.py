@@ -41,7 +41,9 @@ technique is a switch of :class:`FastCanvasOptions`:
 The per-step query group is generic: a branch's queries are its text tokens plus the image query
 segments (:class:`QuerySegment`), each with its own grid positions (RoPE, mask-geometry tokens)
 and timestep. Today there is one segment, the core edit region R; a ring band is one more
-segment with its own positions and, if its noise level differs, its own timestep.
+segment with its own positions and, if its noise level differs, its own timestep. A text
+condition (``text_as_condition``) has no step queries: it runs once with its branch's condition
+pass (t=0, attending to itself and that pass's images) and the steps attend to its cached K/V.
 """
 
 from __future__ import annotations
@@ -127,7 +129,8 @@ class ConditionPass:
     """One isolated condition stream (``build_condition_cache`` inputs) and the ids of its images.
 
     ``isolation``: ``"image"`` (each image attends to itself) or ``"group"`` (the stream's images
-    attend to each other).
+    attend to each other). ``text``: the branch whose prompt is a text condition run with this
+    stream (its queries attend to its own keys and the stream's images), or None.
     """
 
     states: torch.Tensor  # [1, sum(lengths), C] packed condition latents
@@ -135,6 +138,7 @@ class ConditionPass:
     image_token_index: tuple
     ids: Tuple[int, ...]
     isolation: str = "image"
+    text: Optional[int] = None
 
 
 # --------------------------------------------------------------------------------------------
@@ -308,8 +312,11 @@ class KeyLayout:
 
     Branch 0 attends ``[text_0, q_0, own_0, shared]``, branch 1 ``[shared, own_1, q_1, text_1]``:
     two contiguous ranges that overlap on the conditions both branches see (the masked source),
-    so those are stored once. With one branch: ``[text_0|q_0 | conditions]``.
-    ``parts`` are ``(kind, key, start, length)`` with kind ``"step"`` (key = branch) or ``"image"``.
+    so those are stored once. With one branch: ``[text_0|q_0 | conditions]``. A text condition is a
+    part of its own between its branch's step rows and images, ``[q_0 | text_0 | own_0 | shared |
+    own_1 | text_1 | q_1]``, contiguous with the images its condition pass attends.
+    ``parts`` are ``(kind, key, start, length)`` with kind ``"step"`` or ``"text"`` (key = branch) or
+    ``"image"``.
     """
 
     parts: Tuple[Tuple[str, int, int, int], ...]
@@ -327,9 +334,11 @@ class KeyLayout:
         raise KeyError((kind, key))
 
     @classmethod
-    def build(cls, step_lengths: Sequence[int], conditions: Sequence[Sequence[int]], image_lengths: Mapping[int, int]):
+    def build(cls, step_lengths: Sequence[int], conditions: Sequence[Sequence[int]], image_lengths: Mapping[int, int],
+              text_lengths: Optional[Sequence[int]] = None):
+        texts = [[("text", branch)] if text_lengths is not None else [] for branch in range(len(conditions))]
         if len(conditions) == 1:
-            order = [("step", 0)] + [("image", image) for image in conditions[0]]
+            order = [("step", 0)] + texts[0] + [("image", image) for image in conditions[0]]
             spans = [(0, len(order))]
         elif len(conditions) == 2:
             shared = [image for image in conditions[0] if image in conditions[1]]
@@ -337,14 +346,16 @@ class KeyLayout:
                 raise ValueError("shared condition images must keep one order in both branches")
             own = [[image for image in images if image not in shared] for images in conditions]
             images = [("image", image) for image in own[0] + shared + own[1]]
-            order = [("step", 0)] + images + [("step", 1)]
-            first_1 = 1 + len(own[0]) if (shared or own[1]) else len(order) - 1
-            spans = [(0, 1 + len(own[0]) + len(shared)), (first_1, len(order))]
+            order = [("step", 0)] + texts[0] + images + texts[1] + [("step", 1)]
+            head = 1 + len(texts[0]) + len(own[0])
+            first_1 = head if (shared or own[1]) else len(order) - 1 - len(texts[1])
+            spans = [(0, head + len(shared)), (first_1, len(order))]
         else:
             raise NotImplementedError("the shared key layout holds one or two branches")
+        lengths = {"step": step_lengths, "text": text_lengths, "image": image_lengths}
         parts, row = [], 0
         for kind, key in order:
-            length = step_lengths[key] if kind == "step" else image_lengths[key]
+            length = lengths[kind][key]
             parts.append((kind, key, row, length))
             row += length
         branch_keys = tuple((parts[a][2], parts[b - 1][2] + parts[b - 1][3] - parts[a][2]) for a, b in spans)
@@ -403,7 +414,8 @@ class _Attention:
 @dataclass(frozen=True)
 class _Group:
     """Branches evaluated in one forward. Packed query order: one branch ``[text_0 | q_0]`` or
-    ``[q_1 | text_1]`` (the order of its step rows in the layout), two ``[text_0 | q_0 | q_1 | text_1]``."""
+    ``[q_1 | text_1]`` (the order of its step rows in the layout), two ``[text_0 | q_0 | q_1 | text_1]``;
+    a text condition has no text queries (empty text rows)."""
 
     branches: Tuple[int, ...]
     text_rows: Tuple[Tuple[int, int], ...]  # per branch, in the packed query
@@ -421,9 +433,10 @@ class CanvasStepForward:
     """The isolated-condition DiT forward of a fixed set of query tokens and CFG branches.
 
     Construction runs the condition passes once (every condition image through every block at t=0,
-    self-attention only, as ``build_condition_cache``) and keeps their per-block K/V; :meth:`step`
-    then runs only the per-step tokens of every branch. A step's ``latents`` are the image query
-    segments packed in order, ``[1, sum(len), C]``; it returns one prediction per branch.
+    self-attention only, and a text condition over itself and its pass's images, as
+    ``build_condition_cache``) and keeps their per-block K/V; :meth:`step` then runs only the
+    per-step tokens of every branch. A step's ``latents`` are the image query segments packed in
+    order, ``[1, sum(len), C]``; it returns one prediction per branch.
     """
 
     def __init__(
@@ -481,8 +494,17 @@ class CanvasStepForward:
                 if len(counts) - 1 != len(condition.ids):
                     raise ValueError(f"condition pass has {len(counts) - 1} images, ids {condition.ids}")
                 image_lengths.update(zip(condition.ids, counts[1:]))
-            steps = [length + self.query_count for length in self.text_lengths]
-            self.layout = KeyLayout.build(steps, [branch.conditions for branch in self.branches], image_lengths)
+            texts = [condition for condition in passes if condition.text is not None]
+            self.text_condition = bool(texts)
+            if texts and (sorted(condition.text for condition in texts) != list(range(len(self.branches))) or any(
+                    condition.ids != self.branches[condition.text].conditions for condition in texts)):
+                raise ValueError("a text condition runs with one condition pass per branch, holding that branch's images")
+            if self.text_condition:  # the text K/V are cached with the conditions
+                steps = [self.query_count] * len(self.branches)
+            else:
+                steps = [length + self.query_count for length in self.text_lengths]
+            self.layout = KeyLayout.build(steps, [branch.conditions for branch in self.branches], image_lengths,
+                                          self.text_lengths if self.text_condition else None)
             start_time = time.perf_counter()
             self._condition_pass(passes)
             if device.type == "cuda":
@@ -494,8 +516,8 @@ class CanvasStepForward:
 
     def _condition_pass(self, passes: Sequence[ConditionPass]):
         """Every condition stream once through every block (``build_condition_cache``: t=0
-        modulation, attention only within each image or group), its post-RoPE K/V written into
-        the key buffers (or kept per image)."""
+        modulation, attention only within each image or group, a text condition over itself and
+        the stream's images), its post-RoPE K/V written into the key buffers (or kept per part)."""
 
         dit, heads, head_dim = self.dit, self.heads, self.head_dim
         layers = len(dit.transformer_blocks)
@@ -528,9 +550,12 @@ class CanvasStepForward:
             freqs, _ = dit.pos_embed(condition.img_shapes, [0], device=self.device,
                                      token_index=condition.image_token_index)
             freqs = freqs[counts[0] :]
+            text = None if condition.text is None else self._text_condition(condition.text, slots, lengths)
             if self.options.fused_kernels:
-                self._condition_pass_fused(hidden, temb, freqs, lengths, slots, attention)
+                self._condition_pass_fused(hidden, temb, freqs, lengths, slots, attention, text)
                 continue
+            txt = None if text is None else text["hidden"]
+            last = len(dit.transformer_blocks) - 1
             for layer, block in enumerate(dit.transformer_blocks):
                 attn = block.attn
                 img_mod1, img_mod2 = block.img_mod(temb)[-1:].chunk(2, dim=-1)
@@ -547,7 +572,25 @@ class CanvasStepForward:
                 else:
                     keys, values = key[0], value[0].contiguous()
                     for image, offset, length in zip(condition.ids, offsets, lengths):
-                        self.condition_kv[layer][image] = (keys[offset : offset + length], values[offset : offset + length])
+                        self.condition_kv[layer][("image", image)] = (keys[offset : offset + length],
+                                                                      values[offset : offset + length])
+                if txt is not None:
+                    # the text stream at t=0 (the condition row), as forward_conditions
+                    txt_mod1, txt_mod2 = block.txt_mod(temb[-1:]).chunk(2, dim=-1)
+                    txt_modulated, txt_gate1 = _modulate(block.txt_norm1(txt), txt_mod1)
+                    txt_q, txt_k, txt_v = _qkv(txt_modulated, attn, 1, self.options.fuse_qkv).unflatten(
+                        -1, (3 * heads, head_dim)).chunk(3, 2)
+                    txt_q = apply_rotary_emb_qwen(attn.norm_added_q(txt_q), text["freqs"], use_real=False)
+                    txt_k = apply_rotary_emb_qwen(attn.norm_added_k(txt_k), text["freqs"], use_real=False)
+                    if self.options.kv_buffer:
+                        start, length = text["rows"]
+                        keys[start : start + length] = txt_k[0]
+                        values[start : start + length] = txt_v[0]
+                        txt_keys, txt_values = keys, values
+                    else:
+                        self.condition_kv[layer][("text", condition.text)] = (txt_k[0], txt_v[0].contiguous())
+                        txt_keys, txt_values = torch.cat([txt_k[0], keys]), torch.cat([txt_v[0], values])
+                    txt_attn = attn.to_add_out(text["attention"](txt_q[0], txt_keys, txt_values).flatten(1, 2)[None])
                 out = attention(query[0], keys, values).flatten(1, 2)[None]
                 out = attn.to_out[0](out)
                 if len(attn.to_out) > 1:
@@ -555,8 +598,29 @@ class CanvasStepForward:
                 hidden = hidden + gate1 * out
                 modulated2, gate2 = _modulate(block.img_norm2(hidden), img_mod2)
                 hidden = hidden + gate2 * block.img_mlp(modulated2)
+                if txt is not None and layer != last:  # the last block's text output has no consumer
+                    txt = txt + txt_gate1 * txt_attn
+                    txt_modulated2, txt_gate2 = _modulate(block.txt_norm2(txt), txt_mod2)
+                    txt = txt + txt_gate2 * block.txt_mlp(txt_modulated2)
 
-    def _condition_pass_fused(self, hidden, temb, freqs, lengths, slots, attention):
+    def _text_condition(self, branch: int, slots: Sequence[int], lengths: Sequence[int]) -> dict:
+        """A branch's text condition in its condition pass: its hidden states, RoPE, key rows and the
+        attention of its queries over its own keys and the pass's images (without key buffers, over
+        ``[text | images]`` concatenated per block)."""
+
+        length, count = self.text_lengths[branch], sum(lengths)
+        rows, keys = None, (0, length + count)
+        if self.options.kv_buffer:
+            start, first = self.layout.part("text", branch)[0], min(slots)
+            if max(slot + size for slot, size in zip(slots, lengths)) - first != count or first not in (
+                start + length, start - count
+            ):
+                raise ValueError("a text condition must be contiguous with its pass's images in the key rows")
+            rows, keys = (start, length), (min(start, first), length + count)
+        return {"hidden": self.text_hidden[branch], "freqs": self.text_freqs[branch], "rows": rows,
+                "attention": _Attention([(0, length, *keys)], self.device, self.head_dim ** -0.5, self.options.attention)}
+
+    def _condition_pass_fused(self, hidden, temb, freqs, lengths, slots, attention, text=None):
         heads, head_dim = self.heads, self.head_dim
         hidden = hidden[0]
         rows = hidden.shape[0]
@@ -565,6 +629,13 @@ class CanvasStepForward:
         k_rows = torch.cat([torch.arange(slot, slot + length, device=self.device, dtype=torch.int32)
                             for slot, length in zip(slots, lengths)])
         cos, sin = freqs.real.float().contiguous(), freqs.imag.float().contiguous()
+        if text is not None:
+            txt, (start, length) = text["hidden"][0], text["rows"]
+            txt_query = torch.empty(length, heads, head_dim, device=self.device, dtype=self.dtype)
+            txt_q_rows = torch.arange(length, device=self.device, dtype=torch.int32)
+            txt_k_rows = torch.arange(start, start + length, device=self.device, dtype=torch.int32)
+            txt_cos, txt_sin = text["freqs"].real.float().contiguous(), text["freqs"].imag.float().contiguous()
+        last = len(self.dit.transformer_blocks) - 1
         for layer, block in enumerate(self.dit.transformer_blocks):
             attn = block.attn
             (shift1, scale1, gate1), (shift2, scale2, gate2) = (
@@ -574,12 +645,25 @@ class CanvasStepForward:
             keys, values = self.key_buffer[layer], self.value_buffer[layer]
             fused_ops.qk_norm_rope_scatter(qkv, attn.norm_q.weight, attn.norm_k.weight, cos, sin, attn.norm_q.eps,
                                            heads, q_rows, k_rows, query, keys, values)
+            if text is not None:
+                (txt_shift1, txt_scale1, txt_gate1), (txt_shift2, txt_scale2, txt_gate2) = (
+                    part.chunk(3, dim=-1) for part in block.txt_mod(temb[-1:])[0].chunk(2, dim=-1))
+                txt_modulated = fused_ops.ln_modulate(txt, txt_shift1, txt_scale1, block.txt_norm1.eps)
+                fused_ops.qk_norm_rope_scatter(self._fused_qkv(txt_modulated, attn, 1), attn.norm_added_q.weight,
+                                               attn.norm_added_k.weight, txt_cos, txt_sin, attn.norm_added_q.eps, heads,
+                                               txt_q_rows, txt_k_rows, txt_query, keys, values)
+                txt_attn = self._project(text["attention"](txt_query, keys, values).flatten(1, 2), attn.to_add_out)
             out = self._project(attention(query, keys, values).flatten(1, 2), attn.to_out[0])
             if len(attn.to_out) > 1:
                 out = attn.to_out[1](out)
             hidden = fused_ops.gate_residual(hidden, out, gate1)
             modulated2 = fused_ops.ln_modulate(hidden, shift2, scale2, block.img_norm2.eps)
             hidden = fused_ops.gate_residual(hidden, _feed_forward(modulated2, block.img_mlp, self.options.fused_lora), gate2)
+            if text is not None and layer != last:  # the last block's text output has no consumer
+                txt = fused_ops.gate_residual(txt, txt_attn, txt_gate1)
+                txt_modulated2 = fused_ops.ln_modulate(txt, txt_shift2, txt_scale2, block.txt_norm2.eps)
+                txt = fused_ops.gate_residual(
+                    txt, _feed_forward(txt_modulated2, block.txt_mlp, self.options.fused_lora), txt_gate2)
 
     def _fused_qkv(self, x, attn, stream: int):
         if self.options.fused_lora:
@@ -598,14 +682,16 @@ class CanvasStepForward:
     def _groups(self) -> List[_Group]:
         n, scale = self.query_count, self.head_dim ** -0.5
         layout = self.layout
+        # A text condition is cached with the conditions: a branch's step rows are its image queries.
+        text_lengths = [0] * len(self.branches) if self.text_condition else self.text_lengths
         if len(self.branches) == 2 and self.options.batch_cfg:
-            t0, t1 = self.text_lengths
+            t0, t1 = text_lengths
             members = [((0, 1),((0, t0), (t0 + 2 * n, t0 + 2 * n + t1)), (t0, t0 + 2 * n),
                         ((0, layout.part("step", 0)[0], t0 + n), (t0 + n, layout.part("step", 1)[0], n + t1)))]
             queries = [(0, t0 + n), (t0 + n, n + t1)]
         else:
             members, queries = [], []
-            for branch, length in enumerate(self.text_lengths):
+            for branch, length in enumerate(text_lengths):
                 text, img = ((0, length), (length, length + n)) if branch == 0 else ((n, n + length), (0, n))
                 members.append(((branch,), (text,), img, ((0, layout.part("step", branch)[0], length + n),)))
                 queries.append([(0, length + n)])
@@ -639,15 +725,17 @@ class CanvasStepForward:
         txt_q = [row for start, end in group.text_rows for row in range(start, end)]
         copies = len(group.branches)
         img_freqs = self.img_freqs if copies == 1 else self.img_freqs.repeat(copies, 1)
-        txt_freqs = torch.cat([self.text_freqs[branch] for branch in group.branches])
         query_rows = sum(length for _, length, _, _ in group.attention.sequences)
-        return {
+        state = {
             "query": torch.empty(query_rows, self.heads, self.head_dim, device=self.device, dtype=self.dtype),
             "img_q": rows(img_q), "img_k": rows([key_row(row) for row in img_q]),
-            "txt_q": rows(txt_q), "txt_k": rows([key_row(row) for row in txt_q]),
             "img_cos": img_freqs.real.float().contiguous(), "img_sin": img_freqs.imag.float().contiguous(),
-            "txt_cos": txt_freqs.real.float().contiguous(), "txt_sin": txt_freqs.imag.float().contiguous(),
         }
+        if txt_q:  # no text queries with a text condition
+            txt_freqs = torch.cat([self.text_freqs[branch] for branch in group.branches])
+            state.update(txt_q=rows(txt_q), txt_k=rows([key_row(row) for row in txt_q]),
+                         txt_cos=txt_freqs.real.float().contiguous(), txt_sin=txt_freqs.imag.float().contiguous())
+        return state
 
     def warm_attention(self):
         """One attention call per group at this sample's shapes, outside any graph capture (cuDNN
@@ -681,8 +769,8 @@ class CanvasStepForward:
                 parts_k.append(step_key[q_row : q_row + length])
                 parts_v.append(step_value[q_row : q_row + length])
             else:
-                parts_k.append(self.condition_kv[layer][key][0])
-                parts_v.append(self.condition_kv[layer][key][1])
+                parts_k.append(self.condition_kv[layer][(kind, key)][0])
+                parts_v.append(self.condition_kv[layer][(kind, key)][1])
         return torch.cat(parts_k), torch.cat(parts_v)
 
     # ---- one step ---------------------------------------------------------------------------
@@ -694,7 +782,8 @@ class CanvasStepForward:
     def modulation_table(self, steps: Sequence[Mapping[str, torch.Tensor]]):
         """The t-only part of the forward for many steps at once: ``temb`` [S, R, D] and every block's
         image / text modulation rows [S, blocks, R, 6D] / [S, blocks, 1, 6D] (one GEMM per block and
-        stream; the per-step forward computes the same rows with a GEMV per step)."""
+        stream; the per-step forward computes the same rows with a GEMV per step). No text rows (None)
+        with a text condition: it is modulated at t=0 in the condition pass."""
 
         dit = self.dit
         rows = torch.stack([self._timestep_rows(timesteps) for timesteps in steps])  # [S, R]
@@ -702,8 +791,8 @@ class CanvasStepForward:
         temb = dit.time_text_embed(rows.flatten(), self.text_hidden[0]).view(count, width, -1)
         image = torch.stack([block.img_mod(temb.flatten(0, 1)).view(count, width, -1)
                              for block in dit.transformer_blocks], dim=1)
-        text = torch.stack([block.txt_mod(temb[:, :1].flatten(0, 1)).view(count, 1, -1)
-                            for block in dit.transformer_blocks], dim=1)
+        text = None if self.text_condition else torch.stack(
+            [block.txt_mod(temb[:, :1].flatten(0, 1)).view(count, 1, -1) for block in dit.transformer_blocks], dim=1)
         return temb, image, text
 
     def step(self, latents: torch.Tensor, timesteps: Mapping[str, torch.Tensor], modulation=None) -> List[torch.Tensor]:
@@ -725,7 +814,7 @@ class CanvasStepForward:
         for position, group in enumerate(self.groups):
             copies = len(group.branches)
             img = image if copies == 1 else image.repeat(1, copies, 1)
-            txt = torch.cat([self.text_hidden[branch] for branch in group.branches], dim=1)
+            txt = None if self.text_condition else torch.cat([self.text_hidden[branch] for branch in group.branches], dim=1)
             mods = None if modulation is None else modulation[1:]
             if self.fused_state is not None:
                 img = self._blocks_fused(group, self.fused_state[position], img, txt, temb, mods)
@@ -768,8 +857,11 @@ class CanvasStepForward:
         return residual + torch.cat([gate * values[:, start:end] for start, end, gate in gates], dim=1)
 
     def _pack(self, text, image, group: _Group):
-        """``[1, M, H, Dh]`` text and image parts -> ``[S, H, Dh]`` in the packed query order."""
+        """``[1, M, H, Dh]`` text and image parts -> ``[S, H, Dh]`` in the packed query order (``text``
+        None: a text condition, no text rows)."""
 
+        if text is None:
+            return image[0]
         text, image = text[0], image[0]
         if len(group.branches) == 2:
             split = self.text_lengths[group.branches[0]]
@@ -781,26 +873,27 @@ class CanvasStepForward:
         fused = self.options.fuse_qkv
         copies = len(group.branches)
         img_freqs = self.img_freqs if copies == 1 else self.img_freqs.repeat(copies, 1)
-        txt_freqs = torch.cat([self.text_freqs[branch] for branch in group.branches])
+        txt_freqs = None if txt is None else torch.cat([self.text_freqs[branch] for branch in group.branches])
         img_start, img_end = group.img_rows
         last = len(dit.transformer_blocks) - 1
         for index, block in enumerate(dit.transformer_blocks):
             attn = block.attn
             if modulation is None:
                 img_mod1, img_mod2 = block.img_mod(temb).chunk(2, dim=-1)
-                txt_mod1, txt_mod2 = block.txt_mod(temb[:1]).chunk(2, dim=-1)
             else:
                 img_mod1, img_mod2 = modulation[0][index].chunk(2, dim=-1)
-                txt_mod1, txt_mod2 = modulation[1][index].chunk(2, dim=-1)
             img_modulated, img_gate1 = self._modulate_image(block.img_norm1(img), img_mod1)
-            txt_modulated, txt_gate1 = _modulate(block.txt_norm1(txt), txt_mod1)
-
             img_q, img_k, img_v = _qkv(img_modulated, attn, 0, fused).unflatten(-1, (3 * heads, head_dim)).chunk(3, 2)
-            txt_q, txt_k, txt_v = _qkv(txt_modulated, attn, 1, fused).unflatten(-1, (3 * heads, head_dim)).chunk(3, 2)
             img_q = apply_rotary_emb_qwen(attn.norm_q(img_q), img_freqs, use_real=False)
             img_k = apply_rotary_emb_qwen(attn.norm_k(img_k), img_freqs, use_real=False)
-            txt_q = apply_rotary_emb_qwen(attn.norm_added_q(txt_q), txt_freqs, use_real=False)
-            txt_k = apply_rotary_emb_qwen(attn.norm_added_k(txt_k), txt_freqs, use_real=False)
+            txt_q = txt_k = txt_v = None  # a text condition has no text stream: its K/V are cached
+            if txt is not None:
+                txt_mod1, txt_mod2 = (block.txt_mod(temb[:1]) if modulation is None else modulation[1][index]).chunk(
+                    2, dim=-1)
+                txt_modulated, txt_gate1 = _modulate(block.txt_norm1(txt), txt_mod1)
+                txt_q, txt_k, txt_v = _qkv(txt_modulated, attn, 1, fused).unflatten(-1, (3 * heads, head_dim)).chunk(3, 2)
+                txt_q = apply_rotary_emb_qwen(attn.norm_added_q(txt_q), txt_freqs, use_real=False)
+                txt_k = apply_rotary_emb_qwen(attn.norm_added_k(txt_k), txt_freqs, use_real=False)
 
             keys, values = self._keys(index, self._pack(txt_k, img_k, group), self._pack(txt_v, img_v, group), group)
             joint = group.attention(self._pack(txt_q, img_q, group), keys, values).flatten(1, 2)[None]
@@ -808,13 +901,14 @@ class CanvasStepForward:
             img_attn = attn.to_out[0](joint[:, img_start:img_end])
             if len(attn.to_out) > 1:
                 img_attn = attn.to_out[1](img_attn)
-            text_parts = [joint[:, start:end] for start, end in group.text_rows]
-            txt_attn = attn.to_add_out(text_parts[0] if len(text_parts) == 1 else torch.cat(text_parts, dim=1))
+            if txt is not None:
+                text_parts = [joint[:, start:end] for start, end in group.text_rows]
+                txt_attn = attn.to_add_out(text_parts[0] if len(text_parts) == 1 else torch.cat(text_parts, dim=1))
 
             img = self._gated(img, img_attn, img_gate1)
             img_modulated2, img_gate2 = self._modulate_image(block.img_norm2(img), img_mod2)
             img = self._gated(img, block.img_mlp(img_modulated2), img_gate2)
-            if index != last:  # the last block's text output has no consumer
+            if txt is not None and index != last:  # the last block's text output has no consumer
                 txt = txt + txt_gate1 * txt_attn
                 txt_modulated2, txt_gate2 = _modulate(block.txt_norm2(txt), txt_mod2)
                 txt = txt + txt_gate2 * block.txt_mlp(txt_modulated2)
@@ -829,7 +923,7 @@ class CanvasStepForward:
 
     def _blocks_fused(self, group: _Group, state: dict, img, txt, temb, modulation=None):
         dit, heads = self.dit, self.heads
-        img, txt = img[0], txt[0]
+        img, txt = img[0], None if txt is None else txt[0]
         runs = self._image_runs(img.shape[0])
         query = state["query"]
         img_start, img_end = group.img_rows
@@ -858,20 +952,20 @@ class CanvasStepForward:
             attn = block.attn
             if modulation is None:
                 img_mod1, img_mod2 = block.img_mod(temb).chunk(2, dim=-1)
-                txt_mod1, txt_mod2 = block.txt_mod(temb[:1]).chunk(2, dim=-1)
             else:
                 img_mod1, img_mod2 = modulation[0][index].chunk(2, dim=-1)
-                txt_mod1, txt_mod2 = modulation[1][index].chunk(2, dim=-1)
-            (txt_shift1, txt_scale1, txt_gate1), (txt_shift2, txt_scale2, txt_gate2) = (
-                txt_mod1[0].chunk(3), txt_mod2[0].chunk(3))
             img_modulated = image_modulate(img, img_mod1, block.img_norm1.eps)
-            txt_modulated = fused_ops.ln_modulate(txt, txt_shift1, txt_scale1, block.txt_norm1.eps)
+            streams = [(0, img_modulated, (attn.norm_q, attn.norm_k), "img")]
+            if txt is not None:  # a text condition has no text stream: its K/V are cached
+                txt_mod1, txt_mod2 = (block.txt_mod(temb[:1]) if modulation is None else modulation[1][index]).chunk(
+                    2, dim=-1)
+                (txt_shift1, txt_scale1, txt_gate1), (txt_shift2, txt_scale2, txt_gate2) = (
+                    txt_mod1[0].chunk(3), txt_mod2[0].chunk(3))
+                txt_modulated = fused_ops.ln_modulate(txt, txt_shift1, txt_scale1, block.txt_norm1.eps)
+                streams.append((1, txt_modulated, (attn.norm_added_q, attn.norm_added_k), "txt"))
 
             keys, values = self.key_buffer[index], self.value_buffer[index]
-            for stream, modulated, norms, prefix in (
-                (0, img_modulated, (attn.norm_q, attn.norm_k), "img"),
-                (1, txt_modulated, (attn.norm_added_q, attn.norm_added_k), "txt"),
-            ):
+            for stream, modulated, norms, prefix in streams:
                 qkv = self._fused_qkv(modulated, attn, stream)
                 fused_ops.qk_norm_rope_scatter(
                     qkv, norms[0].weight, norms[1].weight, state[f"{prefix}_cos"], state[f"{prefix}_sin"],
@@ -882,14 +976,15 @@ class CanvasStepForward:
             img_attn = self._project(joint[img_start:img_end], attn.to_out[0])
             if len(attn.to_out) > 1:
                 img_attn = attn.to_out[1](img_attn)
-            text_parts = [joint[start:end] for start, end in group.text_rows]
-            txt_attn = self._project(text_parts[0] if len(text_parts) == 1 else torch.cat(text_parts), attn.to_add_out)
+            if txt is not None:
+                text_parts = [joint[start:end] for start, end in group.text_rows]
+                txt_attn = self._project(text_parts[0] if len(text_parts) == 1 else torch.cat(text_parts), attn.to_add_out)
 
             fused_lora = self.options.fused_lora
             img = image_gate(img, img_attn, img_mod1)
             img = image_gate(img, _feed_forward(image_modulate(img, img_mod2, block.img_norm2.eps), block.img_mlp, fused_lora),
                              img_mod2)
-            if index != last:  # the last block's text output has no consumer
+            if txt is not None and index != last:  # the last block's text output has no consumer
                 txt = fused_ops.gate_residual(txt, txt_attn, txt_gate1)
                 txt_modulated2 = fused_ops.ln_modulate(txt, txt_shift2, txt_scale2, block.txt_norm2.eps)
                 txt = fused_ops.gate_residual(txt, _feed_forward(txt_modulated2, block.txt_mlp, fused_lora), txt_gate2)
@@ -939,10 +1034,11 @@ class _GraphedStep:
 class FastCanvasSampler:
     """Drop-in for the trainer's cached canvas sampling (``sampling_from_embeddings``).
 
-    Covers the B2 predict path: complementary canvas with isolated conditions, zero_cond_t,
-    reference CFG (or none), no text true CFG, no latent anchoring, batch size 1, the whole
-    schedule from noise. Construction merges/fuses the DiT weights in place when asked (the
-    model's own forward stays valid). ``install()`` routes the trainer's
+    Covers the canvas predict path with isolated conditions: zero_cond_t, reference CFG (or none),
+    the text in the step or as a condition (``text_as_condition``), latent anchoring inside R (the
+    trainer's post-step blend to the source trajectory), no text true CFG, no ring, batch size 1,
+    the whole schedule from noise. Construction merges/fuses the DiT weights in place when asked
+    (the model's own forward stays valid). ``install()`` routes the trainer's
     ``sampling_from_embeddings`` here.
     """
 
@@ -972,22 +1068,28 @@ class FastCanvasSampler:
     @torch.inference_mode()
     def prepare(self, embeddings: dict) -> dict:
         """The trainer loop's set-up for the canvas + cache path: initial noise (same RNG draw), plan,
-        condition streams, schedule, CFG inputs."""
+        condition streams, schedule, CFG inputs, latent anchoring inside R."""
 
         trainer, dit = self.trainer, self.dit
         canvas = trainer._complementary_canvas_cfg()
         if canvas is None or not canvas.isolate_conditions:
             raise ValueError("the fast canvas sampler needs model.complementary_canvas.isolate_conditions")
         # Later canvas variants: a ring is one more QuerySegment (own positions and timestep, its own
-        # schedule in the loop); a text condition is one more cached condition per branch.
-        unsupported = [name for name in ("ring_tokens", "text_as_condition", "anneal_steps") if getattr(canvas, name, 0)]
+        # schedule in the loop).
+        unsupported = [name for name in ("ring_tokens", "anneal_steps") if getattr(canvas, name, 0)]
         if unsupported:
             raise NotImplementedError(f"the fast canvas sampler does not cover {', '.join(unsupported)} yet")
         isolation = getattr(canvas, "isolation", "image")
+        text_condition = bool(getattr(canvas, "text_as_condition", False))
         if getattr(getattr(trainer.config.model, "flow_map", None), "enabled", False):
             raise ValueError("flow-map sampling has its own loop")
-        if embeddings.get("anchor_source_latents") is not None or embeddings.get("anchor_edit_weight") is not None:
-            raise ValueError("complementary canvas sampling runs without latent anchoring")
+        anchoring_settings = getattr(getattr(trainer.config, "predict", None), "latent_anchoring", None)
+        if embeddings.get("_sigma_handoff") is not None or getattr(anchoring_settings, "source_noise_start", None) is not None:
+            raise ValueError("the complementary canvas samples the whole schedule from noise (no σ hand-off or "
+                             "source_noise_start)")
+        anchor_source, anchor_weight = embeddings.get("anchor_source_latents"), embeddings.get("anchor_edit_weight")
+        if (anchor_source is None) != (anchor_weight is None):
+            raise ValueError("latent anchoring requires both anchor_source_latents and anchor_edit_weight")
         if embeddings["true_cfg_scale"] > 1 and embeddings.get("negative_prompt") is not None:
             raise NotImplementedError("text true CFG is not part of the fast canvas path")
         reference = embeddings.get("reference_cfg_embeddings")
@@ -1040,24 +1142,37 @@ class FastCanvasSampler:
         plan = trainer._canvas_plan(embeddings, img_shapes, device)
         if getattr(plan, "ring_count", 0):
             raise NotImplementedError("ring tokens: pass them as a QuerySegment with their positions and timestep")
+        anchoring = None
+        if anchor_source is not None:
+            # R's latent pixels outside M_free (and its soft transition) follow the source trajectory, as in a dense
+            # anchored run: the trainer's post-step blend on the R tokens, the full-grid draw as trajectory noise.
+            full = {"anchor_source_latents": anchor_source, "edit_weight": anchor_weight, "anchor_noise": latents}
+            if any(value.shape != latents.shape for value in full.values()):
+                raise ValueError("latent anchoring tensors must match the packed target latents")
+            anchoring = {name: gather_tokens(value.to(device=device, dtype=latents.dtype), plan.target_index)
+                         for name, value in full.items()}
         latents = gather_tokens(latents, plan.target_index)
         if reference_mask is not None:
             reference_mask = gather_tokens(reference_mask, plan.target_index)
         timesteps, _ = trainer.prepare_predict_timesteps(embeddings["num_inference_steps"], image_seq_len)
+        if anchoring is not None and abs(float(trainer.scheduler.sigmas[0]) - 1.0) > 1e-6:
+            raise ValueError("latent anchoring requires full-noise initialization (first scheduler sigma = 1)")
 
         conditions = [trainer._complementary_canvas_conditions(branch[3], plan) for branch in branches]
         ids = tuple(range(len(img_shapes[0]) - 1))
-        passes = [ConditionPass(conditions[0], img_shapes, plan.image_token_index, ids, isolation)]
+        passes = [ConditionPass(conditions[0], img_shapes, plan.image_token_index, ids, isolation,
+                                0 if text_condition else None)]
         branch_ids = [ids]
         if do_reference_cfg:
             source_count = int(plan.source_index.numel())
-            if isolation == "image" and conditions[1].shape[1] == source_count and torch.equal(
+            if not text_condition and isolation == "image" and conditions[1].shape[1] == source_count and torch.equal(
                 conditions[1], conditions[0][:, :source_count]
             ):
                 branch_ids.append(ids[:1])  # per-image isolated source tokens never see the reference: shared
-            else:
+            else:  # a condition group or a text condition needs its own null pass
                 null_ids = tuple(range(len(ids), len(ids) + len(branches[1][2][0]) - 1))
-                passes.append(ConditionPass(conditions[1], branches[1][2], plan.image_token_index, null_ids, isolation))
+                passes.append(ConditionPass(conditions[1], branches[1][2], plan.image_token_index, null_ids, isolation,
+                                            1 if text_condition else None))
                 branch_ids.append(null_ids)
         return {
             "plan": plan, "latents": latents, "timesteps": timesteps, "passes": passes,
@@ -1067,6 +1182,7 @@ class FastCanvasSampler:
             "reference_scale": reference_scale, "do_reference_cfg": do_reference_cfg,
             "delta_clip": (bool(embeddings.get("reference_cfg_delta_clip_enabled", False)),
                            float(embeddings.get("reference_cfg_delta_clip_max_ratio", 0.5))),
+            "anchoring": anchoring, "text_condition": text_condition,
         }
 
     def build_forward(self, prepared: dict) -> CanvasStepForward:
@@ -1101,11 +1217,13 @@ class FastCanvasSampler:
         def inputs(latents, index):
             entry = {"latents": latents, "t": scaled[index]}
             if table is not None:
-                entry.update(temb=table[0][index], img_mod=table[1][index], txt_mod=table[2][index])
+                entry.update(temb=table[0][index], img_mod=table[1][index])
+                if table[2] is not None:  # no text rows with a text condition
+                    entry["txt_mod"] = table[2][index]
             return entry
 
         def run(entry):
-            modulation = None if table is None else (entry["temb"], entry["img_mod"], entry["txt_mod"])
+            modulation = None if table is None else (entry["temb"], entry["img_mod"], entry.get("txt_mod"))
             predictions = forward.step(entry["latents"], {"t": entry["t"]}, modulation)
             return predictions + [self.combine(prepared, predictions)]
 
@@ -1132,7 +1250,7 @@ class FastCanvasSampler:
         built = clock()
         step = self.step_function(prepared, forward)
         captured = clock()
-        latents, timesteps = prepared["latents"], prepared["timesteps"]
+        latents, timesteps, anchoring = prepared["latents"], prepared["timesteps"], prepared["anchoring"]
         trainer.scheduler.set_begin_index(0)
         trainer._num_timesteps = len(timesteps)
         for index, t in enumerate(timesteps):
@@ -1141,16 +1259,24 @@ class FastCanvasSampler:
             latents = trainer.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             if latents.dtype != latents_dtype:
                 latents = latents.to(latents_dtype)
+            if anchoring is not None:
+                latents = trainer._apply_post_step_latent_anchoring(
+                    generated_next=latents, timesteps=timesteps, step_index=index, **anchoring)
         done = clock()
-        plan = prepared["plan"]
-        trainer._last_complementary_canvas = {
-            "edit_tokens": int(plan.target_index.numel()),
-            "grid_tokens": int(plan.num_tokens),
-            "condition_cache_bytes": int(forward.condition_bytes),
-        }
+        plan, branches = prepared["plan"], prepared["branches"]
         self.last = {
             "setup_s": built - start, "condition_pass_s": forward.condition_pass_s, "capture_s": captured - built,
             "loop_s": done - captured, "steps": len(timesteps), "options": self.options.label,
+        }
+        trainer._last_complementary_canvas = {  # the trainer's keys, and this sampler's timing
+            "edit_tokens": int(plan.core_count),
+            "ring_tokens": int(plan.ring_count),
+            "grid_tokens": int(plan.num_tokens),
+            "text_tokens": int(branches[0].prompt_embeds.shape[1]),
+            "text_tokens_null": int(branches[1].prompt_embeds.shape[1]) if len(branches) == 2 else None,
+            "text_cached": prepared["text_condition"],
+            "condition_cache_bytes": int(forward.condition_bytes),
+            "fast_sampler": dict(self.last),
         }
         del step, forward
         return scatter_tokens(prepared["source_latents"], plan.target_index, latents)
