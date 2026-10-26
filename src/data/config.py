@@ -463,9 +463,9 @@ class ComplementaryCanvasConfig(BaseModel):
 
     The image stream is [x_t at R (frame 0), masked source outside R (frame 1),
     conditions...]; every token keeps its own grid RoPE coordinate. The final
-    latent is the generated R scattered into the source latent; latent anchoring
-    (expanded/expanded_soft, no ring) additionally pulls R's latent pixels outside
-    M_free back to the source trajectory. ``isolate_conditions`` keeps the condition images from
+    latent is the generated R scattered into the source latent; expanded or
+    expanded_soft anchoring (no ring) also pulls R's latent pixels outside
+    M_free to the source. ``isolate_conditions`` keeps the condition images from
     attending to the text and the target: with ``isolation=image`` each image
     attends only to itself, with ``isolation=group`` the conditions attend to
     each other. ``cache_conditions`` (inference only) then runs the conditions

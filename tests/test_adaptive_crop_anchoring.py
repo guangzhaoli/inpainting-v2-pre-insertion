@@ -571,6 +571,44 @@ class InferAdaptiveCropLatentAnchoringTest(unittest.TestCase):
                 for name in ("mask_core.png", "mask_free.png", "edit_weight.png"):
                     self.assertTrue((sample_dir / name).is_file())
 
+    def test_change_gated_paste_back_is_the_primary_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths, source, _ = self._write_sample(root)
+            trainer = FakePredictTrainer(
+                AdaptiveCropConfig(
+                    predict_enabled=True,
+                    trigger_bbox_area_ratio=0.10,
+                    min_crop_area_ratio=0.25,
+                    context_margin_ratio=0.20,
+                    mask_threshold=0.5,
+                ),
+                anchoring_mode="expanded_soft",
+            )
+            trainer.config.predict.latent_anchoring = LatentAnchoringConfig(
+                mode="expanded_soft", interaction_dilation_px=4, transition_width_px=4, paste_back="change_gated"
+            )
+            sample_dir = root / "result"
+            metadata, _ = run_sample(
+                trainer,
+                {"stem": "sample", **paths},
+                sample_dir,
+                self._args(root),
+                sample_seed=3,
+            )
+            with Image.open(sample_dir / "output.png") as output:
+                output_arr = np.asarray(output.convert("RGB"))
+            x1, y1, x2, y2 = metadata["adaptive_crop"]["plan"]["crop_box"]
+            scale = 0.5 * ((x2 - x1) / 64 + (y2 - y1) / 64)
+            ys, xs = np.mgrid[: source.height, : source.width]
+            to_core = np.hypot(
+                np.maximum(np.maximum(45 - xs, xs - 54), 0), np.maximum(np.maximum(35 - ys, ys - 44), 0)
+            )
+            # Green output inside M_core; beyond M_free (4 model px) and its 4 model px band, the red source.
+            self.assertTrue(np.all(output_arr[to_core == 0] == np.array([0, 255, 0])))
+            self.assertTrue(np.all(output_arr[to_core > 8 * scale + 2] == np.array([255, 0, 0])))
+            self.assertEqual(metadata["latent_anchoring"]["paste_back"], "change_gated")
+
     def test_noop_crop_plus_core_is_allowed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
