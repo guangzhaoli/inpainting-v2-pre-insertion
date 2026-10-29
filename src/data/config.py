@@ -1216,6 +1216,31 @@ class LightingAugmentationConfig(BaseModel):
         return self
 
 
+class ReferenceDownscaleConfig(BaseModel):
+    """Teach the model to add detail the reference does not have.
+
+    Teacher pairs are two frames of one video, so the reference subject is as
+    large as the target. At test time it often has to be enlarged, and output
+    texture and identity fall with the enlargement (refscale probe 20261029).
+    With probability ``prob`` the cut-out reference keeps 1/factor of the linear
+    resolution the model would otherwise see, factor log-uniform in
+    [factor_min, factor_max]. The target and the identity losses keep the
+    original.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool = False
+    prob: float = Field(default=0.5, ge=0, le=1)
+    factor_min: float = Field(default=1.0, ge=1)
+    factor_max: float = Field(default=3.0, ge=1)
+
+    @model_validator(mode="after")
+    def _check_factor_range(self):
+        if self.factor_max < self.factor_min:
+            raise ValueError("reference_downscale.factor_max must be >= factor_min")
+        return self
+
+
 class CategoryConditioningConfig(BaseModel):
     """Preserve domain-specific teacher augmentations in a joint OPD dataset."""
 
@@ -1237,6 +1262,7 @@ class DatasetInitArgs(BaseModel):
     adaptive_crop: AdaptiveCropConfig = Field(default_factory=AdaptiveCropConfig)
     hybrid_masking: HybridMaskingConfig = Field(default_factory=HybridMaskingConfig)
     lighting_augmentation: LightingAugmentationConfig = Field(default_factory=LightingAugmentationConfig)
+    reference_downscale: ReferenceDownscaleConfig = Field(default_factory=ReferenceDownscaleConfig)
     category_balanced_sampling: bool = False
     face_identity_supervision: bool = False
     category_conditioning: Dict[str, CategoryConditioningConfig] = Field(default_factory=dict)

@@ -179,6 +179,11 @@ data:
       reference:
         wb_mired_scale: 21.0
         tint_max: 0.015
+    reference_downscale:
+      enabled: true
+      prob: 0.5
+      factor_min: 1.0
+      factor_max: 3.0
   batch_size: 1
   num_workers: 8
   shuffle: true

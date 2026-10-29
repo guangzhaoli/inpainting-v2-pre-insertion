@@ -46,6 +46,18 @@ from src.utils.hybrid_masking import (
 )
 from src.utils.images import extract_foreground_from_image_and_mask
 
+
+def downscale_reference(image: np.ndarray, factor: float, model_pixels: int) -> np.ndarray:
+    """Keep 1/factor of the linear resolution the model would see, at the original size."""
+    height, width = image.shape[:2]
+    scale = min(1.0, math.sqrt(model_pixels / (height * width))) / factor
+    if scale >= 1.0:
+        return image
+    small = cv2.resize(
+        image, (max(1, round(width * scale)), max(1, round(height * scale))), interpolation=cv2.INTER_AREA
+    )
+    return cv2.resize(small, (width, height), interpolation=cv2.INTER_CUBIC)
+
 IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
 
@@ -628,6 +640,21 @@ class InsertAnythingDataset(Dataset):
                 clean_reference = cut_out(data["ref_image"], data["ref_mask"])
                 data["ref_mask"] = jitter_mask_edge(data["ref_mask"], lighting_rng)
         data["ref_image"], data["ref_mask"] = cut_out(data["ref_image"], data["ref_mask"])
+        # The reference downscale acts on the cut-out, so it is measured against
+        # the resolution the processor will hand the model.
+        downscale_cfg = self.data_config.reference_downscale
+        downscale_factor = None
+        if downscale_cfg.enabled:
+            downscale_rng = np.random.default_rng(int(torch.randint(0, 2**62, ()).item()))
+            if downscale_rng.random() < downscale_cfg.prob:
+                downscale_factor = math.exp(
+                    downscale_rng.uniform(math.log(downscale_cfg.factor_min), math.log(downscale_cfg.factor_max))
+                )
+                if clean_reference is None:
+                    clean_reference = (data["ref_image"], data["ref_mask"])
+                pixels = self.preprocessor.controls_pixels
+                model_pixels = pixels[0] if pixels else math.prod(self.preprocessor.controls_size[0])
+                data["ref_image"] = downscale_reference(data["ref_image"], downscale_factor, model_pixels)
 
         processed = self.preprocessor.preprocess(
             {
@@ -673,7 +700,9 @@ class InsertAnythingDataset(Dataset):
                 "guard_shrinks": placement.guard_shrinks,
                 "guard_exhausted": placement.guard_exhausted,
             }
-        if lighting is not None:
+        if downscale_cfg.enabled:
+            data["reference_downscale_factor"] = downscale_factor or 1.0
+        if lighting is not None or downscale_factor is not None:
             # Identity losses and face boxes keep the reference as photographed.
             if clean_reference is None:
                 data["ref_image_clean"], data["ref_mask_clean"] = data["ref_image"], data["ref_mask"]
