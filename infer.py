@@ -86,7 +86,8 @@ def parse_args(argv=None):
         "--true-cfg-scale",
         type=float,
         default=4.0,
-        help="Reference CFG scale when model.reference_cfg.enabled is true; otherwise native text true-CFG scale.",
+        help="Reference CFG scale when model.reference_cfg.enabled is true (default model.reference_cfg.scale); "
+        "otherwise native text true-CFG scale.",
     )
     parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42, help="Deterministic inference seed.")
@@ -148,6 +149,13 @@ def record_sampling_overrides(args, argv=None):
         setattr(args, "_" + name.replace("-", "_") + "_explicit",
                 any(token == "--" + name or token.startswith("--" + name + "=") for token in tokens))
     return args
+
+
+def apply_reference_cfg_defaults(config, args):
+    """Without --true-cfg-scale a reference-CFG model samples at model.reference_cfg.scale."""
+
+    if config.model.reference_cfg.enabled and not getattr(args, "_true_cfg_scale_explicit", True):
+        args.true_cfg_scale = float(config.model.reference_cfg.scale)
 
 
 def apply_flow_map_defaults(config, args):
@@ -482,6 +490,7 @@ def main():
     # validating a Student deployment config so moved/archived Teacher files
     # are not required for inference.
     config = load_config_from_yaml(str(args.config), for_inference=True)
+    apply_reference_cfg_defaults(config, args)
     apply_flow_map_defaults(config, args)
     if getattr(args, "device", None) is not None:
         from src.data.config import DeviceConfig

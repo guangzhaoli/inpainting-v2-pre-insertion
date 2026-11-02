@@ -34,6 +34,7 @@ class _FakeScheduler:
     def __init__(self):
         self.last_noise_pred = None
         self.begin_index = None
+        self.sigmas = torch.tensor([1.0, 0.0])
 
     def set_begin_index(self, index):
         self.begin_index = index

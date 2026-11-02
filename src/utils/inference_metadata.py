@@ -227,6 +227,8 @@ def build_effective_inference_metadata(
             "num_inference_steps": int(num_inference_steps),
             "text_true_cfg_scale": effective_text_true_cfg_scale,
             "reference_cfg_scale": effective_reference_cfg_scale,
+            "reference_cfg_sigma_min": float(config.model.reference_cfg.sigma_min) if reference_cfg_active else None,
+            "reference_cfg_apg_eta": float(config.model.reference_cfg.apg_eta) if reference_cfg_active else None,
             "guidance_scale": effective_guidance_scale,
             "height": effective_height,
             "width": effective_width,

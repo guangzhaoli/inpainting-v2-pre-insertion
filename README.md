@@ -99,6 +99,8 @@ Set `model.reference_cfg.mask_aware` to `true` to apply reference CFG only insid
 
 Set `model.reference_cfg.delta_clip_enabled` to `true` to clip the per-token reference delta before applying reference CFG. The clipping threshold is `delta_clip_max_ratio * norm(eps_BR)` for each latent token, where `eps_BR` is the positive reference-conditioned prediction. When enabled, this replaces the older full-prediction norm rescale used after CFG combination.
 
+By default reference CFG runs at `model.reference_cfg.scale: 3.0` (used when `--true-cfg-scale` is not given), only at schedule steps with `sigma >= sigma_min: 0.75` (the first 16 of 40 steps; `0` = every step), and with adaptive projected guidance `apg_eta: 0.0`: the part of the reference delta parallel to the conditional x0 prediction (inside the CFG mask) is removed, which drops most of the saturation/brightness shift and chroma blotches of plain CFG. `apg_eta: 1.0` restores plain CFG. These defaults won the 2026-10-29…11-01 sweeps (output/teacher_v2_runs/cfgsweep_20261029, cfgband_20261030, cfgapg_20261031).
+
 Set `model.mask_control.enabled` to `true` to attach the placement mask as an extra VAE-only RGB control (binary mask repeated to 3 channels). It does **not** force `true_cfg_scale` to 1, so it can be combined with `reference_cfg`. When reference CFG is active, both the positive and null-reference branches receive the placement mask; only the reference image is dropped on the null branch. Default `false` preserves previous checkpoints and inference.
 
 ## Training

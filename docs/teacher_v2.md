@@ -123,8 +123,11 @@ uv run --offline --no-sync python infer.py \
   --lora /absolute/path/to/v2/checkpoint \
   --src-image scene.png --src-mask placement.png \
   --ref-image reference.png --ref-mask reference_mask.png \
-  --num-inference-steps 40 --true-cfg-scale 2.5 --output result.png
+  --num-inference-steps 40 --output result.png
 ```
+
+Without `--true-cfg-scale` the reference CFG uses the config defaults: scale 3, only
+at σ ≥ 0.75 (the first 16 of 40 steps), with APG (η = 0); see the README.
 
 The configs use CPU device placeholders so preflight works on login/CPU nodes;
 training uses Accelerate's device, and inference requires `--device cuda:0`.

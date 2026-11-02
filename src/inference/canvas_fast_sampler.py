@@ -1182,6 +1182,8 @@ class FastCanvasSampler:
             "reference_scale": reference_scale, "do_reference_cfg": do_reference_cfg,
             "delta_clip": (bool(embeddings.get("reference_cfg_delta_clip_enabled", False)),
                            float(embeddings.get("reference_cfg_delta_clip_max_ratio", 0.5))),
+            "sigma_min": float(embeddings.get("reference_cfg_sigma_min", 0.0)),
+            "apg_eta": float(embeddings.get("reference_cfg_apg_eta", 1.0)),
             "anchoring": anchoring, "text_condition": text_condition,
         }
 
@@ -1254,7 +1256,20 @@ class FastCanvasSampler:
         trainer.scheduler.set_begin_index(0)
         trainer._num_timesteps = len(timesteps)
         for index, t in enumerate(timesteps):
-            noise_pred = step(latents, index)[-1]
+            outputs = step(latents, index)
+            sigma = float(trainer.scheduler.sigmas[index])
+            if not prepared["do_reference_cfg"] or sigma < prepared["sigma_min"]:
+                noise_pred = outputs[0]
+            elif prepared["apg_eta"] < 1.0:  # outside the graph: APG needs sigma and the current latents
+                clip, ratio = prepared["delta_clip"]
+                noise_pred = trainer._combine_reference_cfg_predictions(
+                    noise_pred=outputs[0], reference_cfg_noise_pred=outputs[1],
+                    reference_cfg_scale=prepared["reference_scale"], reference_cfg_mask=prepared["reference_mask"],
+                    delta_clip_enabled=clip, delta_clip_max_ratio=ratio, apg_eta=prepared["apg_eta"],
+                    latents=latents, sigma=sigma,
+                )
+            else:
+                noise_pred = outputs[-1]
             latents_dtype = latents.dtype
             latents = trainer.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
             if latents.dtype != latents_dtype:

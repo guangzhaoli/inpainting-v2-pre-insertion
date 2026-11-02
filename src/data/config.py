@@ -428,6 +428,11 @@ class MaskControlConfig(BaseModel):
 
 
 class ReferenceCFGConfig(BaseModel):
+    """Reference CFG. ``scale`` is the inference scale when ``--true-cfg-scale`` is not given. Guidance runs only at
+    schedule steps with ``sigma >= sigma_min`` (0 = every step). ``apg_eta < 1`` turns on adaptive projected
+    guidance: of the delta's component parallel to the conditional x0 prediction only ``apg_eta`` is kept
+    (1 = plain CFG). The defaults (3, 0.75, 0) won the 2026-10-29…11-01 cfgsweep / cfgband / cfgapg comparisons."""
+
     model_config = ConfigDict(extra="forbid")
     enabled: bool = False
     train_dropout_rate: float = 0.0
@@ -435,6 +440,9 @@ class ReferenceCFGConfig(BaseModel):
     mask_aware: bool = False
     delta_clip_enabled: bool = False
     delta_clip_max_ratio: float = 0.5
+    scale: float = Field(default=3.0, ge=1.0)
+    sigma_min: float = Field(default=0.75, ge=0.0, le=1.0)
+    apg_eta: float = Field(default=0.0, ge=0.0, le=1.0)
 
     @field_validator("train_dropout_rate")
     @classmethod

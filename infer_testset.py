@@ -14,6 +14,7 @@ from PIL import Image
 from infer import (
     add_fast_canvas_sampler_cli_arg,
     apply_flow_map_defaults,
+    apply_reference_cfg_defaults,
     install_fast_canvas_sampler,
     record_sampling_overrides,
     load_rgb_image,
@@ -142,7 +143,8 @@ def parse_args(argv=None):
     parser.add_argument("--prompt", type=str, default="")
     parser.add_argument("--negative-prompt", type=str, default=None)
     parser.add_argument("--num-inference-steps", type=int, default=40)
-    parser.add_argument("--true-cfg-scale", type=float, default=4.0)
+    parser.add_argument("--true-cfg-scale", type=float, default=4.0,
+                        help="Reference CFG scale when model.reference_cfg.enabled (default model.reference_cfg.scale).")
     parser.add_argument("--guidance-scale", type=float, default=1.0)
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
@@ -843,6 +845,7 @@ def setup_trainer(args):
         raise ValueError("--height and --width must be positive")
 
     config = load_config_from_yaml(str(args.config), for_inference=True)
+    apply_reference_cfg_defaults(config, args)
     apply_flow_map_defaults(config, args)
     if getattr(args, "device", None) is not None:
         from src.data.config import DeviceConfig

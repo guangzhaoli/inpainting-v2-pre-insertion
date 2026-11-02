@@ -152,7 +152,7 @@ def main():
         val_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n")
         cfg["logging"].update(output_dir="logs/teacher_v2", tracker_project_name=f"insertfuse_teacher_v2_{domain}")
         cfg["logging"]["sampling"].update(enable=True, validation_steps=1000, num_samples=min(16, len(rows)),
-                                          fixed_seed_across_steps=True, true_cfg_scale=2.5,
+                                          fixed_seed_across_steps=True, true_cfg_scale=3.0,
                                           validation_data=str(val_path))
         cfg["resume"] = None
         (DEST / f"{domain}.yaml").write_text(

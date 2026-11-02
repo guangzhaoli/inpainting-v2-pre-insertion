@@ -1286,6 +1286,8 @@ class QwenImageEditInsertAnythingTrainer(QwenImageEditPlusTrainer):
             parent_batch["reference_cfg_delta_clip_max_ratio"] = float(
                 policy_cfg.get("delta_clip_max_ratio", reference_cfg_cfg.delta_clip_max_ratio)
             )
+            parent_batch["reference_cfg_sigma_min"] = float(reference_cfg_cfg.sigma_min)
+            parent_batch["reference_cfg_apg_eta"] = float(reference_cfg_cfg.apg_eta)
             if policy_cfg.get("mask_aware", reference_cfg_cfg.mask_aware):
                 parent_batch["reference_cfg_mask_aware"] = True
                 parent_batch["reference_cfg_mask"] = tar_mask_cond

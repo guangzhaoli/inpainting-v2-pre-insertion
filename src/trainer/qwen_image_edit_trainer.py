@@ -186,7 +186,14 @@ class QwenImageEditTrainer(BaseTrainer):
         reference_cfg_mask: Optional[torch.Tensor] = None,
         delta_clip_enabled: bool = False,
         delta_clip_max_ratio: float = 0.5,
+        apg_eta: float = 1.0,
+        latents: Optional[torch.Tensor] = None,
+        sigma: Optional[float] = None,
     ) -> torch.Tensor:
+        """``null + scale * (cond - null)`` with optional delta clip, mask-aware blend and (without clip) norm
+        rescale. ``apg_eta < 1`` keeps only that share of the delta's component parallel to the conditional x0
+        prediction ``latents - sigma * cond`` (projected inside the mask); that path runs in float32."""
+
         if noise_pred.shape != reference_cfg_noise_pred.shape:
             raise ValueError(
                 "reference_cfg noise prediction shape must match positive prediction shape, "
@@ -194,21 +201,16 @@ class QwenImageEditTrainer(BaseTrainer):
             )
         if delta_clip_max_ratio <= 0:
             raise ValueError("reference_cfg delta_clip_max_ratio must be positive")
+        if not 0.0 <= apg_eta <= 1.0:
+            raise ValueError("reference_cfg apg_eta must be in [0, 1]")
+        output_dtype = noise_pred.dtype
+        apg = apg_eta < 1.0
+        if apg:
+            if latents is None or sigma is None:
+                raise ValueError("reference_cfg APG needs the current latents and sigma")
+            noise_pred, reference_cfg_noise_pred = noise_pred.float(), reference_cfg_noise_pred.float()
 
-        reference_delta = noise_pred - reference_cfg_noise_pred
-        cfg_delta = reference_delta
-        if delta_clip_enabled:
-            delta_norm = torch.norm(reference_delta.float(), dim=-1, keepdim=True)
-            positive_norm = torch.norm(noise_pred.float(), dim=-1, keepdim=True)
-            max_delta_norm = positive_norm * float(delta_clip_max_ratio)
-            delta_scale = max_delta_norm / torch.clamp(delta_norm, min=1e-6)
-            delta_scale = torch.clamp(delta_scale, max=1.0).to(dtype=reference_delta.dtype)
-            cfg_delta = reference_delta * delta_scale
-
-        guided_pred = reference_cfg_noise_pred + reference_cfg_scale * cfg_delta
-        if reference_cfg_mask is None:
-            comb_pred = guided_pred
-        else:
+        if reference_cfg_mask is not None:
             if reference_cfg_mask.ndim == 2:
                 reference_cfg_mask = reference_cfg_mask.unsqueeze(-1)
             if reference_cfg_mask.ndim != 3 or reference_cfg_mask.shape[-1] != 1:
@@ -222,15 +224,38 @@ class QwenImageEditTrainer(BaseTrainer):
                     f"got {tuple(reference_cfg_mask.shape)} for prediction {tuple(noise_pred.shape)}"
                 )
             reference_cfg_mask = reference_cfg_mask.to(device=noise_pred.device, dtype=noise_pred.dtype)
+
+        reference_delta = noise_pred - reference_cfg_noise_pred
+        cfg_delta = reference_delta
+        if delta_clip_enabled:
+            delta_norm = torch.norm(reference_delta.float(), dim=-1, keepdim=True)
+            positive_norm = torch.norm(noise_pred.float(), dim=-1, keepdim=True)
+            max_delta_norm = positive_norm * float(delta_clip_max_ratio)
+            delta_scale = max_delta_norm / torch.clamp(delta_norm, min=1e-6)
+            delta_scale = torch.clamp(delta_scale, max=1.0).to(dtype=reference_delta.dtype)
+            cfg_delta = reference_delta * delta_scale
+
+        guided_pred = reference_cfg_noise_pred + reference_cfg_scale * cfg_delta
+        if apg:
+            # x0 = x_t - sigma * v, so the delta moves x0 by -sigma * delta; its part along x0_c is k * x0_c,
+            # which is -k * x0_c / sigma in velocity.
+            x0_c = latents.float() - sigma * noise_pred
+            weight = torch.ones_like(noise_pred[..., :1]) if reference_cfg_mask is None else reference_cfg_mask
+            k = (-sigma * cfg_delta * x0_c * weight).sum(dim=(1, 2), keepdim=True) / (
+                (x0_c * x0_c * weight).sum(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+            )
+            guided_pred = guided_pred - (reference_cfg_scale - 1) * (1 - apg_eta) * (-k * x0_c / sigma)
+        if reference_cfg_mask is None:
+            comb_pred = guided_pred
+        else:
             comb_pred = noise_pred * (1.0 - reference_cfg_mask) + guided_pred * reference_cfg_mask
 
-        if delta_clip_enabled:
-            return comb_pred
-
-        cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
-        noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
-        noise_norm = torch.clamp(noise_norm, min=1e-6)
-        return comb_pred * (cond_norm / noise_norm)
+        if not delta_clip_enabled:
+            cond_norm = torch.norm(noise_pred, dim=-1, keepdim=True)
+            noise_norm = torch.norm(comb_pred, dim=-1, keepdim=True)
+            noise_norm = torch.clamp(noise_norm, min=1e-6)
+            comb_pred = comb_pred * (cond_norm / noise_norm)
+        return comb_pred.to(output_dtype)
 
     def _prepare_reference_cfg_mask(
         self,
@@ -1746,6 +1771,8 @@ class QwenImageEditTrainer(BaseTrainer):
         reference_cfg_mask = embeddings.get("reference_cfg_mask")
         reference_cfg_delta_clip_enabled = bool(embeddings.get("reference_cfg_delta_clip_enabled", False))
         reference_cfg_delta_clip_max_ratio = float(embeddings.get("reference_cfg_delta_clip_max_ratio", 0.5))
+        reference_cfg_sigma_min = float(embeddings.get("reference_cfg_sigma_min", 0.0))
+        reference_cfg_apg_eta = float(embeddings.get("reference_cfg_apg_eta", 1.0))
         do_reference_cfg = reference_cfg_embeddings is not None and reference_cfg_scale > 1
         if do_true_cfg and do_reference_cfg:
             raise ValueError("text true CFG and reference_cfg cannot be enabled at the same time")
@@ -1764,7 +1791,8 @@ class QwenImageEditTrainer(BaseTrainer):
         logging.info(
             "reference_cfg_delta_clip_enabled="
             f"{reference_cfg_delta_clip_enabled}, "
-            f"reference_cfg_delta_clip_max_ratio={reference_cfg_delta_clip_max_ratio}"
+            f"reference_cfg_delta_clip_max_ratio={reference_cfg_delta_clip_max_ratio}, "
+            f"reference_cfg_sigma_min={reference_cfg_sigma_min}, reference_cfg_apg_eta={reference_cfg_apg_eta}"
         )
         device = self._dit_device()
         dit_config = self._dit_config()
@@ -2114,7 +2142,7 @@ class QwenImageEditTrainer(BaseTrainer):
                         if capture_alpha:
                             self._last_alpha_logits = dit_outputs[1]
                         noise_pred = noise_pred[:, : latents.size(1)]
-                if do_reference_cfg:
+                if do_reference_cfg and float(self.scheduler.sigmas[i]) >= reference_cfg_sigma_min:
                     reference_cfg_latent_model_input = latents
                     if reference_cfg_control_latents is not None:
                         reference_cfg_latent_model_input = torch.cat(
@@ -2146,6 +2174,9 @@ class QwenImageEditTrainer(BaseTrainer):
                         reference_cfg_mask=reference_cfg_latent_mask,
                         delta_clip_enabled=reference_cfg_delta_clip_enabled,
                         delta_clip_max_ratio=reference_cfg_delta_clip_max_ratio,
+                        apg_eta=reference_cfg_apg_eta,
+                        latents=latents,
+                        sigma=float(self.scheduler.sigmas[i]),
                     )
 
                     del reference_cfg_noise_pred
