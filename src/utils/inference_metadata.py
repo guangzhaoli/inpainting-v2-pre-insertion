@@ -115,6 +115,8 @@ def _effective_complementary_canvas_contract(config) -> dict:
         contract.update(ring_tokens=int(canvas.ring_tokens), ring_sigma_max=float(canvas.ring_sigma_max))
     if canvas.text_as_condition:
         contract["text_as_condition"] = True
+    if canvas.keep_region_source:
+        contract["keep_region_source"] = True
     return contract
 
 

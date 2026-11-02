@@ -44,6 +44,28 @@ def test_ring_plan_orders_core_then_ring_and_keeps_the_rest_as_source():
         canvas_plan_from_region(REGION, ring_tokens=1)
 
 
+def test_keep_region_source_feeds_the_whole_masked_source_grid_as_condition():
+    plan = canvas_plan_from_region(REGION, keep_region_source=True)
+    assert plan.source_index.tolist() == torch.nonzero(~REGION).flatten().tolist()
+    assert plan.condition_source_index.tolist() == list(range(16))
+    assert plan.image_token_index[1].tolist() == list(range(16))
+
+    calls = []
+
+    def fake_dit(**kwargs):
+        calls.append(kwargs)
+        return (torch.full((1, kwargs["hidden_states"].shape[1], 16), 0.5),)
+
+    canvas = ComplementaryCanvasConfig(enabled=True, isolate_conditions=True, isolation="group", keep_region_source=True)
+    trainer = _loss_trainer(fake_dit, canvas)
+    embeddings = _loss_embeddings(u=0.05)  # index 0: σ = 1.0
+    trainer._compute_loss(embeddings)
+    noise = torch.randn(1, 16, 16, generator=torch.Generator().manual_seed(3))
+    expected_input = torch.cat([noise[:, plan.core_index], embeddings["control_latents"]], dim=1)
+    torch.testing.assert_close(calls[0]["hidden_states"], expected_input)
+    assert [index.tolist() for index in calls[0]["image_token_index"]] == [plan.core_index.tolist(), list(range(16))]
+
+
 def test_ring_feather_weights_fall_linearly_with_latent_distance_in_the_packed_layout():
     plan = _ring_plan()
     weights = ring_feather_weights(plan, (4, 4), 1, channels=3)
@@ -456,6 +478,26 @@ def test_sampling_group_isolation_ring_cached_equals_uncached(text_condition):
     assert torch.equal(cached[:, plan.source_index], embeddings["canvas_source_latents"][:, plan.source_index])
 
 
+@pytest.mark.parametrize("text_condition", [False, True])
+def test_sampling_with_the_region_source_cached_equals_uncached(text_condition):
+    fields = dict(enabled=True, isolate_conditions=True, isolation="group", text_as_condition=text_condition,
+                  keep_region_source=True)
+    uncached, embeddings, calls, _ = _ring_sample(ComplementaryCanvasConfig(**fields), _tiny_dit(lora=True))
+    assert [call["hidden_states"].shape[1] for call in calls] == [6 + 16 + 9, 6 + 16] * 3
+    cached, _, cached_calls, trainer = _ring_sample(
+        ComplementaryCanvasConfig(**fields, cache_conditions=True), _tiny_dit(lora=True)
+    )
+    assert [call["condition_cache"].image_lengths for call in cached_calls] == [(16, 9), (16,)] * 3
+    assert trainer._last_complementary_canvas["source_condition_tokens"] == 16
+    torch.testing.assert_close(cached, uncached, rtol=1e-5, atol=1e-5)
+    # The masked source inside R reaches the generated tokens.
+    outside_r, _, _, _ = _ring_sample(ComplementaryCanvasConfig(**{**fields, "keep_region_source": False}),
+                                      _tiny_dit(lora=True))
+    plan = _ring_plan(0)
+    assert (outside_r[:, plan.core_index] - uncached[:, plan.core_index]).abs().max() > 1e-3
+    assert torch.equal(cached[:, plan.source_index], embeddings["canvas_source_latents"][:, plan.source_index])
+
+
 def test_round2_canvas_config_contracts():
     insert = {"trainer": "QwenImageEditInsertAnything", "predict": {"devices": {}}}
 
@@ -491,6 +533,11 @@ def test_round2_canvas_config_contracts():
     assert mismatches(b2_group_ring, config(isolate_conditions=True, isolation="group", ring_tokens=2, cache_conditions=True)) == set()
     text = config(isolate_conditions=True, text_as_condition=True)
     assert mismatches(b2, text) == {"model.complementary_canvas.text_as_condition"}
+    assert mismatches(b2, config(isolate_conditions=True, keep_region_source=True)) == {
+        "model.complementary_canvas.keep_region_source"
+    }
+    with pytest.raises(ValueError, match="require enabled"):
+        ComplementaryCanvasConfig(keep_region_source=True)
     no_source = config()
     no_source.model.vl_masked_source = False
     assert mismatches(config(), no_source) == {"model.vl_masked_source"}

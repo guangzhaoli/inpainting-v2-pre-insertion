@@ -456,8 +456,14 @@ class QwenImageEditTrainer(BaseTrainer):
             raise ValueError(
                 f"canvas region has {region.shape[-1]} tokens, the target grid {target_shape} has {math.prod(target_shape)}"
             )
-        ring_tokens = self._complementary_canvas_cfg().ring_tokens
-        return canvas_plan_from_region(region, device=device, grid=target_shape[1:], ring_tokens=ring_tokens)
+        canvas = self._complementary_canvas_cfg()
+        return canvas_plan_from_region(
+            region,
+            device=device,
+            grid=target_shape[1:],
+            ring_tokens=canvas.ring_tokens,
+            keep_region_source=canvas.keep_region_source,
+        )
 
     def _canvas_ring_weights(self, plan, img_shapes, latents: torch.Tensor):
         """Feather weights of the ring tokens in the packed latent layout, or None without a ring."""
@@ -534,10 +540,13 @@ class QwenImageEditTrainer(BaseTrainer):
 
     @staticmethod
     def _complementary_canvas_conditions(control_latents: torch.Tensor, plan) -> torch.Tensor:
-        """Condition stream: masked-source tokens outside R, then the remaining condition images."""
+        """Condition stream: masked-source tokens outside R (or the whole grid), then the remaining condition images."""
 
         return torch.cat(
-            [gather_tokens(control_latents[:, : plan.num_tokens], plan.source_index), control_latents[:, plan.num_tokens :]],
+            [
+                gather_tokens(control_latents[:, : plan.num_tokens], plan.condition_source_index),
+                control_latents[:, plan.num_tokens :],
+            ],
             dim=1,
         )
 
@@ -2004,7 +2013,7 @@ class QwenImageEditTrainer(BaseTrainer):
                     canvas_kwargs = {**canvas_kwargs, "condition_cache": condition_cache}
                     condition_cache_bytes = condition_cache.nbytes
                     if do_reference_cfg:
-                        source_count = int(canvas_plan.source_index.numel())
+                        source_count = int(canvas_plan.condition_source_index.numel())
                         shares_source = (
                             condition_cache.per_image
                             and condition_cache.text_layers is None
@@ -2032,6 +2041,7 @@ class QwenImageEditTrainer(BaseTrainer):
                 "edit_tokens": int(canvas_plan.core_count),
                 "ring_tokens": int(canvas_plan.ring_count),
                 "grid_tokens": int(canvas_plan.num_tokens),
+                "source_condition_tokens": int(canvas_plan.condition_source_index.numel()),
                 "text_tokens": int(prompt_embeds.shape[1]),
                 "text_tokens_null": int(reference_cfg_prompt_embeds.shape[1]) if do_reference_cfg else None,
                 "text_cached": bool(canvas.cache_conditions and canvas.text_as_condition),

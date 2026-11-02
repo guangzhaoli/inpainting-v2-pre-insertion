@@ -369,8 +369,9 @@ def test_sampler_matches_the_trainer_cached_loop(batch_cfg, merge):
     assert sampler.last["steps"] == 3
 
 
+@pytest.mark.parametrize("keep_region_source", [False, True], ids=["source-outside-r", "source-whole-grid"])
 @pytest.mark.parametrize("batch_cfg", [False, True])
-def test_sampler_with_text_condition_and_anchoring_matches_the_trainer_cached_loop(batch_cfg):
+def test_sampler_with_text_condition_and_anchoring_matches_the_trainer_cached_loop(batch_cfg, keep_region_source):
     """The deploy path: group isolation, the text as a condition and soft latent anchoring inside R."""
 
     generator = torch.Generator().manual_seed(11)
@@ -378,7 +379,7 @@ def test_sampler_with_text_condition_and_anchoring_matches_the_trainer_cached_lo
                  "anchor_edit_weight": torch.rand(1, 16, 16, generator=generator)}
     embeddings = {**_embeddings(), **anchoring}
     canvas = ComplementaryCanvasConfig(enabled=True, isolate_conditions=True, isolation="group", cache_conditions=True,
-                                       text_as_condition=True)
+                                       text_as_condition=True, keep_region_source=keep_region_source)
     trainer = _trainer(_tiny_dit(), canvas)
     with patch("src.trainer.qwen_image_edit_trainer.tqdm", side_effect=lambda iterable, **_: iterable):
         expected = trainer.sampling_from_embeddings(embeddings)
@@ -391,6 +392,7 @@ def test_sampler_with_text_condition_and_anchoring_matches_the_trainer_cached_lo
     record = dict(trainer._last_complementary_canvas)
     assert record.pop("fast_sampler")["steps"] == 3
     assert record.keys() == expected_canvas.keys() and record["text_cached"] and expected_canvas["text_cached"]
+    assert record["source_condition_tokens"] == expected_canvas["source_condition_tokens"] == (16 if keep_region_source else 10)
     # The anchoring is live: without it R ends elsewhere.
     trainer.scheduler = _EulerScheduler(torch.tensor([1.0, 0.7, 0.4, 0.0]))
     plain = {key: value for key, value in embeddings.items() if key not in anchoring}

@@ -334,7 +334,8 @@ def test_sampling_keeps_source_exact_and_cached_equals_uncached():
     )
     assert [(length, cache.segment_lengths) for length, cache in cached_calls] == [(6, (10, 9)), (6, (10,))] * 3
     assert trainer._last_complementary_canvas == {
-        "edit_tokens": 6, "ring_tokens": 0, "grid_tokens": 16, "text_tokens": 3, "text_tokens_null": 3,
+        "edit_tokens": 6, "ring_tokens": 0, "grid_tokens": 16, "source_condition_tokens": 10, "text_tokens": 3,
+        "text_tokens_null": 3,
         "text_cached": False, "condition_cache_bytes": 2 * 2 * 19 * 32 * 4,
     }
     torch.testing.assert_close(cached, isolated, rtol=1e-5, atol=1e-5)
@@ -350,7 +351,7 @@ def test_canvas_config_defaults_dependencies_and_contracts(tmp_path):
     assert dense.model.complementary_canvas.model_dump() == {
         "enabled": False, "isolate_conditions": False, "isolation": "image", "cache_conditions": False,
         "ring_tokens": 0, "ring_sigma_max": 0.3, "ring_loss_weight": 0.1, "text_as_condition": False,
-        "anneal_steps": 0, "anneal_max_bias": 12.0, "local_decode_margin_px": None,
+        "anneal_steps": 0, "anneal_max_bias": 12.0, "local_decode_margin_px": None, "keep_region_source": False,
     }
     with pytest.raises(ValidationError, match="require enabled"):
         ComplementaryCanvasConfig(isolate_conditions=True)

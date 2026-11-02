@@ -489,6 +489,9 @@ class ComplementaryCanvasConfig(BaseModel):
     ramped from 0 to ``anneal_max_bias`` over that many optimizer steps.
     ``local_decode_margin_px`` makes the pixel losses decode only bbox(R and its
     ring) plus this margin; the far background there is the exact source.
+    ``keep_region_source`` keeps the masked source inside R in the condition
+    stream too (frame 1, the whole grid), so every generated token has its
+    position-matched hole/context token, as in the dense layout.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -503,6 +506,7 @@ class ComplementaryCanvasConfig(BaseModel):
     anneal_steps: int = Field(default=0, ge=0)
     anneal_max_bias: float = Field(default=12.0, gt=0, le=100)
     local_decode_margin_px: Optional[int] = Field(default=None, ge=0, le=1024)
+    keep_region_source: bool = False
 
     @model_validator(mode="after")
     def _check_dependencies(self):
@@ -512,6 +516,7 @@ class ComplementaryCanvasConfig(BaseModel):
             "ring_tokens": self.ring_tokens > 0,
             "text_as_condition": self.text_as_condition,
             "local_decode_margin_px": self.local_decode_margin_px is not None,
+            "keep_region_source": self.keep_region_source,
         }
         if any(changed.values()) and not self.enabled:
             enabled = ", ".join(name for name, value in changed.items() if value)

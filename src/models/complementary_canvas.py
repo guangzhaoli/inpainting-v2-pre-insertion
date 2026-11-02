@@ -32,6 +32,15 @@ class CanvasPlan:
     source_index: torch.Tensor  # the remaining grid, clean source context
     num_tokens: int
     ring_count: int = 0  # trailing entries of target_index that form the ring
+    keep_region_source: bool = False  # the masked-source condition keeps its whole grid, R included
+
+    @property
+    def condition_source_index(self) -> torch.Tensor:
+        """Masked-source tokens in the condition stream: the complement of R, or the whole grid."""
+
+        if self.keep_region_source:
+            return torch.arange(self.num_tokens, device=self.source_index.device)
+        return self.source_index
 
     @property
     def core_count(self) -> int:
@@ -49,7 +58,7 @@ class CanvasPlan:
     def image_token_index(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-image token selection for [target, masked source]; later images keep their full grid."""
 
-        return (self.target_index, self.source_index)
+        return (self.target_index, self.condition_source_index)
 
 
 def token_region_from_mask(mask: torch.Tensor, token_px: int, threshold: float = 0.5) -> torch.Tensor:
@@ -78,11 +87,13 @@ def canvas_plan_from_region(
     *,
     grid: tuple[int, int] | None = None,
     ring_tokens: int = 0,
+    keep_region_source: bool = False,
 ) -> CanvasPlan:
     """One plan per batch: every sample must share R (training and inference use batch size 1).
 
     ``ring_tokens > 0`` (needs ``grid``) adds the band of tokens within that Chebyshev
-    distance of R to the generated set, after R.
+    distance of R to the generated set, after R. ``keep_region_source`` keeps the masked
+    source inside R (and the ring) in the condition stream as well.
     """
 
     region = region.to(device=device, dtype=torch.bool)
@@ -108,6 +119,7 @@ def canvas_plan_from_region(
         source_index=source_index,
         num_tokens=int(region.numel()),
         ring_count=int(ring_index.numel()),
+        keep_region_source=keep_region_source,
     )
 
 

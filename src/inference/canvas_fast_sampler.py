@@ -1164,7 +1164,7 @@ class FastCanvasSampler:
                                 0 if text_condition else None)]
         branch_ids = [ids]
         if do_reference_cfg:
-            source_count = int(plan.source_index.numel())
+            source_count = int(plan.condition_source_index.numel())
             if not text_condition and isolation == "image" and conditions[1].shape[1] == source_count and torch.equal(
                 conditions[1], conditions[0][:, :source_count]
             ):
@@ -1287,6 +1287,7 @@ class FastCanvasSampler:
             "edit_tokens": int(plan.core_count),
             "ring_tokens": int(plan.ring_count),
             "grid_tokens": int(plan.num_tokens),
+            "source_condition_tokens": int(plan.condition_source_index.numel()),
             "text_tokens": int(branches[0].prompt_embeds.shape[1]),
             "text_tokens_null": int(branches[1].prompt_embeds.shape[1]) if len(branches) == 2 else None,
             "text_cached": prepared["text_condition"],
